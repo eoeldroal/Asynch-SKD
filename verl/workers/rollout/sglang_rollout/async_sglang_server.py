@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import zlib
 from typing import Any, Optional
 
 import ray
@@ -63,10 +64,10 @@ def _extract_prompt_logprobs_sglang(
     result_dict: dict[str, list],
 ) -> None:
     """Shape SGLang input-logprobs into the vLLM ``extract_prompt_logprobs`` contract.
+
     Populates ``result_dict`` with two ``[sequence_length, max(num_prompt_logprobs, 1)]``
     lists — ``prompt_ids`` and ``prompt_logprobs`` — so the distillation teacher
-    consumer in ``teacher_manager.AsyncTeacherLLMServerManager`` can treat vLLM and
-    SGLang teachers interchangeably.
+    consumer can treat vLLM and SGLang teachers interchangeably.
     SGLang returns input logprobs with length ``S == len(input_ids)`` whose first
     entry has ``logprob=None`` (no predicting context). That matches the vLLM
     convention, so we skip entry 0 and append a trailing dummy row to keep the
@@ -102,6 +103,59 @@ def _extract_prompt_logprobs_sglang(
         f"SGLang prompt_logprobs length ({len(prompt_ids_ls)}) does not match "
         f"sequence length ({sequence_length}); check logprob_start_len=0 invariant."
     )
+    result_dict["prompt_ids"] = prompt_ids_ls
+    result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def _extract_skd_delta_prompt_logprobs_sglang(
+    meta_info: dict,
+    num_prompt_logprobs: int,
+    sequence_length: int,
+    result_dict: dict[str, list],
+    prompt_logprobs_start_len: int,
+) -> None:
+    """Extract SKD suffix rows from SGLang compact prompt-logprob delta output."""
+    if prompt_logprobs_start_len <= 0:
+        raise ValueError(f"SKD delta prompt_logprobs requires positive start len, got {prompt_logprobs_start_len}.")
+
+    input_token_logprobs = meta_info.get("input_token_logprobs") or []
+    if num_prompt_logprobs > 0:
+        input_top_logprobs = meta_info.get("input_top_logprobs") or []
+    prompt_ids_ls: list[list[int]] = []
+    prompt_logprobs_ls: list[list[float]] = []
+
+    # SGLang returns compact rows starting at logprob_start_len. The first row in
+    # that returned slice is a None/no-context placeholder, so SKD consumes the
+    # compact output by skipping placeholders rather than indexing by original
+    # full-sequence positions.
+    if num_prompt_logprobs == 0:
+        for entry in input_token_logprobs:
+            if entry is None:
+                continue
+            logprob, token_id, _ = entry
+            if logprob is None:
+                continue
+            prompt_ids_ls.append([int(token_id)])
+            prompt_logprobs_ls.append([float(logprob)])
+    else:
+        for top_entries in input_top_logprobs:
+            if top_entries is None:
+                continue
+            ids = [int(tok_id) for _, tok_id, _ in top_entries]
+            logprobs = [float(logprob) for logprob, _, _ in top_entries]
+            assert len(ids) == num_prompt_logprobs, (
+                f"SGLang returned {len(ids)} top logprobs in SKD delta mode, expected {num_prompt_logprobs}."
+            )
+            prompt_ids_ls.append(ids)
+            prompt_logprobs_ls.append(logprobs)
+
+    expected_len = sequence_length - prompt_logprobs_start_len - 1
+    if len(prompt_ids_ls) != expected_len:
+        raise ValueError(
+            f"SGLang SKD delta prompt_logprobs length ({len(prompt_ids_ls)}) does not match expected suffix "
+            f"length ({expected_len}) for sequence_length={sequence_length}, "
+            f"prompt_logprobs_start_len={prompt_logprobs_start_len}."
+        )
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
 
@@ -251,6 +305,20 @@ class SGLangHttpServer:
             else json.dumps({}),
             **engine_kwargs,
         }
+
+        if args.get("nccl_port") is None:
+            nccl_port_base = int(os.environ.get("VERL_SGLANG_NCCL_PORT_BASE", "41000"))
+            nccl_port_stride = int(
+                os.environ.get("VERL_SGLANG_NCCL_PORT_STRIDE", str(max(16, self.nnodes + 1)))
+            )
+            # Spread single-node SGLang TP rendezvous ports across rollout groups so
+            # student hybrid servers and colocated teacher servers do not collide on
+            # the same replica_rank-derived 410xx port.
+            group_seed = f"{self.rollout_mode.value}:{os.path.basename(self.model_config.local_path)}"
+            group_offset = zlib.crc32(group_seed.encode("utf-8")) % 256
+            args["nccl_port"] = (
+                nccl_port_base + (group_offset + self.replica_rank) * nccl_port_stride + self.node_rank
+            )
 
         # update lora-related args
         if self.model_config.lora_rank > 0:
@@ -461,6 +529,7 @@ class SGLangHttpServer:
         # input-token logprobs for every position (top-K when K>0, sampled-token
         # logprob only when K==0). Translate to SGLang's per-request logprob API.
         prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
+        prompt_logprobs_start_len = sampling_params.pop("prompt_logprobs_start_len", None)
         if prompt_logprobs is not None:
             return_logprob = True
 
@@ -475,7 +544,7 @@ class SGLangHttpServer:
         }
 
         if prompt_logprobs is not None:
-            request["logprob_start_len"] = 0
+            request["logprob_start_len"] = prompt_logprobs_start_len or 0
             if prompt_logprobs > 0:
                 request["top_logprobs_num"] = prompt_logprobs
 
@@ -530,12 +599,21 @@ class SGLangHttpServer:
 
         extra_fields = {"global_steps": self.global_steps}
         if prompt_logprobs is not None:
-            _extract_prompt_logprobs_sglang(
-                meta_info=meta_info,
-                num_prompt_logprobs=prompt_logprobs,
-                sequence_length=len(prompt_ids),
-                result_dict=extra_fields,
-            )
+            if prompt_logprobs_start_len is not None and prompt_logprobs_start_len > 0:
+                _extract_skd_delta_prompt_logprobs_sglang(
+                    meta_info=meta_info,
+                    num_prompt_logprobs=prompt_logprobs,
+                    sequence_length=len(prompt_ids),
+                    result_dict=extra_fields,
+                    prompt_logprobs_start_len=prompt_logprobs_start_len,
+                )
+            else:
+                _extract_prompt_logprobs_sglang(
+                    meta_info=meta_info,
+                    num_prompt_logprobs=prompt_logprobs,
+                    sequence_length=len(prompt_ids),
+                    result_dict=extra_fields,
+                )
 
         return TokenOutput(
             token_ids=token_ids,

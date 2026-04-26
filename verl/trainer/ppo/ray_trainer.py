@@ -39,7 +39,7 @@ from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
 from verl.single_controller.ray.base import create_colocated_worker_cls
 from verl.trainer.config import AlgoConfig
-from verl.trainer.distillation.losses import is_distillation_enabled
+from verl.trainer.distillation.losses import is_distillation_enabled, is_supervised_distillation_only
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import AdvantageEstimator, agg_loss
 from verl.trainer.ppo.metric_utils import (
@@ -131,6 +131,37 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def _assemble_async_skd_training_batch(
+    base_input_batch: DataProto,
+    base_output_batch: DataProto,
+    *,
+    async_skd_data_source=None,
+    validate: bool = False,
+    required_multiple: int | None = None,
+) -> tuple[DataProto, DataProto]:
+    """Append promoted async-SKD rollout pairs to the current training batch."""
+    if validate or async_skd_data_source is None:
+        return base_input_batch, base_output_batch
+
+    promoted_available = async_skd_data_source.promoted_count()
+    take_count = promoted_available
+    if required_multiple is not None and required_multiple > 1:
+        take_count -= (len(base_input_batch) + take_count) % required_multiple
+
+    promoted_inputs, promoted_outputs = async_skd_data_source.pop_promoted_pairs(max_count=take_count)
+    if len(promoted_inputs) != len(promoted_outputs):
+        raise ValueError(
+            "promoted input/output batch count must match: "
+            f"{len(promoted_inputs)} != {len(promoted_outputs)}"
+        )
+    if not promoted_inputs:
+        return base_input_batch, base_output_batch
+
+    merged_input = DataProto.concat([base_input_batch, *promoted_inputs])
+    merged_output = DataProto.concat([base_output_batch, *promoted_outputs])
+    return merged_input, merged_output
 
 
 def compute_advantage(
@@ -317,6 +348,8 @@ class RayPPOTrainer:
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+        self._async_skd_data_source = None
+        self._pending_async_skd_data_source_state = None
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -399,6 +432,84 @@ class RayPPOTrainer:
                     self.config.critic.optim.total_training_steps = total_training_steps
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
+
+    def _uses_async_skd_lookahead_training(self) -> bool:
+        manager = getattr(self, "async_rollout_manager", None)
+        if manager is None:
+            return False
+        if not hasattr(manager, "generate_sequences_with_carryover"):
+            return False
+        if not hasattr(manager, "set_async_skd_data_source"):
+            return False
+        mode = OmegaConf.select(self.config, "actor_rollout_ref.rollout.agent.async_skd_mode", default="sync")
+        return str(mode) == "lookahead"
+
+    def _uses_supervised_async_skd_logprob_shortcut(self) -> bool:
+        return self._uses_async_skd_lookahead_training() and is_supervised_distillation_only(
+            self.config.get("distillation")
+        )
+
+    def _async_skd_base_batch_size(self) -> int:
+        return int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
+
+    def _create_async_skd_training_batch_iterator(self, start_epoch: int):
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            del epoch
+            iterator = iter(self.train_dataloader)
+            for batch_dict in iterator:
+                yield batch_dict
+
+    def _prepare_async_skd_training_source(self, start_epoch: int):
+        from verl.experimental.async_skd import AsyncSkdDataSource
+
+        source = AsyncSkdDataSource(self._create_async_skd_training_batch_iterator(start_epoch))
+        if self._pending_async_skd_data_source_state is not None:
+            source.load_state_dict(self._pending_async_skd_data_source_state)
+            self._pending_async_skd_data_source_state = None
+        self._async_skd_data_source = source
+        self.async_rollout_manager.set_async_skd_data_source(source)
+        return source
+
+    def _iter_training_steps(self, start_epoch: int):
+        if self._uses_async_skd_lookahead_training():
+            source = self._prepare_async_skd_training_source(start_epoch)
+            while True:
+                carryover_partials, fresh_batch, current_input_batch = source.next_current_batch(
+                    base_batch_size=self._async_skd_base_batch_size()
+                )
+                if current_input_batch is None:
+                    break
+                current_input_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                fresh_prompts = None
+                gen_batch = None
+                if fresh_batch is not None:
+                    gen_batch = self._get_gen_batch(fresh_batch)
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    fresh_prompts = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n,
+                        interleave=True,
+                    )
+                epoch = max(0, (self.global_steps - 1) // len(self.train_dataloader))
+                yield epoch, current_input_batch, fresh_prompts, carryover_partials, source, gen_batch
+            return
+
+        if hasattr(self.async_rollout_manager, "set_async_skd_data_source"):
+            self.async_rollout_manager.set_async_skd_data_source(None)
+        self._async_skd_data_source = None
+        for epoch in range(start_epoch, self.config.trainer.total_epochs):
+            for batch_dict in self.train_dataloader:
+                batch = DataProto.from_single_dict(batch_dict)
+                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
+                gen_batch = self._get_gen_batch(batch)
+                gen_batch.meta_info["global_steps"] = self.global_steps
+                fresh_prompts = gen_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.n,
+                    interleave=True,
+                )
+                yield epoch, batch, fresh_prompts, [], None, gen_batch
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL."""
@@ -766,6 +877,9 @@ class RayPPOTrainer:
                 wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
+        master_port_range = OmegaConf.select(self.config, "ray_kwargs.master_port_range")
+        if master_port_range is not None:
+            wg_kwargs["master_port_range"] = OmegaConf.to_container(master_port_range)
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
@@ -929,7 +1043,10 @@ class RayPPOTrainer:
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_local_path)
+        dataloader_payload = {"dataloader_state_dict": dataloader_state_dict}
+        if self._async_skd_data_source is not None:
+            dataloader_payload["async_skd_data_source_state_dict"] = self._async_skd_data_source.state_dict()
+        torch.save(dataloader_payload, dataloader_local_path)
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1009,8 +1126,15 @@ class RayPPOTrainer:
                     f"Next epoch will iterate from scratch."
                 )
             else:
-                dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
+                dataloader_payload = torch.load(dataloader_local_path, weights_only=False)
+                if isinstance(dataloader_payload, dict) and "dataloader_state_dict" in dataloader_payload:
+                    dataloader_state_dict = dataloader_payload["dataloader_state_dict"]
+                    async_skd_data_source_state = dataloader_payload.get("async_skd_data_source_state_dict")
+                else:
+                    dataloader_state_dict = dataloader_payload
+                    async_skd_data_source_state = None
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
+                self._pending_async_skd_data_source_state = async_skd_data_source_state
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
@@ -1200,22 +1324,29 @@ class RayPPOTrainer:
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
-        distillation_use_topk = (
-            self.distillation_config.distillation_loss.loss_settings.use_topk
-            if is_distillation_enabled(self.config.get("distillation"))
-            else False
-        )
+        distillation_enabled = is_distillation_enabled(self.config.get("distillation"))
+        loss_config = self.distillation_config.distillation_loss if distillation_enabled else None
+        distillation_use_topk = loss_config.loss_settings.use_topk if distillation_enabled else False
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
+        if self._uses_async_skd_lookahead_training():
+            batch_controls = {
+                "global_batch_size": int(batch_td.batch_size[0]),
+                "num_mini_batch": 1,
+            }
+        else:
+            batch_controls = {
+                "global_batch_size": ppo_mini_batch_size,
+                "mini_batch_size": ppo_mini_batch_size,
+            }
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,
             distillation_use_topk=distillation_use_topk,
-            global_batch_size=ppo_mini_batch_size,
-            mini_batch_size=ppo_mini_batch_size,
+            **batch_controls,
             epochs=ppo_epochs,
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
@@ -1313,8 +1444,9 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+        for epoch, batch, fresh_prompts, carryover_partials, async_skd_data_source, gen_batch in self._iter_training_steps(
+            current_epoch
+        ):
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1326,21 +1458,6 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
-
-                gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1348,16 +1465,29 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        if async_skd_data_source is not None:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences_with_carryover(
+                                fresh_prompts=fresh_prompts,
+                                carryover_partials=carryover_partials,
+                            )
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(fresh_prompts)
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        async_skd_metrics = gen_batch_output.meta_info.pop("async_skd_metrics", None)
+                        if async_skd_metrics:
+                            metrics.update(async_skd_metrics)
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
+                            if gen_batch is None:
+                                raise NotImplementedError(
+                                    "REMAX baseline generation is not supported for async SKD carryover-only steps."
+                                )
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if curr_step_profile:
@@ -1386,6 +1516,15 @@ class RayPPOTrainer:
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if async_skd_data_source is not None:
+                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        batch, gen_batch_output = _assemble_async_skd_training_batch(
+                            batch,
+                            gen_batch_output,
+                            async_skd_data_source=async_skd_data_source,
+                            validate=False,
+                            required_multiple=dp_size,
+                        )
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1421,6 +1560,7 @@ class RayPPOTrainer:
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                    use_supervised_async_skd_logprob_shortcut = self._uses_supervised_async_skd_logprob_shortcut()
                     if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
@@ -1429,6 +1569,8 @@ class RayPPOTrainer:
                             rollout_corr_config=rollout_corr_config,
                             policy_loss_config=self.config.actor_rollout_ref.actor.policy_loss,
                         )
+                    elif use_supervised_async_skd_logprob_shortcut:
+                        pass
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
@@ -1462,9 +1604,10 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
 
-                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+                    if not use_supervised_async_skd_logprob_shortcut:
+                        assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and not use_supervised_async_skd_logprob_shortcut:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)

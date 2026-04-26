@@ -111,3 +111,11 @@ teacher_models:
 
 # Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in the data proto, e.g., task.
 teacher_key: data_source
+
+# SKD (Speculative Knowledge Distillation) config.
+skd:
+  _target_: verl.workers.config.SkdConfig
+  chunk_size: 1024
+  verify_top_k: 25
+  max_chunks_per_sample: 60
+  teacher_system_prompt_path: null

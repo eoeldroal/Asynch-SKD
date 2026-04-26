@@ -18,7 +18,6 @@ import os
 
 from packaging.version import parse as parse_version
 
-from .protocol import DataProto
 from .utils.device import is_npu_available
 from .utils.import_utils import import_external_libs
 from .utils.logging_utils import set_basic_config
@@ -98,3 +97,12 @@ if is_npu_available:
             device_module.synchronize()
 
         TensorDictBase._sync_all = _sync_all_patch
+
+
+def __getattr__(name):
+    if name == "DataProto":
+        from .protocol import DataProto as _DataProto
+
+        globals()["DataProto"] = _DataProto
+        return _DataProto
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

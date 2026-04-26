@@ -60,6 +60,74 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 DEFAULT_ROUTING_CACHE_SIZE = 10000
+ASYNC_SKD_MANAGER_CLASS = "verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager"
+ASYNC_SKD_MODES = {"sample_async", "lookahead"}
+
+
+def _select_config(config, path: str, default=None):
+    if isinstance(config, DictConfig):
+        return OmegaConf.select(config, path, default=default)
+
+    current = config
+    for part in path.split("."):
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(part, default)
+        else:
+            current = getattr(current, part, default)
+    return current
+
+
+def _uses_async_skd(config) -> bool:
+    default_agent_loop = _select_config(config, "actor_rollout_ref.rollout.agent.default_agent_loop")
+    if default_agent_loop is None:
+        default_agent_loop = _select_config(config, "rollout.agent.default_agent_loop")
+    manager_class = _select_config(config, "actor_rollout_ref.rollout.agent.agent_loop_manager_class")
+    if manager_class is None:
+        manager_class = _select_config(config, "rollout.agent.agent_loop_manager_class")
+    async_skd_mode = _select_config(config, "actor_rollout_ref.rollout.agent.async_skd_mode", default=None)
+    if async_skd_mode is None:
+        async_skd_mode = _select_config(config, "rollout.agent.async_skd_mode", default="sync")
+    return (
+        default_agent_loop == "skd_agent"
+        or manager_class == ASYNC_SKD_MANAGER_CLASS
+        or async_skd_mode in ASYNC_SKD_MODES
+    )
+
+
+def _validate_async_skd_backend_config(config) -> None:
+    if not _uses_async_skd(config):
+        return
+
+    rollout_name = _select_config(config, "actor_rollout_ref.rollout.name")
+    rollout_name_path = "actor_rollout_ref.rollout.name"
+    if rollout_name is None:
+        rollout_name = _select_config(config, "rollout.name")
+        rollout_name_path = "rollout.name"
+    if rollout_name != "sglang":
+        raise ValueError(
+            "Async SKD requires SGLang rollout backend, "
+            f"but got {rollout_name_path}={rollout_name!r}."
+        )
+
+    distillation_config = _select_config(config, "distillation")
+    if not is_distillation_enabled(distillation_config):
+        raise ValueError("Async SKD requires distillation.enabled=True.")
+
+    distillation_config: DistillationConfig = omega_conf_to_dataclass(distillation_config)
+    if not distillation_config.distillation_loss.loss_settings.use_topk:
+        raise ValueError(
+            "Async SKD requires a top-k distillation loss because teacher verification emits top-k rows; "
+            f"got distillation.distillation_loss.loss_mode={distillation_config.distillation_loss.loss_mode!r}."
+        )
+    for teacher_key, teacher_model in distillation_config.teacher_models.items():
+        teacher_backend = teacher_model.inference.name
+        if teacher_backend != "sglang":
+            raise ValueError(
+                "Async SKD requires SGLang teacher inference backend, "
+                f"but teacher {teacher_key!r} has inference.name={teacher_backend!r}."
+            )
 
 
 @ray.remote
@@ -490,6 +558,8 @@ class AgentLoopWorker:
                     servers=teacher_servers,
                     load_balancer_handle=teacher_load_balancer_handle,
                 )
+        else:
+            self.teacher_server_manager = None
 
         # for recipe to change
         if not hasattr(self, "server_manager"):
@@ -524,6 +594,7 @@ class AgentLoopWorker:
             trace_config.get("token2text", False),
             trace_config.get("max_samples_per_step_per_worker", None),
         )
+        self._agent_loop_instances: dict[str, AgentLoopBase] = {}
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         """Generate sequences from agent loop.
@@ -633,6 +704,7 @@ class AgentLoopWorker:
                 config=agent_loop_config,
                 trainer_config=DictConfigWrap(config=self.config),
                 server_manager=self.server_manager,
+                teacher_server_manager=self.teacher_server_manager,
                 tokenizer=self.tokenizer,
                 processor=self.processor,
                 dataset_cls=self.dataset_cls,
@@ -640,6 +712,23 @@ class AgentLoopWorker:
             )
             output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
             return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    def _get_or_create_agent_loop(self, agent_name: str) -> AgentLoopBase:
+        assert agent_name in _agent_loop_registry, (
+            f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
+        )
+        if agent_name not in self._agent_loop_instances:
+            self._agent_loop_instances[agent_name] = hydra.utils.instantiate(
+                config=_agent_loop_registry[agent_name],
+                trainer_config=DictConfigWrap(config=self.config),
+                server_manager=self.server_manager,
+                teacher_server_manager=self.teacher_server_manager,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+                dataset_cls=self.dataset_cls,
+                data_config=DictConfigWrap(self.config.data),
+            )
+        return self._agent_loop_instances[agent_name]
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
@@ -899,6 +988,49 @@ class AgentLoopWorker:
         sample_kwargs: Optional[dict[str, Any]] = None,
     ) -> None:
         """Compute teacher logprobs for single sample."""
+        if "teacher_ids_list" in output.extra_fields or "teacher_logprobs_list" in output.extra_fields:
+            if "teacher_ids_list" not in output.extra_fields or "teacher_logprobs_list" not in output.extra_fields:
+                raise ValueError("SKD teacher rows require both teacher_ids_list and teacher_logprobs_list.")
+            teacher_ids_list = output.extra_fields.pop("teacher_ids_list")
+            teacher_logprobs_list = output.extra_fields.pop("teacher_logprobs_list")
+            if len(teacher_ids_list) != len(teacher_logprobs_list):
+                raise ValueError(
+                    "SKD teacher row length mismatch: "
+                    f"ids={len(teacher_ids_list)}, logprobs={len(teacher_logprobs_list)}."
+                )
+            if not teacher_ids_list:
+                return
+            topk = len(teacher_ids_list[0])
+            prompt_len = len(prompt_ids)
+            response_len = len(response_ids)
+            if prompt_len <= 0:
+                raise ValueError("SKD teacher row adaptation requires a non-empty prompt.")
+            zero_ids = [0] * topk
+            zero_logprobs = [0.0] * topk
+            response_teacher_ids = [list(row) for row in teacher_ids_list[:response_len]]
+            response_teacher_logprobs = [list(row) for row in teacher_logprobs_list[:response_len]]
+            while len(response_teacher_ids) < response_len:
+                response_teacher_ids.append(list(zero_ids))
+                response_teacher_logprobs.append(list(zero_logprobs))
+
+            full_ids = [list(zero_ids) for _ in range(prompt_len - 1)]
+            full_logprobs = [list(zero_logprobs) for _ in range(prompt_len - 1)]
+            full_ids.extend(response_teacher_ids)
+            full_logprobs.extend(response_teacher_logprobs)
+            full_ids.append(list(zero_ids))
+            full_logprobs.append(list(zero_logprobs))
+
+            expected_len = prompt_len + response_len
+            if len(full_ids) != expected_len or len(full_logprobs) != expected_len:
+                raise ValueError(
+                    "SKD teacher rows must align to prompt + response length after adaptation, "
+                    f"got ids={len(full_ids)}, logprobs={len(full_logprobs)}, expected={expected_len}."
+                )
+
+            output.extra_fields["teacher_ids"] = torch.tensor(full_ids, dtype=torch.int32)
+            output.extra_fields["teacher_logprobs"] = torch.tensor(full_logprobs)
+            return
+
         if self.distillation_enabled and not validate:
             routing_key = None
             if sample_kwargs is not None:
@@ -1054,6 +1186,7 @@ class AgentLoopManager:
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         self.config = config
+        _validate_async_skd_backend_config(self.config)
         self.rollout_config, self.model_config = _get_rollout_and_model_config(config)
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
@@ -1218,7 +1351,7 @@ class AgentLoopManager:
         timing = {}
         t_generate_sequences = np.array([metric["generate_sequences"] for chunk in metrics for metric in chunk])
         t_tool_calls = np.array([metric["tool_calls"] for chunk in metrics for metric in chunk])
-        t_compute_score = np.array([metric["compute_score"] for chunk in metrics for metric in chunk])
+        t_compute_score = np.array([metric.get("compute_score", 0.0) for chunk in metrics for metric in chunk])
         num_preempted = np.array([metric["num_preempted"] for chunk in metrics for metric in chunk])
         timing["agent_loop/num_preempted/min"] = num_preempted.min()
         timing["agent_loop/num_preempted/max"] = num_preempted.max()

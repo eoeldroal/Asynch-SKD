@@ -22,10 +22,12 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from .rollout import RolloutConfig
 
-__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "SkdConfig", "DistillationConfig"]
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET = 512
 
 
 @dataclass
@@ -64,6 +66,7 @@ class DistillationLossConfig(BaseConfig):
 
     loss_mode: str = "k3"
     topk: Optional[int] = 128
+    forward_kl_topk_impl: str = "log_softmax"
     use_task_rewards: bool = True
     distillation_loss_coef: float = 1.0
     loss_max_clamp: Optional[float] = 10.0
@@ -90,6 +93,13 @@ class DistillationLossConfig(BaseConfig):
         from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+
+        valid_forward_kl_topk_impls = {"log_softmax", "logsumexp_gather"}
+        if self.forward_kl_topk_impl not in valid_forward_kl_topk_impls:
+            raise ValueError(
+                f"Unsupported forward_kl_topk_impl: {self.forward_kl_topk_impl}. "
+                f"Supported values are: {sorted(valid_forward_kl_topk_impls)}"
+            )
 
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
@@ -157,19 +167,37 @@ class DistillationTeacherModelConfig(BaseConfig):
         if self.num_replicas is None:
             raise ValueError("num_replicas must be specified for distillation teacher model config.")
 
-    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+    def validate_and_prepare_for_distillation(
+        self, use_topk: bool, topk: Optional[int], extra_prompt_budget: int = 0
+    ) -> None:
         # Prompt + Response from student are fed into teacher as context
         max_model_len = self.inference.max_model_len
+        max_num_batched_tokens = self.inference.max_num_batched_tokens
         student_prompt_length = self.inference.prompt_length
         student_response_length = self.inference.response_length
-        required_context_len = student_prompt_length + student_response_length + 1
+
+        if extra_prompt_budget:
+            if max_model_len is not None:
+                object.__setattr__(self.inference, "max_model_len", max_model_len + extra_prompt_budget)
+                max_model_len = self.inference.max_model_len
+            if max_num_batched_tokens is not None:
+                object.__setattr__(
+                    self.inference,
+                    "max_num_batched_tokens",
+                    max_num_batched_tokens + extra_prompt_budget,
+                )
+
+        required_context_len = student_prompt_length + student_response_length + 1 + extra_prompt_budget
         if max_model_len is not None and required_context_len > max_model_len:
             raise ValueError(
                 "Distillation teacher inference requires room for the student prompt, the full student "
-                f"response, and one generated token, but got {student_prompt_length=}, "
-                f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
+                "response, one generated token, and any configured teacher-only prefix budget, but got "
+                f"{student_prompt_length=}, {student_response_length=}, {extra_prompt_budget=}, "
+                f"{required_context_len=}, {max_model_len=}."
             )
-        self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
+        self.inference.prompt_length = (
+            self.inference.prompt_length + self.inference.response_length + extra_prompt_budget
+        )
         self.inference.response_length = 1
         self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
 
@@ -204,6 +232,16 @@ class DistillationTeacherModelConfig(BaseConfig):
                 raise NotImplementedError(
                     f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
                 )
+
+
+@dataclass
+class SkdConfig(BaseConfig):
+    """Configuration for Speculative Knowledge Distillation (SKD)."""
+
+    chunk_size: int = 1024
+    verify_top_k: int = 25
+    max_chunks_per_sample: int = 60
+    teacher_system_prompt_path: Optional[str] = None
 
 
 @dataclass
@@ -253,17 +291,21 @@ class DistillationConfig(BaseConfig):
     teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
     teacher_key: str = "data_source"
     distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+    skd: SkdConfig = field(default_factory=SkdConfig)
 
     def __post_init__(self):
         if not self.enabled:
             return
 
         self.teacher_models = self._resolve_teacher_models()
+        teacher_system_prompt_path = self.skd.get("teacher_system_prompt_path", None) if self.skd else None
+        extra_prompt_budget = _TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET if teacher_system_prompt_path else 0
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
             teacher_model.validate_and_prepare_for_distillation(
                 use_topk=self.distillation_loss.loss_settings.use_topk,
                 topk=self.distillation_loss.topk,
+                extra_prompt_budget=extra_prompt_budget,
             )
             teacher_world_size_sum += teacher_model.world_size
         total_pool_size = self.n_gpus_per_node * self.nnodes

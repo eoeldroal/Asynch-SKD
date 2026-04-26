@@ -102,6 +102,10 @@ class AgentLoopConfig(BaseConfig):
     # Fully qualified class name for custom AgentLoopManager (e.g., "mypackage.module.MyManager").
     # Security: This class will be dynamically imported via importlib. Only use trusted class paths.
     agent_loop_manager_class: Optional[str] = None
+    # Optional async SKD scheduler knobs. Consumed by AsyncSkdAgentLoopManager.
+    async_skd_mode: str = "sync"
+    async_skd_prefetch_limit: int = 0
+    async_skd_prefetch_worker_target: int = 0
 
 
 @dataclass

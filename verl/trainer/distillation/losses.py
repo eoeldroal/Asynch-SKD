@@ -43,6 +43,14 @@ def is_distillation_enabled(config: Optional[DistillationConfig]) -> bool:
     return config.enabled
 
 
+def is_supervised_distillation_only(config: Optional[DistillationConfig]) -> bool:
+    """Whether distillation runs as pure supervised SKD without PPO-side reward terms."""
+    if not is_distillation_enabled(config):
+        return False
+    loss_config = config.distillation_loss
+    return not loss_config.use_task_rewards and not loss_config.use_policy_gradient
+
+
 @dataclass
 class DistillationLossSettings(BaseConfig):
     """
@@ -207,6 +215,11 @@ def distillation_ppo_loss(
     # Called as final policy loss
     distillation_loss_config = distillation_config.distillation_loss
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
+    if is_supervised_distillation_only(distillation_config):
+        policy_metrics = dict(distill_metrics)
+        policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
+        return distill_loss, policy_metrics
+
     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
     if not distillation_loss_config.use_task_rewards:
         policy_loss = 0.0
@@ -306,12 +319,12 @@ def compute_forward_kl_topk(
     """
     # topk loss has been computed in logits processor
     distillation_losses = no_padding_2_padding(model_output["distillation_losses"], data)
-    student_mass = no_padding_2_padding(model_output["student_mass"], data)
-    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
     if data["response_mask"].is_nested:
         response_mask_bool = data["response_mask"].bool().to_padded_tensor(False)
     else:
         response_mask_bool = data["response_mask"].bool()
+    student_mass = no_padding_2_padding(model_output["student_mass"], data)
+    teacher_mass = no_padding_2_padding(model_output["teacher_mass"], data)
     assert distillation_losses.shape == student_mass.shape == teacher_mass.shape == response_mask_bool.shape
 
     # Log amount of mass in the top-k log probabilities for both student and teacher.

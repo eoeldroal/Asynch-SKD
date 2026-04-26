@@ -15,6 +15,7 @@ import inspect
 import logging
 import os
 import socket
+import zlib
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -35,6 +36,8 @@ __all__ = ["Worker"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_DEFAULT_MASTER_PORT_RANGE = [25000, 25100]
 
 
 def get_random_string(length: int) -> str:
@@ -87,25 +90,30 @@ def sort_placement_group_by_node_ip(pgs: list[PlacementGroup]) -> list[Placement
 
 
 @ray.remote
-def get_master_addr_port(master_port_range: Optional[list[int]] = None) -> tuple[str, str]:
+def get_master_addr_port(master_port_range: Optional[list[int]] = None, port_seed: Optional[str] = None) -> tuple[str, str]:
     addr = ray.util.get_node_ip_address().strip("[]")
 
     if master_port_range is None:
-        with socket.socket() as s:
-            s.bind(("", 0))
-            port = s.getsockname()[1]
+        master_port_range = _DEFAULT_MASTER_PORT_RANGE
+
+    start_port, end_port = master_port_range
+    if end_port <= start_port:
+        raise RuntimeError(f"Invalid master_port_range: {master_port_range}")
+
+    range_size = end_port - start_port
+    offset = zlib.crc32((port_seed or "").encode("utf-8")) % range_size
+
+    for attempt in range(range_size):
+        port = start_port + ((offset + attempt) % range_size)
+        try:
+            with socket.socket() as s:
+                s.bind(("", port))
+                break
+        except OSError:
+            next_port = start_port + ((offset + attempt + 1) % range_size)
+            logger.info("Port %d is already in use, trying port %d", port, next_port)
     else:
-        port = master_port_range[0]
-        while port < master_port_range[1]:
-            try:
-                with socket.socket() as s:
-                    s.bind(("", port))
-                    break
-            except OSError:
-                port += 1  # Increment port number if already in use
-                logger.info("Port %d is already in use, trying port %d", port - 1, port)
-        else:
-            raise RuntimeError(f"Could not find a free port in range {master_port_range}")
+        raise RuntimeError(f"Could not find a free port in range {master_port_range}")
     return addr, str(port)
 
 
@@ -519,7 +527,7 @@ class RayWorkerGroup(WorkerGroup):
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg, placement_group_bundle_index=bundle_index
                     ),
-                ).remote(master_port_range=master_port_range)
+                ).remote(master_port_range=master_port_range, port_seed=self.name_prefix)
             )
         elif self._master_addr is not None and self._master_port is not None:
             logger.debug(f"{self._master_addr=} {self._master_port=}")

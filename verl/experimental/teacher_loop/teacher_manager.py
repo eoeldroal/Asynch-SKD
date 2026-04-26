@@ -33,13 +33,9 @@ def _get_teacher_sampling_params(
     distillation_loss_config: DistillationLossConfig,
 ) -> dict[str, Any]:
     """Get sampling parameters for teacher model when computing log probabilities for distillation."""
-    if teacher_model_config.inference.temperature != 1.0:
-        raise NotImplementedError("vLLM does not support temperature for prompt_logprobs.")
-
     num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
     return {
         "max_tokens": 1,
-        "temperature": teacher_model_config.inference.temperature,
         "prompt_logprobs": num_logprobs,
     }
 
@@ -116,16 +112,29 @@ class AsyncTeacherLLMServerManager:
         sequence_ids: list[int],
         multi_modal_data: Optional[dict[str, Any]] = None,
         routing_key: Optional[str] = None,
+        request_id: Optional[str] = None,
+        logprob_start_len: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
+        teacher_backend = teacher_model_config.inference.name
+        if logprob_start_len > 0 and teacher_backend != "sglang":
+            raise ValueError(
+                f"SKD delta verification requires SGLang teacher inference for teacher key {teacher_key!r}, "
+                f"but backend is {teacher_backend!r}."
+            )
+
+        sampling_params = _get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config)
+        if logprob_start_len > 0:
+            sampling_params["prompt_logprobs_start_len"] = logprob_start_len
+
         server_manager = self.server_managers[teacher_key]
         teacher_output = await server_manager.generate(
-            request_id=uuid4().hex,
+            request_id=request_id or uuid4().hex,
             prompt_ids=sequence_ids,
-            sampling_params=_get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config),
+            sampling_params=sampling_params,
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
         )
@@ -133,5 +142,15 @@ class AsyncTeacherLLMServerManager:
         # the distillation loss settings.
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-        assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+        expected_len = len(sequence_ids) if logprob_start_len == 0 else len(sequence_ids) - logprob_start_len - 1
+        if expected_len < 0:
+            raise ValueError(
+                f"Invalid teacher logprob_start_len={logprob_start_len} for seq_len={len(sequence_ids)}."
+            )
+        if teacher_ids.shape[0] != expected_len or teacher_logprobs.shape[0] != expected_len:
+            raise ValueError(
+                f"Unexpected teacher logprob length for teacher key {teacher_key!r}: "
+                f"ids={teacher_ids.shape[0]}, logprobs={teacher_logprobs.shape[0]}, "
+                f"expected={expected_len}, seq_len={len(sequence_ids)}, start={logprob_start_len}."
+            )
         return teacher_ids, teacher_logprobs

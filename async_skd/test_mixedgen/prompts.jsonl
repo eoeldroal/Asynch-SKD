@@ -1,0 +1,8 @@
+{"uid":"math_000","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 2 + 3. Answer with only the number."}]}
+{"uid":"math_001","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 9 - 4. Answer with only the number."}]}
+{"uid":"math_002","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 6 * 7. Answer with only the number."}]}
+{"uid":"math_003","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 48 / 6. Answer with only the number."}]}
+{"uid":"math_004","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 15 + 28. Answer with only the number."}]}
+{"uid":"math_005","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 100 - 37. Answer with only the number."}]}
+{"uid":"math_006","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 12 * 12. Answer with only the number."}]}
+{"uid":"math_007","data_source":"default","raw_prompt":[{"role":"user","content":"Compute 81 / 9. Answer with only the number."}]}
