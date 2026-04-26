@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import os
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -22,6 +23,15 @@ if TYPE_CHECKING:
 
 
 _ASYNC_SKD_INPUT_NON_TENSOR_BATCH = "async_skd_input_non_tensor_batch"
+_ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+
+
+def _trace_async_skd(stage: str, **fields: Any) -> None:
+    if _ASYNC_SKD_TRACE <= 0:
+        return
+    parts = [f"{key}={value!r}" for key, value in fields.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
 
 
 class AsyncSkdAgentLoopWorker(AgentLoopWorker):
@@ -144,6 +154,21 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             kwargs = {}
             validate = False
             input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
+        _trace_async_skd(
+            "worker.generate_until_boundary.entry",
+            sample_id=sample_id,
+            logical_step=logical_step,
+            source_type=source_type,
+            has_batch=batch is not None,
+            partial_request_id=None if partial_state is None else partial_state.request_id,
+            incoming_teacher_replica_id=kwargs.get("teacher_replica_id")
+            if batch is not None
+            else partial_state.extra_fields.get("teacher_replica_id"),
+            incoming_teacher_routing_key=kwargs.get("data_source")
+            if batch is not None
+            else partial_state.extra_fields.get("teacher_routing_key"),
+            incoming_non_tensor_keys=sorted(input_non_tensor_batch.keys()),
+        )
 
         sampling_params = self._build_sampling_params(validate=validate)
         agent_loop = self._get_or_create_agent_loop(agent_name)
@@ -168,6 +193,18 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         if isinstance(result, SkdPartialState):
             if batch is not None:
                 result.extra_fields[_ASYNC_SKD_INPUT_NON_TENSOR_BATCH] = deepcopy(input_non_tensor_batch)
+            _trace_async_skd(
+                "worker.generate_until_boundary.partial",
+                sample_id=result.sample_id,
+                logical_step=result.logical_step,
+                source_type=result.source_type,
+                request_id=result.request_id,
+                teacher_replica_id=result.extra_fields.get("teacher_replica_id"),
+                teacher_routing_key=result.extra_fields.get("teacher_routing_key"),
+                response_len=len(result.response_mask),
+                committed_gen_chunks=result.committed_gen_chunks,
+                committed_prefix_tokens=result.committed_prefix_tokens,
+            )
             return AsyncSkdSample.from_partial(partial_state=result)
 
         if not isinstance(result, AgentLoopOutput):
@@ -180,6 +217,14 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             [internal_output],
             input_non_tensor_batch=input_non_tensor_batch,
             validate=validate,
+        )
+        _trace_async_skd(
+            "worker.generate_until_boundary.completed",
+            sample_id=sample_id,
+            logical_step=logical_step,
+            source_type=source_type,
+            teacher_replica_id=internal_output.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=internal_output.extra_fields.get("teacher_routing_key"),
         )
         return AsyncSkdSample.from_completed(
             sample_id=sample_id,
@@ -204,6 +249,18 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             f"start_prefix_tokens={partial_state.committed_prefix_tokens}",
             flush=True,
         )
+        _trace_async_skd(
+            "worker.generate_from_partial.entry",
+            sample_id=partial_state.sample_id,
+            logical_step=partial_state.logical_step,
+            source_type=source_type,
+            request_id=partial_state.request_id,
+            teacher_replica_id=partial_state.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=partial_state.extra_fields.get("teacher_routing_key"),
+            response_len=len(partial_state.response_mask),
+            committed_gen_chunks=partial_state.committed_gen_chunks,
+            committed_prefix_tokens=partial_state.committed_prefix_tokens,
+        )
         input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
         sampling_params = self._build_sampling_params(validate=False)
         agent_loop = self._get_or_create_agent_loop(agent_name)
@@ -227,6 +284,16 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             [internal_output],
             input_non_tensor_batch=input_non_tensor_batch,
             validate=False,
+        )
+        _trace_async_skd(
+            "worker.generate_from_partial.completed",
+            sample_id=partial_state.sample_id,
+            logical_step=partial_state.logical_step,
+            source_type=source_type,
+            parent_request_id=partial_state.request_id,
+            current_request_id=internal_output.extra_fields.get("request_id"),
+            teacher_replica_id=internal_output.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=internal_output.extra_fields.get("teacher_routing_key"),
         )
         return AsyncSkdSample.from_completed(
             sample_id=partial_state.sample_id,

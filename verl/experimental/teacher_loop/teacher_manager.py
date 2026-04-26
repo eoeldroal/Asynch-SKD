@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -26,6 +27,16 @@ from verl.workers.config import (
     DistillationLossConfig,
     DistillationTeacherModelConfig,
 )
+
+_ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+
+
+def _trace_async_skd(stage: str, **fields: Any) -> None:
+    if _ASYNC_SKD_TRACE <= 0:
+        return
+    parts = [f"{key}={value!r}" for key, value in fields.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
 
 
 def _get_teacher_sampling_params(
@@ -91,6 +102,16 @@ class AsyncTeacherLLMServerManager:
             for key in self.teacher_model_configs
         }
 
+    def server_ids_for_routing_key(self, routing_key: Optional[str] = None) -> list[str]:
+        teacher_key = self._resolve_teacher_key(routing_key)
+        return list(self.server_managers[teacher_key]._server_id_to_handle.keys())
+
+    def server_ids_by_routing_key(self) -> dict[str, list[str]]:
+        return {
+            teacher_key: list(server_manager._server_id_to_handle.keys())
+            for teacher_key, server_manager in self.server_managers.items()
+        }
+
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
             # Single-teacher path: route everything to the one teacher regardless of the sample's key.
@@ -107,8 +128,15 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
-    async def bind_sticky_request(self, *, routing_key: str, request_id: str, server_id: str) -> None:
+    async def bind_sticky_request(self, *, routing_key: Optional[str] = None, request_id: str, server_id: str) -> None:
         teacher_key = self._resolve_teacher_key(routing_key)
+        _trace_async_skd(
+            "teacher.bind_sticky_request",
+            teacher_key=teacher_key,
+            routing_key=routing_key,
+            request_id=request_id,
+            server_id=server_id,
+        )
         await self.server_managers[teacher_key]._load_balancer.bind_request_to_server.remote(
             request_id=request_id,
             server_id=server_id,
@@ -144,6 +172,14 @@ class AsyncTeacherLLMServerManager:
             sampling_params["prompt_logprobs_start_len"] = logprob_start_len
 
         server_manager = self.server_managers[teacher_key]
+        _trace_async_skd(
+            "teacher.compute_logprobs_single",
+            teacher_key=teacher_key,
+            routing_key=routing_key,
+            request_id=request_id,
+            seq_len=len(sequence_ids),
+            logprob_start_len=logprob_start_len,
+        )
         teacher_output = await server_manager.generate(
             request_id=request_id or uuid4().hex,
             prompt_ids=sequence_ids,

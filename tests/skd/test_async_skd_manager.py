@@ -11,6 +11,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.experimental.async_skd.manager import AsyncSkdAgentLoopManager
+from verl.experimental.async_skd.state import SkdPartialState
 from verl.protocol import DataProto
 
 
@@ -34,6 +35,11 @@ class _FakeWorker:
         self._calls.append((self._name, input_pos))
         await asyncio.sleep(self._delays.get(input_pos, 0.0))
         return _make_output(input_pos)
+
+
+class _FakeTeacherModelManager:
+    def __init__(self, server_addresses: dict[str, list[str]]):
+        self.server_addresses = server_addresses
 
 
 def _make_prompts(batch_size: int) -> DataProto:
@@ -135,3 +141,110 @@ def test_async_skd_manager_mode_defaults_to_sync():
 
     manager.config = OmegaConf.create({})
     assert manager._async_skd_mode() == "sync"
+
+
+def test_teacher_server_id_map_refreshes_when_initial_cache_is_empty():
+    manager, _ = _make_manager()
+    manager._teacher_server_ids_by_routing_key = {}
+    manager.teacher_model_manager = _FakeTeacherModelManager(
+        {
+            "default": ["teacher-0", "teacher-1"],
+        }
+    )
+
+    server_id_map = manager._teacher_server_id_map()
+
+    assert server_id_map == {"default": ["teacher-0", "teacher-1"]}
+    assert manager._teacher_server_ids_by_routing_key == {"default": ["teacher-0", "teacher-1"]}
+
+
+def test_resolve_teacher_routing_key_recovers_from_empty_cache_via_lazy_refresh():
+    manager, _ = _make_manager()
+    manager._teacher_server_ids_by_routing_key = {}
+    manager.teacher_model_manager = _FakeTeacherModelManager(
+        {
+            "default": ["teacher-0", "teacher-1"],
+        }
+    )
+
+    resolved = manager._resolve_teacher_routing_key("nvidia/Nemotron-Cascade-RL-Math")
+
+    assert resolved == "default"
+
+
+def test_teacher_server_id_map_loads_from_parent_teacher_model_manager():
+    manager, _ = _make_manager()
+    manager._teacher_server_ids_by_routing_key = {}
+    manager.teacher_model_manager = _FakeTeacherModelManager(
+        {
+            "default": [
+                "http://teacher-0",
+                "http://teacher-1",
+            ]
+        }
+    )
+
+    server_id_map = manager._teacher_server_id_map()
+
+    assert server_id_map == {"default": ["http://teacher-0", "http://teacher-1"]}
+    assert manager._resolve_teacher_routing_key("nvidia/Nemotron-Cascade-RL-Math") == "default"
+
+
+def test_parent_teacher_model_manager_is_used_when_worker_teacher_client_is_absent():
+    manager, _ = _make_manager()
+    manager._teacher_server_ids_by_routing_key = {}
+    manager.teacher_model_manager = _FakeTeacherModelManager(
+        {
+            "default": [
+                "http://teacher-0",
+                "http://teacher-1",
+            ]
+        }
+    )
+
+    assert manager._teacher_replica_ids_for_planning(routing_key="nvidia/Nemotron-Cascade-RL-Math") == [
+        "http://teacher-0",
+        "http://teacher-1",
+    ]
+
+
+def test_teacher_sticky_carryover_can_be_disabled_via_config():
+    manager, _ = _make_manager()
+    manager.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "n": 1,
+                    "agent": {
+                        "async_skd_mode": "lookahead",
+                        "async_skd_teacher_sticky_carryover": False,
+                    },
+                }
+            }
+        }
+    )
+    manager._teacher_server_ids_by_routing_key = {"default": ["teacher-0", "teacher-1"]}
+    manager._teacher_replica_pin_by_sample_id = {"carry-1": "teacher-1"}
+    manager._teacher_routing_key_by_sample_id = {"carry-1": "default"}
+
+    partial = SkdPartialState(
+        sample_id="carry-1",
+        logical_step=4,
+        source_type="resumed_current",
+        agent_state="generating",
+        request_id="req-carry-1",
+        extra_fields={"teacher_replica_id": "teacher-1", "teacher_routing_key": "default"},
+    )
+
+    assignments = manager._plan_teacher_replica_assignments(
+        carryover_sample_ids=["carry-1"],
+        fresh_sample_ids=[],
+        carryover_partials=[partial],
+        fresh_payloads_by_sample_id={},
+    )
+
+    assert assignments == {"carry-1": "teacher-0"}
+    assert manager._teacher_replica_last_plan_stats == {
+        "async_skd/teacher_pinned_carryover_count": 0,
+        "async_skd/teacher_fallback_carryover_count": 0,
+    }

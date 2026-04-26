@@ -7,6 +7,7 @@ import math
 import time
 from typing import Any
 
+import numpy as np
 from omegaconf import OmegaConf
 import ray
 
@@ -41,7 +42,9 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         self.agent_loop_workers_class = ray.remote(AsyncSkdAgentLoopWorker)
         self._async_skd_data_source = None
         self._teacher_replica_pin_by_sample_id: dict[str, str] = {}
+        self._teacher_routing_key_by_sample_id: dict[str, str] = {}
         self._teacher_replica_last_plan_stats: dict[str, Any] = {}
+        self._teacher_server_ids_by_routing_key = self._load_teacher_server_ids_by_routing_key()
 
     def set_async_skd_data_source(self, source: Any | None) -> None:
         self._async_skd_data_source = source
@@ -110,6 +113,14 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             return worker_capacity
         return max(1, min(target, worker_capacity))
 
+    def _teacher_sticky_carryover_enabled(self) -> bool:
+        value = OmegaConf.select(
+            self.config,
+            "actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover",
+            default=True,
+        )
+        return bool(value)
+
     def _next_lookahead_sample(self, logical_step: int) -> tuple[str, DataProto] | None:
         source = self._get_async_skd_data_source()
         if source is None:
@@ -123,38 +134,83 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         carryover_count = len(getattr(self, "_async_skd_carryover_partials", []))
         return max(0, base_batch_size - carryover_count)
 
+    @staticmethod
+    def _normalize_teacher_server_id_map(server_id_map: Any) -> dict[str, list[str]]:
+        if not server_id_map:
+            return {}
+        if isinstance(server_id_map, dict):
+            return {
+                str(routing_key): [str(server_id) for server_id in server_ids if server_id is not None]
+                for routing_key, server_ids in server_id_map.items()
+                if server_ids
+            }
+        return {"default": [str(server_id) for server_id in server_id_map if server_id is not None]}
+
+    def _load_teacher_server_ids_by_routing_key(self) -> dict[str, list[str]]:
+        teacher_model_manager = getattr(self, "teacher_model_manager", None)
+        if teacher_model_manager is None:
+            return {}
+        return self._normalize_teacher_server_id_map(getattr(teacher_model_manager, "server_addresses", None))
+
+    def _refresh_teacher_server_ids_by_routing_key(self, *, reason: str) -> dict[str, list[str]]:
+        server_id_map = self._load_teacher_server_ids_by_routing_key()
+        self._teacher_server_ids_by_routing_key = server_id_map
+        return server_id_map
+
+    def _teacher_server_id_map(self) -> dict[str, list[str]]:
+        server_ids_by_routing_key = getattr(self, "_teacher_server_ids_by_routing_key", None)
+        if server_ids_by_routing_key:
+            return {
+                str(routing_key): [str(server_id) for server_id in server_ids]
+                for routing_key, server_ids in server_ids_by_routing_key.items()
+            }
+        server_ids_by_routing_key = self._refresh_teacher_server_ids_by_routing_key(reason="empty_cache")
+        if server_ids_by_routing_key:
+            return {
+                str(routing_key): [str(server_id) for server_id in server_ids]
+                for routing_key, server_ids in server_ids_by_routing_key.items()
+            }
+        return {}
+
+    def _resolve_teacher_routing_key(self, routing_key: Any | None) -> str | None:
+        server_id_map = self._teacher_server_id_map()
+        if not server_id_map:
+            server_id_map = self._refresh_teacher_server_ids_by_routing_key(reason="resolve_routing_key")
+        if not server_id_map:
+            return None
+        if routing_key is not None:
+            routing_key = str(routing_key)
+            if routing_key in server_id_map:
+                return routing_key
+        if len(server_id_map) == 1:
+            return next(iter(server_id_map))
+        return None
+
+    def _teacher_routing_key_from_partial(self, partial: SkdPartialState) -> str | None:
+        return self._resolve_teacher_routing_key(partial.extra_fields.get("teacher_routing_key"))
+
+    def _teacher_routing_key_from_payload(self, payload: Any) -> str | None:
+        if isinstance(payload, SkdPartialState):
+            return self._teacher_routing_key_from_partial(payload)
+        if isinstance(payload, DataProto):
+            teacher_key = getattr(self, "teacher_key", "data_source")
+            if teacher_key in payload.non_tensor_batch:
+                routing_key = payload.non_tensor_batch[teacher_key][0]
+                if hasattr(routing_key, "item"):
+                    routing_key = routing_key.item()
+                return self._resolve_teacher_routing_key(routing_key)
+        return self._resolve_teacher_routing_key(None)
+
     def _teacher_replica_ids_for_planning(
         self,
-        carryover_partials: list[SkdPartialState] | None = None,
+        *,
+        routing_key: Any | None = None,
     ) -> list[str]:
-        replica_ids: list[str] = []
-
-        explicit_replica_ids = getattr(self, "_teacher_replica_ids", None)
-        if explicit_replica_ids:
-            replica_ids.extend(str(replica_id) for replica_id in explicit_replica_ids)
-        else:
-            worker_count = len(getattr(self, "agent_loop_workers", []))
-            if worker_count <= 0:
-                worker_count = 1
-            replica_ids.extend(f"teacher-replica-{idx}" for idx in range(worker_count))
-
-        if carryover_partials is not None:
-            for partial in carryover_partials:
-                teacher_replica_id = partial.extra_fields.get("teacher_replica_id")
-                if teacher_replica_id is None:
-                    continue
-                teacher_replica_id = str(teacher_replica_id)
-                if teacher_replica_id not in replica_ids:
-                    replica_ids.append(teacher_replica_id)
-
-        for teacher_replica_id in getattr(self, "_teacher_replica_pin_by_sample_id", {}).values():
-            if teacher_replica_id not in replica_ids:
-                replica_ids.append(teacher_replica_id)
-
-        if not replica_ids:
-            replica_ids.append("teacher-replica-0")
-
-        return replica_ids
+        resolved_routing_key = self._resolve_teacher_routing_key(routing_key)
+        if resolved_routing_key is None:
+            return []
+        server_id_map = self._teacher_server_id_map()
+        return list(server_id_map.get(resolved_routing_key, []))
 
     def _teacher_replica_id_from_partial(self, partial: SkdPartialState) -> str | None:
         teacher_replica_id = partial.extra_fields.get("teacher_replica_id")
@@ -162,18 +218,71 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             return None
         return str(teacher_replica_id)
 
-    def _choose_teacher_replica_for_lookahead(self) -> str:
-        replica_ids = self._teacher_replica_ids_for_planning()
+    def _choose_teacher_replica_for_lookahead(self, routing_key: Any | None = None) -> str | None:
+        resolved_routing_key = self._resolve_teacher_routing_key(routing_key)
+        replica_ids = self._teacher_replica_ids_for_planning(routing_key=resolved_routing_key)
+        if not replica_ids:
+            return None
         replica_order = {replica_id: idx for idx, replica_id in enumerate(replica_ids)}
         replica_loads: dict[str, int] = {replica_id: 0 for replica_id in replica_ids}
-        for teacher_replica_id in getattr(self, "_teacher_replica_pin_by_sample_id", {}).values():
+        teacher_routing_key_by_sample_id = getattr(self, "_teacher_routing_key_by_sample_id", {})
+        for sample_id, teacher_replica_id in getattr(self, "_teacher_replica_pin_by_sample_id", {}).items():
+            if self._resolve_teacher_routing_key(teacher_routing_key_by_sample_id.get(sample_id)) != resolved_routing_key:
+                continue
             teacher_replica_id = str(teacher_replica_id)
             if teacher_replica_id not in replica_loads:
-                replica_order[teacher_replica_id] = len(replica_order)
-                replica_loads[teacher_replica_id] = 0
-                replica_ids.append(teacher_replica_id)
+                continue
             replica_loads[teacher_replica_id] += 1
         return min(replica_ids, key=lambda replica_id: (replica_loads[replica_id], replica_order[replica_id]))
+
+    @staticmethod
+    def _object_array(value: Any) -> np.ndarray:
+        array = np.empty(1, dtype=object)
+        array[0] = value
+        return array
+
+    def _apply_teacher_assignment(
+        self,
+        *,
+        sample_id: str,
+        teacher_replica_id: str | None,
+        teacher_routing_key: str | None,
+        payload: Any,
+    ) -> None:
+        if teacher_replica_id is None:
+            return
+        teacher_replica_id = str(teacher_replica_id)
+        teacher_replica_pin_by_sample_id = getattr(self, "_teacher_replica_pin_by_sample_id", None)
+        if teacher_replica_pin_by_sample_id is None:
+            teacher_replica_pin_by_sample_id = {}
+            self._teacher_replica_pin_by_sample_id = teacher_replica_pin_by_sample_id
+        teacher_replica_pin_by_sample_id[sample_id] = teacher_replica_id
+        if teacher_routing_key is not None:
+            teacher_routing_key_by_sample_id = getattr(self, "_teacher_routing_key_by_sample_id", None)
+            if teacher_routing_key_by_sample_id is None:
+                teacher_routing_key_by_sample_id = {}
+                self._teacher_routing_key_by_sample_id = teacher_routing_key_by_sample_id
+            teacher_routing_key_by_sample_id[sample_id] = str(teacher_routing_key)
+
+        if isinstance(payload, SkdPartialState):
+            payload.extra_fields["teacher_replica_id"] = teacher_replica_id
+            if teacher_routing_key is not None and payload.extra_fields.get("teacher_routing_key") is None:
+                payload.extra_fields["teacher_routing_key"] = str(teacher_routing_key)
+            return
+
+        if isinstance(payload, DataProto):
+            payload.non_tensor_batch["teacher_replica_id"] = self._object_array(teacher_replica_id)
+            teacher_key = getattr(self, "teacher_key", "data_source")
+            if teacher_routing_key is not None and teacher_key not in payload.non_tensor_batch:
+                payload.non_tensor_batch[teacher_key] = self._object_array(str(teacher_routing_key))
+
+    def _clear_teacher_assignment(self, sample_id: str) -> None:
+        teacher_replica_pin_by_sample_id = getattr(self, "_teacher_replica_pin_by_sample_id", None)
+        if teacher_replica_pin_by_sample_id is not None:
+            teacher_replica_pin_by_sample_id.pop(sample_id, None)
+        teacher_routing_key_by_sample_id = getattr(self, "_teacher_routing_key_by_sample_id", None)
+        if teacher_routing_key_by_sample_id is not None:
+            teacher_routing_key_by_sample_id.pop(sample_id, None)
 
     def _plan_teacher_replica_assignments(
         self,
@@ -181,48 +290,83 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         carryover_sample_ids: list[str],
         fresh_sample_ids: list[str],
         carryover_partials: list[SkdPartialState] | None = None,
+        fresh_payloads_by_sample_id: dict[str, Any] | None = None,
     ) -> dict[str, str]:
-        replica_ids = self._teacher_replica_ids_for_planning(carryover_partials=carryover_partials)
-        replica_order = {replica_id: idx for idx, replica_id in enumerate(replica_ids)}
-        replica_loads: dict[str, int] = {replica_id: 0 for replica_id in replica_ids}
         assignments: dict[str, str] = {}
         pinned_carryover_count = 0
         fallback_carryover_count = 0
+        sticky_carryover_enabled = self._teacher_sticky_carryover_enabled()
 
         carryover_partial_by_sample_id = (
             {partial.sample_id: partial for partial in carryover_partials} if carryover_partials is not None else {}
         )
+        fresh_payloads_by_sample_id = fresh_payloads_by_sample_id or {}
+        active_sample_ids = set(carryover_sample_ids) | set(fresh_sample_ids)
+        pool_state_by_routing_key: dict[str | None, tuple[list[str], dict[str, int], dict[str, int]]] = {}
 
-        def choose_least_loaded_replica() -> str:
+        def ensure_pool_state(routing_key: str | None) -> tuple[list[str], dict[str, int], dict[str, int]]:
+            resolved_routing_key = self._resolve_teacher_routing_key(routing_key)
+            if resolved_routing_key in pool_state_by_routing_key:
+                return pool_state_by_routing_key[resolved_routing_key]
+
+            replica_ids = self._teacher_replica_ids_for_planning(routing_key=resolved_routing_key)
+            replica_order = {replica_id: idx for idx, replica_id in enumerate(replica_ids)}
+            replica_loads: dict[str, int] = {replica_id: 0 for replica_id in replica_ids}
+
+            teacher_routing_key_by_sample_id = getattr(self, "_teacher_routing_key_by_sample_id", {})
+            for sample_id, teacher_replica_id in getattr(self, "_teacher_replica_pin_by_sample_id", {}).items():
+                if sample_id in active_sample_ids:
+                    continue
+                if self._resolve_teacher_routing_key(teacher_routing_key_by_sample_id.get(sample_id)) != resolved_routing_key:
+                    continue
+                teacher_replica_id = str(teacher_replica_id)
+                if teacher_replica_id in replica_loads:
+                    replica_loads[teacher_replica_id] += 1
+
+            pool_state_by_routing_key[resolved_routing_key] = (replica_ids, replica_order, replica_loads)
+            return pool_state_by_routing_key[resolved_routing_key]
+
+        def choose_least_loaded_replica(routing_key: str | None) -> str | None:
+            replica_ids, replica_order, replica_loads = ensure_pool_state(routing_key)
+            if not replica_ids:
+                return None
             return min(replica_ids, key=lambda replica_id: (replica_loads[replica_id], replica_order[replica_id]))
 
         for sample_id in carryover_sample_ids:
-            teacher_replica_id = getattr(self, "_teacher_replica_pin_by_sample_id", {}).get(sample_id)
-            hard_pinned = teacher_replica_id is not None
-            if teacher_replica_id is None:
-                partial = carryover_partial_by_sample_id.get(sample_id)
-                if partial is not None:
-                    teacher_replica_id = self._teacher_replica_id_from_partial(partial)
-                    hard_pinned = teacher_replica_id is not None
-            if teacher_replica_id is None:
-                teacher_replica_id = choose_least_loaded_replica()
-                fallback_carryover_count += 1
+            partial = carryover_partial_by_sample_id.get(sample_id)
+            routing_key = self._teacher_routing_key_from_partial(partial) if partial is not None else None
+            replica_ids, _, replica_loads = ensure_pool_state(routing_key)
+            teacher_replica_id = (
+                getattr(self, "_teacher_replica_pin_by_sample_id", {}).get(sample_id)
+                if sticky_carryover_enabled
+                else None
+            )
+            hard_pinned = teacher_replica_id is not None and str(teacher_replica_id) in replica_loads
+            if sticky_carryover_enabled and not hard_pinned and partial is not None:
+                teacher_replica_id = self._teacher_replica_id_from_partial(partial)
+                hard_pinned = teacher_replica_id is not None and str(teacher_replica_id) in replica_loads
+            if teacher_replica_id is None or str(teacher_replica_id) not in replica_loads:
+                teacher_replica_id = choose_least_loaded_replica(routing_key)
+                if sticky_carryover_enabled:
+                    fallback_carryover_count += 1
             else:
                 teacher_replica_id = str(teacher_replica_id)
 
-            if teacher_replica_id not in replica_loads:
-                replica_order[teacher_replica_id] = len(replica_order)
-                replica_loads[teacher_replica_id] = 0
-                if teacher_replica_id not in replica_ids:
-                    replica_ids.append(teacher_replica_id)
-
+            if teacher_replica_id is None:
+                continue
             assignments[sample_id] = teacher_replica_id
             replica_loads[teacher_replica_id] += 1
             if hard_pinned:
                 pinned_carryover_count += 1
 
         for sample_id in fresh_sample_ids:
-            teacher_replica_id = choose_least_loaded_replica()
+            routing_key = self._teacher_routing_key_from_payload(fresh_payloads_by_sample_id.get(sample_id))
+            replica_ids, _, replica_loads = ensure_pool_state(routing_key)
+            if not replica_ids:
+                continue
+            teacher_replica_id = choose_least_loaded_replica(routing_key)
+            if teacher_replica_id is None:
+                continue
             assignments[sample_id] = teacher_replica_id
             replica_loads[teacher_replica_id] += 1
 
@@ -230,12 +374,21 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         if teacher_replica_pin_by_sample_id is None:
             teacher_replica_pin_by_sample_id = {}
             self._teacher_replica_pin_by_sample_id = teacher_replica_pin_by_sample_id
-        teacher_replica_pin_by_sample_id.update(assignments)
+        teacher_routing_key_by_sample_id = getattr(self, "_teacher_routing_key_by_sample_id", None)
+        if teacher_routing_key_by_sample_id is None:
+            teacher_routing_key_by_sample_id = {}
+            self._teacher_routing_key_by_sample_id = teacher_routing_key_by_sample_id
+        for sample_id, teacher_replica_id in assignments.items():
+            teacher_replica_pin_by_sample_id[sample_id] = teacher_replica_id
+            if sample_id in carryover_partial_by_sample_id:
+                routing_key = self._teacher_routing_key_from_partial(carryover_partial_by_sample_id[sample_id])
+            else:
+                routing_key = self._teacher_routing_key_from_payload(fresh_payloads_by_sample_id.get(sample_id))
+            if routing_key is not None:
+                teacher_routing_key_by_sample_id[sample_id] = routing_key
         self._teacher_replica_last_plan_stats = {
             "async_skd/teacher_pinned_carryover_count": pinned_carryover_count,
             "async_skd/teacher_fallback_carryover_count": fallback_carryover_count,
-            "async_skd/teacher_rebalanced_fresh_count": len(fresh_sample_ids),
-            "async_skd/teacher_replica_count": len(replica_ids),
         }
         self._async_skd_last_step_metrics = dict(self._teacher_replica_last_plan_stats)
         return assignments
@@ -300,10 +453,16 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             for kind, order, payload in current_items
             if kind == "fresh"
         ]
+        fresh_payloads_by_sample_id = {
+            sample_id_for_item(kind, order, payload): payload
+            for kind, order, payload in current_items
+            if kind == "fresh"
+        }
         current_teacher_replica_by_sample_id = self._plan_teacher_replica_assignments(
             carryover_sample_ids=carryover_sample_ids,
             fresh_sample_ids=fresh_sample_ids,
             carryover_partials=carryover_partials,
+            fresh_payloads_by_sample_id=fresh_payloads_by_sample_id,
         )
 
         def teacher_replica_id_for_item(kind: str, order: int, payload: Any) -> str | None:
@@ -434,6 +593,13 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             teacher_replica_id = None
             if teacher_replica_id_for_item is not None:
                 teacher_replica_id = teacher_replica_id_for_item(kind, order, payload)
+            teacher_routing_key = self._teacher_routing_key_from_payload(payload)
+            self._apply_teacher_assignment(
+                sample_id=sample_id,
+                teacher_replica_id=teacher_replica_id,
+                teacher_routing_key=teacher_routing_key,
+                payload=payload,
+            )
             event_context = {
                 "global_step": logical_step,
                 "logical_step": logical_step,
@@ -460,11 +626,11 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 "order": order,
                 "worker_idx": worker_idx,
                 "sample_id": sample_id,
-                    "source_type": source_type,
-                    "barrier_role": "current",
-                    "launch_ts": time.time(),
-                    "teacher_replica_id": teacher_replica_id,
-                }
+                "source_type": source_type,
+                "barrier_role": "current",
+                "launch_ts": time.time(),
+                "teacher_replica_id": teacher_replica_id,
+            }
             emit_async_skd_event(
                 "sample_launch",
                 global_step=logical_step,
@@ -481,10 +647,19 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
 
         def launch_lookahead_batch(sample_id: str, sample: DataProto, admission_order: int, worker_idx: int) -> None:
             worker = worker_for_idx(worker_idx)
+            teacher_routing_key = self._teacher_routing_key_from_payload(sample)
             teacher_replica_id = getattr(self, "_teacher_replica_pin_by_sample_id", {}).get(sample_id)
-            if teacher_replica_id is None:
-                teacher_replica_id = self._choose_teacher_replica_for_lookahead()
-                self._teacher_replica_pin_by_sample_id[sample_id] = teacher_replica_id
+            valid_replica_ids = set(self._teacher_replica_ids_for_planning(routing_key=teacher_routing_key))
+            if teacher_replica_id is not None:
+                teacher_replica_id = str(teacher_replica_id)
+            if teacher_replica_id not in valid_replica_ids:
+                teacher_replica_id = self._choose_teacher_replica_for_lookahead(teacher_routing_key)
+            self._apply_teacher_assignment(
+                sample_id=sample_id,
+                teacher_replica_id=teacher_replica_id,
+                teacher_routing_key=teacher_routing_key,
+                payload=sample,
+            )
             task = asyncio.ensure_future(
                 worker.generate_skd_until_boundary.remote(
                     sample,
@@ -556,7 +731,19 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
 
         def launch_lookahead_partial(partial_state: SkdPartialState, admission_order: int, worker_idx: int) -> None:
             worker = worker_for_idx(worker_idx)
+            teacher_routing_key = self._teacher_routing_key_from_partial(partial_state)
             teacher_replica_id = partial_state.extra_fields.get("teacher_replica_id")
+            valid_replica_ids = set(self._teacher_replica_ids_for_planning(routing_key=teacher_routing_key))
+            if teacher_replica_id is not None:
+                teacher_replica_id = str(teacher_replica_id)
+            if teacher_replica_id not in valid_replica_ids:
+                teacher_replica_id = self._choose_teacher_replica_for_lookahead(teacher_routing_key)
+            self._apply_teacher_assignment(
+                sample_id=partial_state.sample_id,
+                teacher_replica_id=teacher_replica_id,
+                teacher_routing_key=teacher_routing_key,
+                payload=partial_state,
+            )
             task = asyncio.ensure_future(
                 worker.generate_skd_until_boundary.remote(
                     None,
@@ -655,6 +842,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         worker_active_after=active_after,
                         worker_capacity=worker_capacity,
                     )
+                    self._clear_teacher_assignment(str(meta["sample_id"]))
                     if not current_active and not drain_requested:
                         actual_lt_sample_id = str(meta["sample_id"])
                         print(
@@ -706,6 +894,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         worker_capacity=worker_capacity,
                     )
                     if sample.kind == "completed":
+                        self._clear_teacher_assignment(sample.sample_id)
                         promoted_lookahead.append((admission_order, sample))
                         if not drain_requested:
                             try_admit_lookahead(worker_idx)

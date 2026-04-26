@@ -16,6 +16,7 @@ from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
 from tests.experimental.agent_loop.test_agent_loop_extra_fields_schema_on_cpu import _FakeTokenizer
+from tests.skd.test_skd_logic import make_skd_loop
 
 
 LOSS_TOP_K = 4
@@ -45,6 +46,21 @@ def make_single_batch() -> DataProto:
             "index": np.array([7], dtype=object),
             "agent_name": np.array(["skd_agent"], dtype=object),
             "reward_model": np.array([{"ground_truth": "42"}], dtype=object),
+        },
+        meta_info={"global_steps": 12, "validate": False},
+    )
+
+
+def make_single_batch_with_teacher_assignment() -> DataProto:
+    raw_prompt = [{"role": "user", "content": "hi"}]
+    return DataProto.from_dict(
+        non_tensors={
+            "raw_prompt": _object_array([raw_prompt]),
+            "index": np.array([7], dtype=object),
+            "agent_name": np.array(["skd_agent"], dtype=object),
+            "reward_model": np.array([{"ground_truth": "42"}], dtype=object),
+            "data_source": np.array(["default"], dtype=object),
+            "teacher_replica_id": np.array(["teacher-server-2"], dtype=object),
         },
         meta_info={"global_steps": 12, "validate": False},
     )
@@ -159,6 +175,39 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
         return self.loop
 
 
+class _RealLoopBoundaryWorker(AsyncSkdAgentLoopWorker):
+    reward_loop_worker_handles = None
+    distillation_enabled = False
+    stream_teacher_with_rollout = False
+    processor = None
+
+    def __init__(self):
+        self.rollout_config = OmegaConf.create(
+            {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 50,
+                "calculate_log_probs": False,
+                "prompt_length": 4,
+                "response_length": 16,
+                "val_kwargs": {"temperature": 0.0, "top_p": 1.0, "top_k": -1},
+                "agent": {"default_agent_loop": "skd_agent"},
+            }
+        )
+        self.tokenizer = _FakeTokenizer()
+        self.loop = make_skd_loop(student_chunks=[[10]], teacher_topk_by_call=[{}], response_length=16)
+
+        async def fake_apply_chat_template(messages, tools=None, images=None, videos=None, **kwargs):
+            del messages, tools, images, videos, kwargs
+            return [1, 2, 3]
+
+        self.loop.apply_chat_template = fake_apply_chat_template
+
+    def _get_or_create_agent_loop(self, agent_name: str):
+        assert agent_name == "skd_agent"
+        return self.loop
+
+
 @pytest.mark.asyncio
 async def test_generate_skd_until_boundary_wraps_partial_result_from_fresh_batch():
     partial = make_partial()
@@ -180,6 +229,24 @@ async def test_generate_skd_until_boundary_wraps_partial_result_from_fresh_batch
     assert worker.loop.calls[0]["source_type"] == "lookahead"
     assert worker.loop.calls[0]["partial_state"] is None
     assert worker.loop.calls[0]["kwargs"]["raw_prompt"] == [{"role": "user", "content": "hi"}]
+
+
+@pytest.mark.asyncio
+async def test_generate_skd_until_boundary_propagates_teacher_assignment_through_real_loop():
+    worker = _RealLoopBoundaryWorker()
+
+    result = await worker.generate_skd_until_boundary(
+        make_single_batch_with_teacher_assignment(),
+        sample_id="fresh-sample",
+        logical_step=12,
+        source_type="lookahead",
+    )
+
+    partial = result.require_partial()
+    assert partial.extra_fields["teacher_replica_id"] == "teacher-server-2"
+    assert partial.extra_fields["teacher_routing_key"] == "default"
+    assert worker.loop.teacher_server_manager.bound_requests
+    assert worker.loop.teacher_server_manager.bound_requests[0]["server_id"] == "teacher-server-2"
 
 
 @pytest.mark.asyncio

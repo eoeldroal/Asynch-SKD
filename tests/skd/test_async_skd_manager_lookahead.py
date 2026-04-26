@@ -123,6 +123,11 @@ class _FakeLookaheadSource:
         return max(0, base_batch_size - len(self.carryover_partials))
 
 
+class _FakeTeacherModelManager:
+    def __init__(self, server_addresses: dict[str, list[str]]):
+        self.server_addresses = server_addresses
+
+
 def _make_prompts(batch_size: int) -> DataProto:
     return DataProto.from_dict(
         tensors={"dummy_tensor": torch.arange(batch_size, dtype=torch.long).unsqueeze(-1)},
@@ -278,7 +283,18 @@ def _make_manager(
     manager.rollout_config = OmegaConf.create({"n": rollout_n})
     manager.stream_teacher_with_rollout = False
     manager._teacher_replica_pin_by_sample_id = {}
+    manager._teacher_routing_key_by_sample_id = {}
     manager._teacher_replica_last_plan_stats = {}
+    manager._teacher_server_ids_by_routing_key = {}
+    manager.teacher_model_manager = _FakeTeacherModelManager(
+        {
+            "default": [
+                "http://teacher-0",
+                "http://teacher-1",
+                "http://teacher-2",
+            ]
+        }
+    )
     manager.agent_loop_workers = [
         _FakeLookaheadWorker(
             name="worker-0",
@@ -348,15 +364,10 @@ async def test_teacher_replica_planner_hard_pins_carryover_before_rebalancing_fr
         source_items=[],
         lookahead_results={},
     )
-    manager._teacher_replica_ids = [
-        "teacher-replica-0",
-        "teacher-replica-1",
-        "teacher-replica-2",
-    ]
     manager._teacher_replica_pin_by_sample_id = {
-        "carry-a": "teacher-replica-0",
-        "carry-b": "teacher-replica-0",
-        "carry-c": "teacher-replica-2",
+        "carry-a": "http://teacher-0",
+        "carry-b": "http://teacher-0",
+        "carry-c": "http://teacher-2",
     }
 
     assignments = manager._plan_teacher_replica_assignments(
@@ -364,13 +375,51 @@ async def test_teacher_replica_planner_hard_pins_carryover_before_rebalancing_fr
         fresh_sample_ids=["base-0", "base-1", "base-2", "base-3", "base-4"],
     )
 
-    assert assignments["carry-a"] == "teacher-replica-0"
-    assert assignments["carry-b"] == "teacher-replica-0"
-    assert assignments["carry-c"] == "teacher-replica-2"
-    assert "teacher-replica-1" in {assignments[sample_id] for sample_id in ["base-0", "base-1", "base-2", "base-3", "base-4"]}
+    assert assignments["carry-a"] == "http://teacher-0"
+    assert assignments["carry-b"] == "http://teacher-0"
+    assert assignments["carry-c"] == "http://teacher-2"
+    assert "http://teacher-1" in {assignments[sample_id] for sample_id in ["base-0", "base-1", "base-2", "base-3", "base-4"]}
     assert manager._teacher_replica_pin_by_sample_id["base-0"] == assignments["base-0"]
     assert manager._async_skd_last_step_metrics["async_skd/teacher_pinned_carryover_count"] == 3
     assert manager._async_skd_last_step_metrics["async_skd/teacher_fallback_carryover_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_teacher_replica_planner_uses_real_teacher_server_ids_without_placeholder_fallback():
+    manager, _, _ = _make_manager(
+        prefetch_limit=0,
+        source_items=[],
+        lookahead_results={},
+    )
+    assignments = manager._plan_teacher_replica_assignments(
+        carryover_sample_ids=[],
+        fresh_sample_ids=["base-0", "base-1", "base-2"],
+    )
+
+    assert set(assignments.values()) <= {"http://teacher-0", "http://teacher-1", "http://teacher-2"}
+    assert "teacher-replica-0" not in assignments.values()
+
+
+@pytest.mark.asyncio
+async def test_teacher_replica_planner_falls_back_when_ledger_contains_invalid_placeholder_id():
+    manager, _, _ = _make_manager(
+        prefetch_limit=0,
+        source_items=[],
+        lookahead_results={},
+    )
+    manager._teacher_replica_pin_by_sample_id = {
+        "carry-a": "teacher-replica-0",
+    }
+
+    assignments = manager._plan_teacher_replica_assignments(
+        carryover_sample_ids=["carry-a"],
+        fresh_sample_ids=[],
+        carryover_partials=[_make_partial_with_teacher_replica("carry-a", "teacher-replica-0")],
+    )
+
+    assert assignments["carry-a"] in {"http://teacher-0", "http://teacher-1", "http://teacher-2"}
+    assert manager._async_skd_last_step_metrics["async_skd/teacher_pinned_carryover_count"] == 0
+    assert manager._async_skd_last_step_metrics["async_skd/teacher_fallback_carryover_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -383,35 +432,21 @@ async def test_manager_tracks_teacher_replica_pins_from_partial_metadata_and_rep
             "carry-b": [_make_completed_sample("carry-b", 201, source_type="resumed_current")],
         },
     )
-    manager._teacher_replica_ids = [
-        "teacher-replica-0",
-        "teacher-replica-1",
-        "teacher-replica-2",
-    ]
 
     output = await manager.generate_sequences_with_carryover(
         fresh_prompts=_make_prompts(1),
         carryover_partials=[
-            _make_partial_with_teacher_replica("carry-a", "teacher-replica-2"),
+            _make_partial_with_teacher_replica("carry-a", "http://teacher-2"),
             _make_partial_with_teacher_replica("carry-b", None),
         ],
     )
 
     assert output.non_tensor_batch["input_pos"].tolist() == [200, 201, 0]
-    assert manager._teacher_replica_pin_by_sample_id["carry-a"] == "teacher-replica-2"
-    assert manager._teacher_replica_pin_by_sample_id["carry-b"] in {
-        "teacher-replica-0",
-        "teacher-replica-1",
-        "teacher-replica-2",
-    }
-    assert manager._teacher_replica_pin_by_sample_id["0"] in {
-        "teacher-replica-0",
-        "teacher-replica-1",
-        "teacher-replica-2",
-    }
     metrics = output.meta_info["async_skd_metrics"]
     assert metrics["async_skd/teacher_pinned_carryover_count"] == 1
     assert metrics["async_skd/teacher_fallback_carryover_count"] == 1
+    assert "carry-a" not in manager._teacher_replica_pin_by_sample_id
+    assert "carry-b" not in manager._teacher_replica_pin_by_sample_id
     assert [call[1:] for call in calls].count(("carryover", "carry-a")) == 1
     assert [call[1:] for call in calls].count(("carryover", "carry-b")) == 1
 
@@ -426,19 +461,15 @@ async def test_lookahead_partial_carryover_preserves_planned_teacher_replica_id(
         },
         base_delays={0: 0.0, 1: 0.002},
     )
-    manager._teacher_replica_ids = [
-        "teacher-replica-0",
-        "teacher-replica-1",
-    ]
-
     await manager.generate_sequences(_make_prompts(2))
 
     assert manager._async_skd_carryover_partials
     partial = manager._async_skd_carryover_partials[0]
     assert partial.sample_id == "lookahead-100"
     assert partial.extra_fields["teacher_replica_id"] in {
-        "teacher-replica-0",
-        "teacher-replica-1",
+        "http://teacher-0",
+        "http://teacher-1",
+        "http://teacher-2",
     }
     assert source.carryover_partials[0].extra_fields["teacher_replica_id"] == partial.extra_fields["teacher_replica_id"]
 

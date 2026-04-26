@@ -204,6 +204,7 @@ def make_skd_loop(
     loop.interaction_config_file = None
     loop.max_assistant_turns = None
     loop.max_user_turns = None
+    loop.processor = None
     return loop
 
 
@@ -873,6 +874,60 @@ async def test_skd_teacher_verification_binds_sticky_request_to_pinned_replica()
         "request_id": agent_data.request_id,
         "server_id": "teacher-replica-7",
     }
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_verification_binds_sticky_request_without_routing_key_for_single_teacher():
+    loop = make_skd_loop(
+        student_chunks=[[10, EOS]],
+        teacher_topk_by_call=[{}, {}],
+    )
+    agent_data = make_agent_data()
+    agent_data.extra_fields["teacher_replica_id"] = "teacher-server-0"
+
+    next_state = await loop._handle_generating_state(
+        agent_data,
+        {
+            "max_tokens": 8,
+        },
+    )
+
+    assert next_state == AgentState.TERMINATED
+    assert loop.teacher_server_manager.bound_requests
+    assert loop.teacher_server_manager.bound_requests[0] == {
+        "routing_key": None,
+        "request_id": agent_data.request_id,
+        "server_id": "teacher-server-0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_skd_run_until_exportable_boundary_fresh_preserves_teacher_assignment_from_kwargs():
+    loop = make_skd_loop(
+        student_chunks=[[20]],
+        teacher_topk_by_call=[{}],
+    )
+
+    async def fake_apply_chat_template(messages, tools=None, images=None, videos=None, **kwargs):
+        del messages, tools, images, videos, kwargs
+        return [1, 2, 3]
+
+    loop.apply_chat_template = fake_apply_chat_template
+
+    result = await loop.run_until_exportable_boundary(
+        {},
+        sample_id="fresh-boundary-teacher-pin",
+        logical_step=12,
+        source_type="lookahead",
+        raw_prompt=[{"role": "user", "content": "question"}],
+        tools_kwargs={"session": "abc"},
+        data_source="default",
+        teacher_replica_id="teacher-server-1",
+    )
+
+    assert isinstance(result, SkdPartialState)
+    assert result.extra_fields["teacher_replica_id"] == "teacher-server-1"
+    assert result.extra_fields["teacher_routing_key"] == "default"
 
 
 @pytest.mark.asyncio

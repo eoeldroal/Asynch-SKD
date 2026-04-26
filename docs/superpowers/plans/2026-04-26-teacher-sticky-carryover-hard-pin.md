@@ -2,11 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Extend teacher-side sticky routing so carryover samples keep using the same teacher replica across steps, while new base samples are rebalanced only after pinned carryover load is accounted for.
+**Goal:** Extend teacher-side sticky routing so carryover samples keep using the same real teacher server across steps, while new base samples are rebalanced only after pinned carryover load is accounted for.
 
-**Architecture:** Keep the existing same-step teacher sticky model, but stop releasing sticky mappings for unfinished carryover trajectories. Add a manager-owned `sample_id -> teacher_replica_id` ledger, use that ledger to hard-pin carryover samples, and rebalance fresh base samples against the remaining replica load. The student path stays unchanged because rollout sleep/update releases its KV state every step.
+**Architecture:** Keep the existing same-step teacher sticky model, but stop releasing sticky mappings for unfinished carryover trajectories. Add manager-owned ledgers for `sample_id -> real teacher server_id` and `sample_id -> teacher_routing_key`, use those ledgers to hard-pin carryover samples inside the correct teacher pool, and rebalance fresh base samples against the remaining pool-local load. The student path stays unchanged because rollout sleep/update releases its KV state every step.
 
 **Tech Stack:** Python, Ray async actors, OmegaConf, existing async SKD manager/worker stack, existing agent-loop sticky load balancer tests, pytest
+
+**Note:** Some code snippets below still use names like `teacher-replica-0` as compact test-fixture labels. They are illustrative fixture values only, not the runtime source of truth. Actual runtime binding must use the real teacher `server_id` exposed by the teacher manager, scoped by `teacher_routing_key`.
 
 ---
 
@@ -473,4 +475,3 @@ git commit -m "chore(async-skd): add teacher carryover pin metrics"
   - each code-changing step includes exact code or command shape
 - Type consistency:
   - uses one consistent vocabulary: `teacher_replica_id`, `bind_sticky_request()`, `release_request_binding()`, `_teacher_replica_pin_by_sample_id`
-

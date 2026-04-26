@@ -52,7 +52,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # SKD debug logging: set VERL_SKD_DEBUG=1 to enable per-chunk diagnostics.
 # VERL_SKD_DEBUG=2 for token-level alignment verification (first 3 samples per batch).
 _SKD_DEBUG = int(os.getenv("VERL_SKD_DEBUG", "0"))
+_ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
 _SKD_PENDING_TURN_RESPONSE_IDS = "skd_pending_turn_response_ids"
+
+
+def _trace_async_skd(stage: str, **fields: Any) -> None:
+    if _ASYNC_SKD_TRACE <= 0:
+        return
+    parts = [f"{key}={value!r}" for key, value in fields.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
 
 
 @register("skd_agent")
@@ -156,7 +165,20 @@ class SkdAgentLoop(ToolAgentLoop):
             if hasattr(routing_key, "item"):
                 routing_key = routing_key.item()
             agent_data.extra_fields["teacher_routing_key"] = routing_key
+        teacher_replica_id = kwargs.get("teacher_replica_id")
+        if teacher_replica_id is not None:
+            if hasattr(teacher_replica_id, "item"):
+                teacher_replica_id = teacher_replica_id.item()
+            agent_data.extra_fields["teacher_replica_id"] = teacher_replica_id
         agent_data.extra_fields["raw_prompt"] = deepcopy(kwargs["raw_prompt"])
+        _trace_async_skd(
+            "loop.init_boundary_agent_data",
+            request_id=request_id,
+            teacher_replica_id=agent_data.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=agent_data.extra_fields.get("teacher_routing_key"),
+            raw_prompt_len=len(messages),
+            kwargs_keys=sorted(kwargs.keys()),
+        )
         return agent_data
 
     def _finalize_boundary_agent_output(self, agent_data: AgentData) -> AgentLoopOutput:
@@ -331,7 +353,7 @@ class SkdAgentLoop(ToolAgentLoop):
         self._assert_teacher_alignment(agent_data)
 
         extra_fields = deepcopy(agent_data.extra_fields)
-        return SkdPartialState(
+        partial = SkdPartialState(
             sample_id=sample_id,
             logical_step=logical_step,
             source_type=source_type,
@@ -359,6 +381,19 @@ class SkdAgentLoop(ToolAgentLoop):
             image_data=deepcopy(agent_data.image_data),
             video_data=deepcopy(agent_data.video_data),
         )
+        _trace_async_skd(
+            "loop.export_partial_state",
+            sample_id=sample_id,
+            logical_step=logical_step,
+            source_type=source_type,
+            request_id=agent_data.request_id,
+            teacher_replica_id=partial.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=partial.extra_fields.get("teacher_routing_key"),
+            response_len=len(partial.response_mask),
+            committed_gen_chunks=partial.committed_gen_chunks,
+            committed_prefix_tokens=partial.committed_prefix_tokens,
+        )
+        return partial
 
     def _restore_partial_state(self, partial_state: SkdPartialState) -> tuple[AgentData, AgentState]:
         """Restore a previously exported SKD partial snapshot."""
@@ -405,6 +440,18 @@ class SkdAgentLoop(ToolAgentLoop):
         if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
             raise ValueError("Invalid SKD partial state: missing teacher row lists in extra_fields")
         self._assert_teacher_alignment(agent_data)
+        _trace_async_skd(
+            "loop.restore_partial_state",
+            sample_id=partial_state.sample_id,
+            logical_step=partial_state.logical_step,
+            source_type=partial_state.source_type,
+            request_id=partial_state.request_id,
+            teacher_replica_id=agent_data.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=agent_data.extra_fields.get("teacher_routing_key"),
+            response_len=len(agent_data.response_mask),
+            committed_gen_chunks=partial_state.committed_gen_chunks,
+            committed_prefix_tokens=partial_state.committed_prefix_tokens,
+        )
         return agent_data, next_state
 
     async def _run_until_exportable_boundary(
@@ -504,6 +551,16 @@ class SkdAgentLoop(ToolAgentLoop):
         parent_request_id = agent_data.request_id
         agent_data.extra_fields["parent_request_id"] = parent_request_id
         agent_data.request_id = uuid4().hex
+        _trace_async_skd(
+            "loop.resume_request_rebind",
+            sample_id=partial_state.sample_id,
+            logical_step=partial_state.logical_step,
+            source_type=partial_state.source_type,
+            parent_request_id=parent_request_id,
+            new_request_id=agent_data.request_id,
+            teacher_replica_id=agent_data.extra_fields.get("teacher_replica_id"),
+            teacher_routing_key=agent_data.extra_fields.get("teacher_routing_key"),
+        )
         try:
             await self._run_until_terminated(agent_data, state, sampling_params)
             return self._finalize_boundary_agent_output(agent_data)
@@ -658,10 +715,17 @@ class SkdAgentLoop(ToolAgentLoop):
                     teacher_replica_id = agent_data.extra_fields.get("teacher_replica_id")
                     teacher_routing_key = agent_data.extra_fields.get("teacher_routing_key")
                     bind_sticky_request = getattr(self.teacher_server_manager, "bind_sticky_request", None)
+                    _trace_async_skd(
+                        "loop.teacher_bind_attempt",
+                        request_id=agent_data.request_id,
+                        teacher_replica_id=teacher_replica_id,
+                        teacher_routing_key=teacher_routing_key,
+                        teacher_prompt_len=len(teacher_prompt_ids),
+                        chunk_len=len(chunk),
+                    )
                     if (
                         teacher_replica_id is not None
                         and bind_sticky_request is not None
-                        and teacher_routing_key is not None
                     ):
                         result = bind_sticky_request(
                             routing_key=teacher_routing_key,
@@ -670,6 +734,12 @@ class SkdAgentLoop(ToolAgentLoop):
                         )
                         if inspect.isawaitable(result):
                             await result
+                        _trace_async_skd(
+                            "loop.teacher_bind_applied",
+                            request_id=agent_data.request_id,
+                            teacher_replica_id=teacher_replica_id,
+                            teacher_routing_key=teacher_routing_key,
+                        )
                     verify_sequence = teacher_prompt_ids + chunk
                     logprob_start_len = max(len(teacher_prompt_ids) - 1, 0)
                     teacher_ids, teacher_logprobs = (
@@ -781,6 +851,16 @@ class SkdAgentLoop(ToolAgentLoop):
                     response_len=len(agent_data.response_mask),
                     committed_gen_chunks=int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0)),
                     committed_prefix_tokens=int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0)),
+                )
+                _trace_async_skd(
+                    "loop.chunk_commit",
+                    request_id=agent_data.request_id,
+                    teacher_replica_id=agent_data.extra_fields.get("teacher_replica_id"),
+                    teacher_routing_key=agent_data.extra_fields.get("teacher_routing_key"),
+                    response_len=len(agent_data.response_mask),
+                    committed_gen_chunks=int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0)),
+                    committed_prefix_tokens=int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0)),
+                    termination_reason=termination_reason,
                 )
 
                 # 5. Termination checks within chunk loop
