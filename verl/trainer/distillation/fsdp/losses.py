@@ -32,6 +32,22 @@ def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     return kld.sum(dim=-1)
 
 
+def _compute_student_topk_log_probs(
+    student_logits: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    loss_config: DistillationLossConfig,
+) -> torch.Tensor:
+    impl = getattr(loss_config, "forward_kl_topk_impl", "log_softmax")
+    if impl == "log_softmax":
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        return torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+    if impl == "logsumexp_gather":
+        student_topk_logits = torch.gather(student_logits, dim=-1, index=teacher_topk_ids)
+        student_log_norm = torch.logsumexp(student_logits, dim=-1, keepdim=True)
+        return student_topk_logits - student_log_norm
+    raise ValueError(f"Unsupported forward_kl_topk_impl: {impl}")
+
+
 def compute_forward_kl_topk(
     student_logits: torch.Tensor,
     teacher_topk_log_probs: torch.Tensor,
@@ -63,11 +79,10 @@ def compute_forward_kl_topk(
     assert teacher_topk_log_probs.shape[:2] == teacher_topk_ids.shape[:2] == student_logits.shape[:2]
 
     # 2. compute token-wise KL divergence across sp groups
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-    student_topk_log_probs = torch.gather(student_log_probs, dim=-1, index=teacher_topk_ids)
+    loss_config: DistillationLossConfig = config.distillation_loss
+    student_topk_log_probs = _compute_student_topk_log_probs(student_logits, teacher_topk_ids, loss_config)
     student_mass = student_topk_log_probs.exp().sum(dim=-1)
     teacher_mass = teacher_topk_log_probs.exp().sum(dim=-1)
-    loss_config: DistillationLossConfig = config.distillation_loss
     if loss_config.log_prob_min_clamp is not None:
         student_topk_log_probs = student_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
         teacher_topk_log_probs = teacher_topk_log_probs.clamp_min(loss_config.log_prob_min_clamp)
