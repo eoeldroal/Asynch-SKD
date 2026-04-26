@@ -73,6 +73,39 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _get_validation_agent_names(
+    agent_names: Optional[np.ndarray],
+    *,
+    default_agent_name: str,
+    batch_size: int,
+) -> Optional[np.ndarray]:
+    """Validation should evaluate the student policy without SKD teacher verification.
+
+    For current SKD experiments, the least disruptive way to do that is to swap
+    ``skd_agent`` to ``tool_agent`` only during validation. ``tool_agent`` still
+    supports tool-calling when tools are configured, and degenerates to a
+    single-turn student-only rollout when no tools are available.
+
+    NOTE:
+    We keep this decision at the trainer/validation entrypoint instead of adding
+    a validation-only branch inside ``skd_agent``. ``skd_agent`` is intentionally
+    teacher-in-the-loop during training; changing its semantics at the loop level
+    would couple validation policy selection to the SKD implementation and make
+    train/val behavior harder to reason about.
+    """
+    validation_agent_name = "tool_agent"
+
+    if agent_names is None:
+        if default_agent_name == "skd_agent":
+            return np.array([validation_agent_name] * batch_size, dtype=object)
+        return None
+
+    return np.array(
+        [validation_agent_name if name == "skd_agent" else name for name in agent_names],
+        dtype=object,
+    )
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -650,6 +683,13 @@ class RayPPOTrainer:
             sample_gts.extend(ground_truths)
 
             test_gen_batch = self._get_gen_batch(test_batch)
+            validation_agent_names = _get_validation_agent_names(
+                test_gen_batch.non_tensor_batch.get("agent_name"),
+                default_agent_name=self.config.actor_rollout_ref.rollout.agent.default_agent_loop,
+                batch_size=len(test_gen_batch),
+            )
+            if validation_agent_names is not None:
+                test_gen_batch.non_tensor_batch["agent_name"] = validation_agent_names
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
                 "pad_token_id": self.tokenizer.pad_token_id,
