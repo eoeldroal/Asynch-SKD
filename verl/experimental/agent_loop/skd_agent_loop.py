@@ -479,6 +479,7 @@ class SkdAgentLoop(ToolAgentLoop):
         try:
             next_state = await self._run_until_exportable_boundary(agent_data, state, sampling_params)
             if next_state == AgentState.TERMINATED:
+                await self._release_teacher_sticky_session(agent_data.request_id)
                 return self._finalize_boundary_agent_output(agent_data)
 
             return self._export_partial_state(
@@ -488,8 +489,9 @@ class SkdAgentLoop(ToolAgentLoop):
                 logical_step=logical_step,
                 source_type=source_type,
             )
-        finally:
+        except Exception:
             await self._release_teacher_sticky_session(agent_data.request_id)
+            raise
 
     async def run_from_partial_to_completion(
         self,
@@ -506,7 +508,8 @@ class SkdAgentLoop(ToolAgentLoop):
             await self._run_until_terminated(agent_data, state, sampling_params)
             return self._finalize_boundary_agent_output(agent_data)
         finally:
-            await self._release_teacher_sticky_session(agent_data.request_id)
+            for request_id in (agent_data.request_id, parent_request_id):
+                await self._release_teacher_sticky_session(request_id)
 
     def _assert_teacher_alignment(self, agent_data: AgentData) -> None:
         """Validate that response_mask and teacher rows stay response-token aligned."""

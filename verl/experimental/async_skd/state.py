@@ -88,6 +88,11 @@ class SkdPartialState:
     image_data: Any = None
     video_data: Any = None
 
+    @property
+    def teacher_replica_id(self) -> Any | None:
+        """Return the pinned teacher replica id carried in ``extra_fields`` if present."""
+        return self.extra_fields.get("teacher_replica_id")
+
 
 @dataclass
 class AsyncSkdSample:

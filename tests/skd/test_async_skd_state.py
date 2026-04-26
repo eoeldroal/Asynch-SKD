@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pickle
+
 import numpy as np
 import pytest
 
@@ -87,6 +89,18 @@ def test_async_skd_sample_from_partial_copies_metadata_and_requires_partial():
 
     with pytest.raises(ValueError, match="not completed"):
         sample.require_completed()
+
+
+def test_async_skd_partial_state_preserves_teacher_replica_id_through_pickle_roundtrip():
+    partial = make_partial()
+    partial.extra_fields["teacher_replica_id"] = "teacher-replica-9"
+
+    restored = pickle.loads(pickle.dumps(partial))
+
+    assert restored.extra_fields["teacher_replica_id"] == "teacher-replica-9"
+    assert AsyncSkdSample.from_partial(partial_state=restored).require_partial().extra_fields[
+        "teacher_replica_id"
+    ] == "teacher-replica-9"
 
 
 def test_async_skd_sample_rejects_invalid_completed_payload_combinations():

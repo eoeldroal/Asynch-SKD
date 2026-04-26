@@ -41,6 +41,10 @@ class AsyncSkdDataSource:
             return
         batch.non_tensor_batch["uid"] = np.array([self._uid_fn() for _ in range(len(batch))], dtype=object)
 
+    @staticmethod
+    def _clone_partials(partials: list[SkdPartialState]) -> list[SkdPartialState]:
+        return copy.deepcopy(partials)
+
     def _load_next_fresh_buffer(self) -> bool:
         for batch_dict in self._batch_iterator:
             batch = DataProto.from_single_dict(batch_dict)
@@ -133,7 +137,7 @@ class AsyncSkdDataSource:
                 self._reserved_input_batches.pop(partial.sample_id, None)
                 resolved_inputs.append(input_batch)
 
-        self._carryover_partials.extend(copy.deepcopy(partials))
+        self._carryover_partials.extend(self._clone_partials(partials))
         self._carryover_input_batches.extend(copy.deepcopy(resolved_inputs))
 
     def pop_carryover(self) -> SkdPartialState | None:
@@ -183,7 +187,7 @@ class AsyncSkdDataSource:
         return {
             "fresh_buffer": self._fresh_buffer,
             "fresh_cursor": self._fresh_cursor,
-            "carryover_partials": copy.deepcopy(self._carryover_partials),
+            "carryover_partials": self._clone_partials(self._carryover_partials),
             "carryover_input_batches": copy.deepcopy(self._carryover_input_batches),
             "reserved_input_batches": copy.deepcopy(self._reserved_input_batches),
             "promoted_input_batches": copy.deepcopy(self._promoted_input_batches),
@@ -194,7 +198,7 @@ class AsyncSkdDataSource:
     def load_state_dict(self, state: dict) -> None:
         self._fresh_buffer = state.get("fresh_buffer")
         self._fresh_cursor = int(state.get("fresh_cursor", 0))
-        self._carryover_partials = copy.deepcopy(state.get("carryover_partials", []))
+        self._carryover_partials = self._clone_partials(state.get("carryover_partials", []))
         self._carryover_input_batches = copy.deepcopy(state.get("carryover_input_batches", []))
         self._reserved_input_batches = copy.deepcopy(state.get("reserved_input_batches", {}))
         self._promoted_input_batches = copy.deepcopy(state.get("promoted_input_batches", []))

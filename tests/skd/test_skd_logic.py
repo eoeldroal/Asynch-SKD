@@ -772,7 +772,71 @@ async def test_skd_run_until_exportable_boundary_fresh_returns_partial():
     assert result.extra_fields["raw_prompt"] == [{"role": "user", "content": "question"}]
     assert result.extra_fields["teacher_ids_list"] == [[10, 0, 0, 0], [11, 0, 0, 0]]
     assert result.extra_fields["teacher_logprobs_list"] == [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K]
-    assert loop.teacher_server_manager.released_request_ids == [result.request_id]
+    assert loop.teacher_server_manager.released_request_ids == []
+
+
+@pytest.mark.asyncio
+async def test_skd_run_until_exportable_boundary_resume_partial_keeps_teacher_replica_id():
+    partial = SkdPartialState(
+        sample_id="resume-boundary",
+        logical_step=13,
+        source_type="lookahead",
+        agent_state=AgentState.GENERATING.value,
+        request_id="req-resume-boundary",
+        tools_kwargs={},
+        messages=[{"role": "user", "content": "question"}],
+        prompt_ids=[1, 2, 3, 10],
+        teacher_prompt_ids=[1, 2, 3, 10],
+        response_ids=[10],
+        response_mask=[1],
+        response_logprobs=[],
+        assistant_turns=0,
+        user_turns=0,
+        rollout_birth_version=7,
+        rollout_min_version=7,
+        rollout_max_version=7,
+        committed_gen_chunks=1,
+        committed_env_units=0,
+        committed_prefix_tokens=1,
+        metrics={},
+        extra_fields={
+            "teacher_prompt_ids": [1, 2, 3, 10],
+            "teacher_ids_list": [[10, 0, 0, 0]],
+            "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
+            "skd_pending_turn_response_ids": [10],
+            "skd_committed_gen_chunks": 1,
+            "skd_committed_env_units": 0,
+            "skd_committed_prefix_tokens": 1,
+            "rollout_birth_version": 7,
+            "rollout_min_version": 7,
+            "rollout_max_version": 7,
+            "teacher_replica_id": "teacher-replica-1",
+            "raw_prompt": [{"role": "user", "content": "question"}],
+        },
+    )
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [20],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+
+    result = await loop.run_until_exportable_boundary(
+        {},
+        sample_id="resume-boundary",
+        logical_step=13,
+        source_type="lookahead",
+        partial_state=partial,
+    )
+
+    assert isinstance(result, SkdPartialState)
+    assert result.extra_fields["teacher_replica_id"] == "teacher-replica-1"
+    assert result.extra_fields["teacher_ids_list"] == [[10, 0, 0, 0], [20, 0, 0, 0]]
+    assert result.extra_fields["teacher_logprobs_list"] == [[-1.0] * LOSS_TOP_K, [-1.0] * LOSS_TOP_K]
+    assert loop.teacher_server_manager.released_request_ids == []
 
 
 @pytest.mark.asyncio
@@ -914,7 +978,8 @@ async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediat
     [new_request_id] = list(new_teacher_request_ids)
     assert new_request_id != old_request_id
     assert result.extra_fields["parent_request_id"] == old_request_id
-    assert loop.teacher_server_manager.released_request_ids == [new_request_id]
+    assert set(loop.teacher_server_manager.released_request_ids) == {old_request_id, new_request_id}
+    assert len(loop.teacher_server_manager.released_request_ids) == 2
 
 
 @pytest.mark.asyncio
