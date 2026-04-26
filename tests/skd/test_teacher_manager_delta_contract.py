@@ -1,14 +1,99 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
+import sys
 from types import SimpleNamespace
+from pathlib import Path
 from typing import Any
 
 import pytest
 import torch
 
-from verl.experimental.teacher_loop import teacher_manager
-from verl.workers.rollout.replica import TokenOutput
+
+class _PlaceholderConfig:
+    pass
+
+
+class _FakeAsyncLLMServerManager:
+    def __init__(self, config: Any, servers: list[tuple[str, Any]], load_balancer_handle: Any):
+        self.config = config
+        self._load_balancer = load_balancer_handle
+        self._server_id_to_handle = dict(servers)
+        teacher_models = getattr(getattr(config, "distillation", None), "teacher_models", {})
+        first_teacher = next(iter(teacher_models.values()), None)
+        inference = getattr(first_teacher, "inference", None)
+        self._temperature = getattr(inference, "temperature", None)
+
+    async def generate(
+        self,
+        request_id: str,
+        prompt_ids: list[int],
+        sampling_params: dict[str, Any],
+        image_data: Any = None,
+        video_data: Any = None,
+    ) -> Any:
+        server_id = await self._load_balancer.acquire_server.remote(request_id=request_id)
+        try:
+            if self._temperature is not None:
+                sampling_params = dict(sampling_params)
+                sampling_params.setdefault("temperature", self._temperature)
+            handle = self._server_id_to_handle[server_id]
+            return await handle.generate.remote(
+                request_id=request_id,
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                image_data=image_data,
+                video_data=video_data,
+            )
+        finally:
+            self._load_balancer.release_server.remote(server_id=server_id)
+
+
+def _install_import_stubs() -> None:
+    import types
+
+    ray_module = types.ModuleType("ray")
+    ray_module.remote = lambda obj=None, **kwargs: obj if obj is not None else (lambda cls: cls)
+    ray_module.get = lambda value: value
+    ray_module.actor = types.SimpleNamespace(ActorHandle=object)
+    sys.modules.setdefault("ray", ray_module)
+
+    verl_module = sys.modules.setdefault("verl", types.ModuleType("verl"))
+    verl_module.__path__ = []
+    experimental_module = sys.modules.setdefault("verl.experimental", types.ModuleType("verl.experimental"))
+    experimental_module.__path__ = []
+    agent_loop_module = types.ModuleType("verl.experimental.agent_loop")
+    agent_loop_module.AsyncLLMServerManager = _FakeAsyncLLMServerManager
+    sys.modules["verl.experimental.agent_loop"] = agent_loop_module
+
+    utils_module = sys.modules.setdefault("verl.utils", types.ModuleType("verl.utils"))
+    utils_module.__path__ = []
+    config_module = types.ModuleType("verl.utils.config")
+    config_module.omega_conf_to_dataclass = lambda value: value
+    sys.modules["verl.utils.config"] = config_module
+
+    workers_module = sys.modules.setdefault("verl.workers", types.ModuleType("verl.workers"))
+    workers_module.__path__ = []
+    config_types_module = types.ModuleType("verl.workers.config")
+    config_types_module.DistillationConfig = _PlaceholderConfig
+    config_types_module.DistillationLossConfig = _PlaceholderConfig
+    config_types_module.DistillationTeacherModelConfig = _PlaceholderConfig
+    sys.modules["verl.workers.config"] = config_types_module
+
+
+def _load_teacher_manager():
+    _install_import_stubs()
+    module_path = Path(__file__).resolve().parents[2] / "verl" / "experimental" / "teacher_loop" / "teacher_manager.py"
+    spec = importlib.util.spec_from_file_location("teacher_manager_under_test", module_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+teacher_manager = _load_teacher_manager()
 
 
 class FakeRemoteMethod:
@@ -35,16 +120,18 @@ class FakeLoadBalancer:
     def __init__(self, server_id: str = "server-0"):
         self.acquire_server = FakeRemoteMethod(server_id)
         self.release_server = FakeRemoteMethod(None)
+        self.bind_request_to_server = FakeRemoteMethod(None)
+        self.release_request_binding = FakeRemoteMethod(None)
 
 
 class FakeRayServer:
-    def __init__(self, output: TokenOutput):
+    def __init__(self, output: Any):
         self.output = output
         self.generate = FakeRemoteMethod(output)
 
 
-def _fake_output(rows: list[list[int]], logprobs: list[list[float]]) -> TokenOutput:
-    return TokenOutput(
+def _fake_output(rows: list[list[int]], logprobs: list[list[float]]) -> Any:
+    return SimpleNamespace(
         token_ids=[],
         log_probs=[],
         num_preempted=0,
@@ -142,3 +229,34 @@ def test_compute_teacher_logprobs_single_rejects_wrong_delta_suffix_length(monke
                 logprob_start_len=2,
             )
         )
+
+
+def test_bind_sticky_request_targets_the_resolved_teacher_load_balancer(monkeypatch):
+    manager, _, load_balancer = _make_manager(monkeypatch, _fake_output([[1], [2]], [[-0.1], [-0.2]]))
+
+    asyncio.run(
+        manager.bind_sticky_request(
+            routing_key="default",
+            request_id="carry-1",
+            server_id="server-0",
+        )
+    )
+
+    assert load_balancer.bind_request_to_server.calls == [
+        {"request_id": "carry-1", "server_id": "server-0"}
+    ]
+
+
+def test_release_sticky_session_clears_the_bound_request(monkeypatch):
+    manager, _, load_balancer = _make_manager(monkeypatch, _fake_output([[1], [2]], [[-0.1], [-0.2]]))
+
+    asyncio.run(
+        manager.bind_sticky_request(
+            routing_key="default",
+            request_id="carry-1",
+            server_id="server-0",
+        )
+    )
+    asyncio.run(manager.release_sticky_session("carry-1", routing_key="default"))
+
+    assert load_balancer.release_request_binding.calls == [{"request_id": "carry-1"}]

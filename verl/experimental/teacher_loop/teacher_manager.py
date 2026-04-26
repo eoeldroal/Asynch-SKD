@@ -107,6 +107,19 @@ class AsyncTeacherLLMServerManager:
             )
         return routing_key
 
+    async def bind_sticky_request(self, *, routing_key: str, request_id: str, server_id: str) -> None:
+        teacher_key = self._resolve_teacher_key(routing_key)
+        await self.server_managers[teacher_key]._load_balancer.bind_request_to_server.remote(
+            request_id=request_id,
+            server_id=server_id,
+        )
+
+    async def release_sticky_session(self, request_id: str, routing_key: Optional[str] = None) -> None:
+        teacher_key = self._resolve_teacher_key(routing_key)
+        await self.server_managers[teacher_key]._load_balancer.release_request_binding.remote(
+            request_id=request_id,
+        )
+
     async def compute_teacher_logprobs_single(
         self,
         sequence_ids: list[int],
