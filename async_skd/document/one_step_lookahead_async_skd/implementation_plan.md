@@ -1310,7 +1310,6 @@ Why worker-level first:
 - The manager currently knows worker handles, not exact CUDA device ids.
 - SGLang batches individual outstanding requests internally.
 - Under TP=1, one SGLang server replica usually maps to one GPU, but manager should not rely on CUDA numbers.
-- Preferred-server routing is allowed only after server-replica metrics show worker-level refill is insufficient.
 
 Tests:
 
@@ -1332,11 +1331,10 @@ tests/trainer/ppo/test_ray_trainer_async_skd_helpers_on_cpu.py
 
 Extend existing `RayPPOTrainer._save_checkpoint()` and `_load_checkpoint()`. Do not add a separate checkpoint engine.
 
-New `data.pt` format:
+`data.pt` format:
 
 ```python
 {
-    "format": "async_skd_data_state_v1",
     "dataloader_state_dict": train_dataloader_state,
     "async_skd_data_source_state_dict": async_skd_source_state,
 }
@@ -1360,54 +1358,27 @@ carryover_input_batches
 promoted input rows if present
 ```
 
-## 14. Phase 11: Drift and Source-Aware Metrics
+## 14. Phase 11: Source-Aware Metrics
 
-목표: 논문 방어에 필요한 empirical diagnostics를 남긴다.
+목표: promoted/carryover 비율을 학습 로그에 남긴다.
 
-대상:
+구현 완료:
 
 ```text
-async_skd/manager.py
-skd_agent_loop.py
-metric aggregation path
+async_skd/lookahead_promoted_count
+async_skd/lookahead_carryover_count
+async_skd/lookahead_promote_rate
+async_skd/lookahead_carryover_rate
 ```
 
-### 14.1 Required Metrics
+미구현:
 
 ```text
-async_skd/promoted_count
-async_skd/carryover_count
-async_skd/lookahead_budget_used
 async_skd/intentional_idle_time
-async_skd/stale_sample_ratio
-async_skd/stale_token_ratio
-async_skd/old_gen_chunks_p95
-async_skd/logprob_delta_mean
-async_skd/logprob_delta_p95
+async_skd/logprob_delta_mean / logprob_delta_p95
 ```
 
-### 14.2 Logprob Drift
-
-계산:
-
-```text
-delta_t = log pi_current(a_t | h_t) - log pi_rollout(a_t | h_t)
-```
-
-보고:
-
-```text
-mean_abs_delta
-p95_abs_delta
-sequence_mean_delta
-source_type별 delta
-age별 delta
-```
-
-왜 필요한가:
-
-- “현재 정책은 해당 trajectory를 낮은 확률로 만들지 않는가?”라는 반박에 대응한다.
-- 수학적으로 완전 보장하지 않고, 실제 drift가 작다는 진단으로 방어한다.
+`logprob_delta`는 current policy re-forward를 요구하므로 현재 학습 경로에서 추가하지 않는다.
 
 ## 15. Phase 12: Config
 
@@ -1437,39 +1408,13 @@ distillation.skd.verify_top_k
 distillation.skd.max_chunks_per_sample
 ```
 
-## 16. Phase 13: Persistent Rollout Weight Sync
+## 16. Phase 13: Weight Sync And Version Metadata
 
-목표: trainer update 후 student rollout engine에 weight를 sync한다.
+현재 구현 상태:
 
-주의: MVP에서 per-sample committed-boundary sync를 가정하지 않는다. vLLM/SGLang weight update는 engine-level operation일 수 있으므로, 처음에는 다음 중 안전한 정책을 사용한다.
-
-```text
-1. step boundary drain 후 sync
-2. 새 sample admission부터 새 version worker에 배정
-3. active lookahead는 committed generation chunk cap 안에서만 continuation 허용
-```
-
-기록할 수 있는 observability metadata:
-
-```text
-rollout_min_version
-rollout_max_version
-train_consume_version
-```
-
-왜 필요한가:
-
-- Drift metric과 benchmark 해석의 기준이 된다.
-
-Reference:
-
-```text
-recipe/gkd/megatron/ray_trainer.py::sync_rollout_weights()
-recipe/gkd/megatron/megatron_workers.py::sync_rollout_weights()
-verl/experimental/fully_async_policy/fully_async_trainer.py::_fit_update_weights()
-```
-
-Do not inherit the GKD trainer. Copy only the weight-sync mechanics and version metadata pattern.
+- Weight sync는 기존 verl의 step-boundary `update_weights()` 경로를 사용한다. 별도 `sync_rollout_weights()` 함수는 추가하지 않았다.
+- Version metadata (`rollout_birth_version`, `rollout_min_version`, `rollout_max_version`)는 `SkdPartialState`와 `AsyncSkdSample`에 저장되고, `skd_agent_loop.py`에서 inference engine output의 `global_steps`/`min_global_steps`/`max_global_steps` 값으로부터 추적된다.
+- `train_consume_version`은 현재 추적하지 않는다.
 
 ## 17. Recommended Patch Order
 
@@ -1660,27 +1605,6 @@ Expected behavior:
 - `DataProto.union()` sees matching row counts.
 - promoted sample `uid` appears exactly once in training.
 
-### Patch 10: Stale Budget Enforcement
-
-Status: not implemented in current code.
-
-Files:
-
-```text
-verl/experimental/async_skd/manager.py
-tests/skd/test_async_skd_manager_lookahead.py
-```
-
-Changes:
-
-- historical plan: implement `_can_continue_lookahead_partial()`.
-- historical plan: read `async_skd_max_old_gen_chunks`.
-- current behavior: no separate stale-prefix hard cap; drain/carryover is controlled by current-work barrier and SKD `max_chunks_per_sample`.
-
-Expected behavior:
-
-- not guaranteed by a separate stale cap in current code.
-
 ### Patch 11: Lookahead Admission During Carry-Over Current Work
 
 Status: implemented.
@@ -1724,8 +1648,6 @@ Changes:
 - call `try_admit_lookahead(worker_idx)` when a current task frees a slot.
 - report `async_skd/worker_capacity`, `async_skd/worker_active_max`, `async_skd/lookahead_started_count`, and per-worker completed counts.
 
-This patch is implemented before preferred-server routing. Preferred-server routing is allowed only after server-replica metrics show worker-level refill is insufficient.
-
 Expected behavior:
 
 - fast workers naturally admit more lookahead work.
@@ -1733,29 +1655,27 @@ Expected behavior:
 - global prefetch limit remains the upper bound on lookahead starts.
 - `drain_requested=True` prevents any new lookahead admission.
 
-### Patch 13: Server-Replica Observability
+### Patch 13: Rollout Version Metadata
 
-Status: implemented for rollout output metadata.
+Status: implemented.
 
 Files:
 
 ```text
-verl/experimental/agent_loop/agent_loop.py
-verl/workers/rollout/sglang_rollout/async_sglang_server.py
-verl/experimental/async_skd/manager.py
-tests/skd/test_async_skd_manager_lookahead.py
+verl/experimental/agent_loop/skd_agent_loop.py
+verl/experimental/async_skd/state.py
 ```
 
 Changes:
 
-- record acquired `server_id` in `TokenOutput.extra_fields`, e.g. `rollout_server_id`.
-- keep `rollout_server_id` in per-sample output metrics and expose async SKD worker-slot scheduler counters.
-- do not add preferred-server routing yet.
+- `_record_rollout_version_from_output()` reads `global_steps`/`min_global_steps`/`max_global_steps` from inference engine output `extra_fields`.
+- `rollout_birth_version`, `rollout_min_version`, `rollout_max_version` stored in `SkdPartialState` and `AsyncSkdSample`.
+- `rollout_server_id`는 구현하지 않았다. SGLang load balancer 내부에서 `server_id`를 관리하지만 출력 extra_fields에 기록하지 않는다.
 
 Expected behavior:
 
-- scheduler can report which server replicas actually handled work.
-- worker-level refill can be evaluated against server-replica distribution.
+- version metadata survives carryover resume across steps.
+- async SKD worker-slot scheduler counters are reported via W&B metrics.
 - no change to routing semantics.
 
 ### Patch 14: Source Checkpoint Integration
@@ -1824,58 +1744,34 @@ Expected behavior:
 - experiment scripts can enable lookahead through explicit config fields.
 - stale budget values are not part of current config.
 
-### Patch 17: Persistent Weight Sync
+### Patch 17: Weight Sync And Version Metadata
+
+Status: implemented (version metadata only; no dedicated sync function).
 
 Changes:
 
-- student rollout engine sync after trainer update
-- step-boundary/drain-safe sync
-- version metadata
+- version metadata (`rollout_birth_version`, `rollout_min_version`, `rollout_max_version`) tracked in `SkdPartialState` and `AsyncSkdSample` via `_record_rollout_version_from_output()`.
+- weight sync uses existing verl `update_weights()` at step boundary.
 
 Expected behavior:
 
-- version metadata is available for diagnostics.
+- version metadata available for diagnostics.
+- weight sync is step-boundary only, not per-sample.
 
-Reference:
+### Patch 18: Source-Aware Step Metrics
 
-```text
-recipe/gkd/megatron/ray_trainer.py::sync_rollout_weights()
-recipe/gkd/megatron/megatron_workers.py::sync_rollout_weights()
-verl/experimental/fully_async_policy/fully_async_trainer.py::_fit_update_weights()
-```
-
-Do not inherit the GKD trainer. Copy only the weight-sync mechanics and version metadata pattern.
-
-### Patch 18: Preferred Server Routing
-
-Files:
-
-```text
-verl/experimental/agent_loop/agent_loop.py
-tests/skd/test_async_skd_manager_lookahead.py
-```
+Status: implemented.
 
 Changes:
 
-- add optional preferred server id support only if server-replica metrics show worker-level refill is insufficient.
-- extend load balancer or `AsyncLLMServerManager.generate()` with a controlled preferred-server path.
+- `async_skd/lookahead_promoted_count`, `async_skd/lookahead_carryover_count` emitted per step.
+- `async_skd/lookahead_promote_rate`, `async_skd/lookahead_carryover_rate` emitted per step.
+- `LookaheadStepResult` carries `promoted_count` and `carryover_count` for downstream W&B logging.
 
 Expected behavior:
 
-- lookahead can target a specific SGLang server replica.
-- default routing remains unchanged when no preferred server is provided.
-
-### Patch 19: Drift Metrics
-
-Changes:
-
-- source-aware drift logs
-- stale ratio logs
-- intentional idle logs
-
-Expected behavior:
-
-- 논문 방어용 diagnostics 수집 가능.
+- training logs can separate current vs promoted vs carryover samples.
+- promote/carryover rates visible in W&B dashboard.
 
 ## 18. Step-by-Step Validation Gates
 
@@ -1937,24 +1833,13 @@ response_mask updated but dummy teacher rows not appended
 teacher_prompt_ids missing tool result delta
 ```
 
-### Gate F: Drift Diagnostics
+## 19. Implemented Scope
 
-At minimum:
-
-```text
-age=0 vs age=1 logprob_delta_mean
-age=0 vs age=1 distillation/loss
-source_type별 response length
-source_type별 tool call count
-```
-
-## 19. Expected First Implementation Scope
-
-첫 구현은 conservative하게 잡는다.
+구현 완료된 초기 설정값은 다음과 같다 (실행 스크립트 기준):
 
 ```text
 async_skd_prefetch_limit = 64
-async_skd_prefetch_worker_target = 20
+async_skd_prefetch_worker_target = 16
 promote_finished = true
 tool_macro_step_atomic = true
 ```
@@ -1962,9 +1847,8 @@ tool_macro_step_atomic = true
 Feature scope:
 
 - Direct SKD only.
-- Text-only tool부터 시작.
-- Promote-only lookahead를 먼저 구현.
-- Carryover resume은 그 다음 단계.
+- tool-aware (sandbox_fusion code_interpreter 경로).
+- Promote + carryover resume 모두 구현됨.
 - No exact IS correction.
 - No mid-tool interruption.
 - No live KV cache resume.
@@ -1987,230 +1871,3 @@ work-conserving under bounded-staleness constraints
 - Tool result는 loss 대상이 아니지만 tool macro-step으로 atomic하게 다룬다.
 - Current-policy forward가 stale logits 문제는 없애지만, context distribution shift는 남으므로 drift metric을 보고한다.
 
-## 21. Future Phase: 8-GPU Actor Update With 4+4 Streaming Rollout
-
-이 섹션은 현재 구현 완료 항목이 아니라, Qwen3.5/Qwen3.6 FP8 long-context
-async-SKD 실험에서 확인된 actor update 병목을 줄이기 위한 다음 구조 변경 계획이다.
-
-현재 로컬 8GPU 실행은 다음처럼 GPU를 쓴다.
-
-```text
-global_pool:
-  actor / student rollout / actor update
-  trainer.n_gpus_per_node=4
-
-teacher_pool:
-  teacher SGLang
-  distillation.teacher_model.n_gpus_per_node=4
-```
-
-이 구조에서는 generation 중 student와 teacher가 각각 4GPU를 쓰지만,
-`update_actor`는 actor `global_pool`의 4GPU만 사용한다. 최근 Qwen3.5
-student update 로그에서 `update_actor`는 step time의 큰 비중을 차지하므로,
-update phase만 8GPU로 확장하는 것이 가장 공격적인 systems 개선 후보가
-되었다.
-
-### 21.1 Do Not Just Set `trainer.n_gpus_per_node=8`
-
-단순히 다음처럼 바꾸면 안 된다.
-
-```text
-trainer.n_gpus_per_node=8
-distillation.teacher_model.enable_resource_pool=True
-distillation.teacher_model.n_gpus_per_node=4
-```
-
-현재 resource manager는 actor/global pool과 teacher pool을 합산한다.
-
-```text
-global_pool=8 + teacher_pool=4 = 12 GPUs requested
-```
-
-8GPU 서버에서는 Ray resource check에서 실패하거나, placement가 우연히
-진행되더라도 runtime layout이 의도와 달라진다.
-
-### 21.2 `enable_resource_pool` Is Not Just Resource Accounting
-
-현재 코드에서 `distillation.teacher_model.enable_resource_pool=True`는 두 의미를
-동시에 가진다.
-
-```text
-1. teacher model을 Ray resource pool에 띄운다.
-2. rollout 중 streaming teacher verification을 활성화한다.
-```
-
-Agent loop 쪽은 이 값을 보고 `stream_teacher_with_rollout`을 결정한다. 따라서
-이 값을 단순히 `False`로 바꾸면 별도 teacher pool은 사라지지만, 현재 SKD의
-chunk-level streaming teacher verification 경로도 꺼질 수 있다.
-
-향후 구조 변경에서는 이 두 의미를 분리해야 한다.
-
-```text
-keep:
-  streaming teacher verification during rollout
-
-change:
-  teacher server placement should be able to share/split the actor global pool
-  instead of always creating an additional teacher_pool
-```
-
-예상 config 방향:
-
-```yaml
-distillation.teacher_model.enable_resource_pool: true
-distillation.teacher_model.share_actor_resource_pool: true
-distillation.teacher_model.shared_resource_start: 4
-distillation.teacher_model.shared_resource_size: 4
-actor_rollout_ref.rollout.shared_resource_start: 0
-actor_rollout_ref.rollout.shared_resource_size: 4
-```
-
-필드 이름은 예시다. 핵심은 streaming semantics와 resource-pool creation을
-분리하는 것이다.
-
-### 21.3 Target Runtime Layout
-
-목표는 같은 8GPU를 phase별로 다르게 쓰는 것이다.
-
-```text
-generation phase:
-  student rollout SGLang: GPUs 0-3
-  teacher SGLang:         GPUs 4-7
-
-update phase:
-  student rollout sleeps and releases weights/KV
-  teacher sleeps and releases weights/KV
-  actor FSDP update: GPUs 0-7
-
-post-update:
-  student rollout receives updated actor weights
-  teacher does not receive actor weights because teacher is fixed
-```
-
-이 구조는 teacher throughput을 희생하지 않고 actor update만 8GPU로 키우는
-방향이다. Student와 teacher SGLang을 같은 GPU에 동시에 올리는 방식은
-`gpu_memory_utilization=0.90` 조합에서 현실적이지 않다.
-
-### 21.4 Required Code Changes
-
-구조 변경의 최소 단위는 다음이다.
-
-1. Resource pool construction
-
-   - `global_pool`은 8GPU로 만든다.
-   - `share_actor_resource_pool=True`일 때는 별도 `teacher_pool`을 추가하지 않는다.
-   - 그래도 streaming teacher path는 유지해야 한다.
-
-2. Actor worker group
-
-   - Actor/FSDP worker group은 8 ranks로 만든다.
-   - `update_actor`는 이 8 ranks 전체에서 수행된다.
-
-3. Student rollout worker subset
-
-   - Student rollout server는 actor worker group 전체가 아니라 앞쪽 4 workers만
-     사용한다.
-   - 현재 `AgentLoopManager._initialize_llm_servers()`는 `worker_group.world_size`
-     기준으로 replica 수를 잡으므로, subset worker group을 명시적으로 넘기거나
-     manager가 rollout subset을 만들 수 있어야 한다.
-
-4. Teacher rollout resource subset
-
-   - Teacher rollout server는 global pool의 뒤쪽 4GPU에 해당하는 resource
-     subset을 사용한다.
-   - `TeacherModelManager`는 기존처럼 teacher servers를 만들되, 별도 4GPU
-     pool을 새로 요구하지 않아야 한다.
-
-5. Sleep before update
-
-   - Student rollout은 기존 checkpoint manager path에서 sleep된다.
-   - Teacher rollout도 update 전에 sleep되어야 한다. Async SKD manager의
-     `finally` sleep에만 의존하지 말고, update 직전 방어적으로
-     `teacher_model_manager.sleep()`을 보장하는 편이 안전하다.
-
-### 21.5 Weight Sync Risk
-
-현재 기본 rollout checkpoint backend는 `naive`다.
-
-```text
-actor_rollout_ref.rollout.checkpoint_engine.backend=naive
-```
-
-이 경로는 각 actor worker가 자기 내부의 rollout object를 업데이트하는 형태에
-가깝다. 따라서 다음 비대칭 구조와 잘 맞지 않을 수 있다.
-
-```text
-actor trainer world_size = 8
-student rollout world_size = 4
-```
-
-개념적으로는 FSDP shard에서 full HF-style weight tensor를 materialize한 뒤,
-4개 SGLang rollout replica에 업데이트하면 된다. 하지만 현재 `naive` path는
-actor worker 수와 rollout worker 수가 자연스럽게 맞는 colocated layout을
-전제한다.
-
-`nccl`과 `nixl` checkpoint engine은 interface 차원에서
-`trainer_world_size`와 `rollout_world_size`를 따로 받는다. 특히 NCCL path는
-trainer rank 0을 sender로 두고 rollout ranks를 receiver로 두는 topology를
-구성한다. 이 경로가 8->4 sync에 더 적합할 가능성이 높다.
-
-따라서 8GPU update 구조는 weight sync backend 검증 없이는 구현 완료로 보면 안 된다.
-
-### 21.6 Smoke Test Plan
-
-검증은 네 단계로 나눈다.
-
-```text
-Level 0: CPU-only topology/config test
-  - resource_pool_spec이 8GPU만 요구하는지 확인
-  - teacher streaming flag와 teacher pool creation이 분리되는지 확인
-  - checkpoint backend build_topology(8, 4, metadata) shape 확인
-
-Level 1: small-model GPU sync test
-  - trainer_world_size=2, rollout_world_size=1 또는 4->2로 시작
-  - backend=nccl 또는 nixl
-  - FSDP full tensor materialization과 SGLang update_weights 경로 확인
-
-Level 2: actual 8->4 GPU sync test
-  - actor trainer ranks=8
-  - student rollout replicas=4
-  - teacher는 아직 제외
-  - update 후 rollout generation이 새 weights를 보는지 확인
-
-Level 3: full phase-sharing test
-  - actor/FSDP update=8GPU
-  - student rollout=4GPU
-  - teacher rollout=4GPU
-  - generation 후 both rollout engines sleep
-  - update 중 8GPU가 모두 actor update에 사용되는지 확인
-```
-
-CPU-only test는 필요하지만 충분하지 않다. 실제 위험은 CUDA tensor bucket,
-NCCL/NIXL process group, FSDP full tensor materialization, SGLang
-`update_weights()`에서 나온다. 의미 있는 8->4 sync 검증은 GPU가 필요하다.
-
-### 21.7 Expected Benefit And Failure Modes
-
-최근 로컬 Qwen3.5/Qwen3.6 FP8 run에서 step time은 대략 다음 구조였다.
-
-```text
-generation:   step의 가장 큰 비중
-update_actor: step의 약 1/3 수준까지 상승
-old_log_prob: 상대적으로 작음
-```
-
-8GPU update가 성공하면 `update_actor`는 2배까지는 아니더라도 유의미하게
-줄어들 수 있다. 단, 전체 step time은 generation/teacher tail이 여전히 크기
-때문에 반으로 줄어들지는 않는다.
-
-예상되는 실패 모드:
-
-- Ray resource accounting이 여전히 12GPU를 요구한다.
-- Student rollout subset이 아니라 actor worker group 전체 8개에 SGLang을 띄운다.
-- Teacher streaming path가 꺼져 SKD가 post-rollout teacher computation으로 바뀐다.
-- Teacher SGLang이 sleep 후에도 GPU memory를 충분히 release하지 않아 update가 OOM난다.
-- `naive` checkpoint backend가 8 trainer / 4 rollout 비대칭을 처리하지 못한다.
-- `nccl` 또는 `nixl` sync에서 rank 0 full tensor materialization memory가 터진다.
-
-이 phase는 script tuning이 아니라 resource layout과 weight sync semantics를
-바꾸는 작업으로 취급한다.

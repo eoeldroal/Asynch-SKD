@@ -111,7 +111,7 @@ tool call 로그가 보인다고 해서 sandbox execution이 실제로 성공했
 
 이 축에서 validation은 student policy 자체를 평가하는 단계다.  
 따라서 validation 동작을 해석할 때는 teacher-guided train rollout과 구분해야 한다.  
-현재 구현은 validation에서도 agent-loop 경로를 타지만, `validate=True`일 때 distillation 경로는 비활성화되므로 teacher-guided training rollout과 동일하다고 보면 안 된다.
+현재 구현은 validation에서도 agent-loop 경로를 타지만, trainer validation entrypoint에서 `skd_agent`를 `tool_agent`로 바꿔 student-only validation으로 처리하므로 teacher-guided training rollout과 동일하다고 보면 안 된다.
 
 추가로 `best@4`, `mean@4`를 보려면:
 
@@ -234,6 +234,16 @@ student rollout SGLang 쪽 `gpu_memory_utilization`은 runtime에서 그대로 `
 - `0.60` -> `107.01 GiB`
 
 즉 이 값은 rollout throughput과 resume 안정성에 직접 영향을 주는 레버다.
+
+### 15. `data.truncation=error`는 silently 넘어가지 않는다
+
+현재 스크립트는 `data.truncation=error`를 사용한다. 오버롱 prompt가 들어오면 truncate 하지 않고 에러로 올린다. `filter_overlong_prompts=True`와 함께 쓰이기 때문에 정상 흐름에서는 에러가 나지 않아야 한다. 만약 `Prompt length ... exceeds ...` 에러가 뜨면 filter 단계가 제대로 작동하지 않은 것이므로, data pipeline을 먼저 본다.
+
+### 16. `VERL_SKD_DEBUG` 레벨은 목적에 맞게 선택한다
+
+- `VERL_SKD_DEBUG=0` (기본): 디버그 로그 없음
+- `VERL_SKD_DEBUG=1` (현재 스크립트 기본): chunk 단위 diagnostics 출력 (`accept/reject rate`, `avg_tok/chunk`, 종료 이유 등)
+- `VERL_SKD_DEBUG=2`: 위에 더해 batch당 첫 3 sample의 token-level alignment 검증 로그 출력. teacher row 정렬 문제가 의심될 때만 사용한다. 로그가 매우 많아지고 성능에 영향을 줄 수 있다.
 
 ## 결론
 

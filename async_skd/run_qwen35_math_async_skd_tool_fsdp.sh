@@ -48,8 +48,8 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.use_policy_gradient=False \
     distillation.distillation_loss.loss_max_clamp=10.0 \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
-    distillation.skd.chunk_size=128 \
-    distillation.skd.verify_top_k=5 \
+    distillation.skd.chunk_size=64 \
+    distillation.skd.verify_top_k=3 \
     distillation.skd.max_chunks_per_sample=512 \
     distillation.skd.teacher_system_prompt_path=/home/sogang_nlpy/verl/async_skd/test_mixedgen/teacher_system_prompt_math_planning.txt \
     actor_rollout_ref.rollout.name=sglang \
@@ -71,7 +71,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.default_agent_loop=skd_agent \
     +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager \
     +actor_rollout_ref.rollout.agent.async_skd_mode=lookahead \
-    +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=64 \
+    +actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover=False \
+    +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=80 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=16 \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -97,7 +98,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_math_tool_fsdp/qwen35_9b_to_27b_async_skd_tool \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.resume_mode=disable \
     trainer.save_freq=25 \
     trainer.test_freq=10 \

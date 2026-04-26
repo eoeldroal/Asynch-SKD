@@ -1634,12 +1634,12 @@ Carry-over current work has one extra trainer-side rule. The fresh rows are conv
 
 MVP should be conservative.
 
-Implemented config:
+Implemented config (실행 스크립트 기준):
 
 ```text
 async_skd_mode = lookahead
 async_skd_prefetch_limit = 64
-async_skd_prefetch_worker_target = 20
+async_skd_prefetch_worker_target = 16
 promote_finished = true
 carryover_resume = true
 ```
@@ -1665,14 +1665,15 @@ Implemented pieces:
 6. compact W&B step metrics
 ```
 
-Not implemented in the current code:
+Not implemented:
 
 ```text
-1. separate async_skd_max_old_gen_chunks cap
-2. exact IS correction
-3. live KV-cache resume across carryover
-4. rollout.n > 1 semantics
+1. exact IS correction
+2. live KV-cache resume across carryover
+3. rollout.n > 1 semantics
 ```
+
+Staleness 제어는 `distillation.skd.max_chunks_per_sample`이 담당한다. 별도 `async_skd_max_old_gen_chunks` cap은 구현하지 않는다.
 
 ## 14. Paper Framing
 
@@ -1759,22 +1760,21 @@ worker_active_count-based refill
 
 Do not import the queue design. `MessageQueue` drops samples when full, which conflicts with source ledger accounting.
 
-### 15.3 Persistent Instance Interpretation
+### 15.3 Current Runtime Layout
 
-최종 방향은 persistent generator/trainer 구조다.
+현재 구현된 레이아웃은 다음과 같다.
 
 ```text
-Student trainer:
-GPU 0-3, current theta_k 보유, KD loss와 optimizer update 수행
+global_pool (actor/student rollout/actor update):
+  trainer.n_gpus_per_node=4
+  actor FSDP + student SGLang rollout이 동일 pool 사용
 
-Student rollout engines:
-GPU 4-5, theta_bar_v snapshot으로 SKD student chunk 생성
-
-Teacher rollout engines:
-GPU 6-7, 고정 teacher로 verification 수행
+teacher_pool:
+  distillation.n_gpus_per_node=4
+  teacher SGLang (고정 teacher)
 ```
 
-Trainer가 update를 끝내면 student rollout engines에만 weight sync를 건다. Sync는 handler-return export boundary에서 적용한다. 이 구조는 GPU utilization을 높이지만, 안전한 work가 없으면 의도적으로 idle을 허용한다.
+Trainer가 update를 끝내면 기존 verl `update_weights()` 경로로 student rollout engine에 weight sync를 건다. 이 구조는 GPU utilization을 높이지만, 안전한 work가 없으면 의도적으로 idle을 허용한다.
 
 즉 목표는 unconditional 100% utilization이 아니라:
 
@@ -1793,8 +1793,7 @@ Bound lookahead admission.
 Promote every finished lookahead sample.
 Pause unfinished samples only at handler-return export boundaries that satisfy real-state predicates.
 Resume only one step later.
-Bound old generation chunks and old prefix length.
-Drop anything older.
+Bound old generation chunks via distillation.skd.max_chunks_per_sample.
 Track source-aware metrics.
 ```
 
