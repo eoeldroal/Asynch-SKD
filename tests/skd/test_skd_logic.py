@@ -114,6 +114,7 @@ class FakeTeacherServer:
         self.call_count = 0
         self.call_log: list[dict[str, Any]] = []
         self.released_request_ids: list[str] = []
+        self.bound_requests: list[dict[str, str]] = []
 
     async def compute_teacher_logprobs_single(
         self,
@@ -152,6 +153,15 @@ class FakeTeacherServer:
 
     async def release_sticky_session(self, request_id: str) -> None:
         self.released_request_ids.append(request_id)
+
+    async def bind_sticky_request(self, *, routing_key: str, request_id: str, server_id: str) -> None:
+        self.bound_requests.append(
+            {
+                "routing_key": routing_key,
+                "request_id": request_id,
+                "server_id": server_id,
+            }
+        )
 
 
 class FakeToolParser:
@@ -837,6 +847,32 @@ async def test_skd_run_until_exportable_boundary_resume_partial_keeps_teacher_re
     assert result.extra_fields["teacher_ids_list"] == [[10, 0, 0, 0], [20, 0, 0, 0]]
     assert result.extra_fields["teacher_logprobs_list"] == [[-1.0] * LOSS_TOP_K, [-1.0] * LOSS_TOP_K]
     assert loop.teacher_server_manager.released_request_ids == []
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_verification_binds_sticky_request_to_pinned_replica():
+    loop = make_skd_loop(
+        student_chunks=[[10, EOS]],
+        teacher_topk_by_call=[{}, {}],
+    )
+    agent_data = make_agent_data()
+    agent_data.extra_fields["teacher_routing_key"] = "default"
+    agent_data.extra_fields["teacher_replica_id"] = "teacher-replica-7"
+
+    next_state = await loop._handle_generating_state(
+        agent_data,
+        {
+            "max_tokens": 8,
+        },
+    )
+
+    assert next_state == AgentState.TERMINATED
+    assert loop.teacher_server_manager.bound_requests
+    assert loop.teacher_server_manager.bound_requests[0] == {
+        "routing_key": "default",
+        "request_id": agent_data.request_id,
+        "server_id": "teacher-replica-7",
+    }
 
 
 @pytest.mark.asyncio

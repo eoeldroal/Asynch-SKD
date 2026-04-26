@@ -74,7 +74,13 @@ class _FakeLookaheadWorker:
             assert partial_state is not None
             self._calls.append((self._name, "resume", sample_id))
         await asyncio.sleep(0)
-        sample = self._lookahead_results[sample_id].pop(0)
+        samples = self._lookahead_results[sample_id]
+        if samples:
+            sample = samples.pop(0)
+            if not samples:
+                self._lookahead_results[sample_id] = [sample]
+        else:
+            sample = _make_partial_sample(sample_id)
         if sample.kind == "completed":
             sample.require_completed().meta_info["metrics"][0]["rollout_server_id"] = self._name
         return sample
@@ -408,6 +414,33 @@ async def test_manager_tracks_teacher_replica_pins_from_partial_metadata_and_rep
     assert metrics["async_skd/teacher_fallback_carryover_count"] == 1
     assert [call[1:] for call in calls].count(("carryover", "carry-a")) == 1
     assert [call[1:] for call in calls].count(("carryover", "carry-b")) == 1
+
+
+@pytest.mark.asyncio
+async def test_lookahead_partial_carryover_preserves_planned_teacher_replica_id():
+    manager, _, source = _make_manager(
+        prefetch_limit=1,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={
+            "lookahead-100": [_make_partial_sample("lookahead-100") for _ in range(32)],
+        },
+        base_delays={0: 0.0, 1: 0.002},
+    )
+    manager._teacher_replica_ids = [
+        "teacher-replica-0",
+        "teacher-replica-1",
+    ]
+
+    await manager.generate_sequences(_make_prompts(2))
+
+    assert manager._async_skd_carryover_partials
+    partial = manager._async_skd_carryover_partials[0]
+    assert partial.sample_id == "lookahead-100"
+    assert partial.extra_fields["teacher_replica_id"] in {
+        "teacher-replica-0",
+        "teacher-replica-1",
+    }
+    assert source.carryover_partials[0].extra_fields["teacher_replica_id"] == partial.extra_fields["teacher_replica_id"]
 
 
 @pytest.mark.asyncio

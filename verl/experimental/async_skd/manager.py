@@ -162,6 +162,19 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             return None
         return str(teacher_replica_id)
 
+    def _choose_teacher_replica_for_lookahead(self) -> str:
+        replica_ids = self._teacher_replica_ids_for_planning()
+        replica_order = {replica_id: idx for idx, replica_id in enumerate(replica_ids)}
+        replica_loads: dict[str, int] = {replica_id: 0 for replica_id in replica_ids}
+        for teacher_replica_id in getattr(self, "_teacher_replica_pin_by_sample_id", {}).values():
+            teacher_replica_id = str(teacher_replica_id)
+            if teacher_replica_id not in replica_loads:
+                replica_order[teacher_replica_id] = len(replica_order)
+                replica_loads[teacher_replica_id] = 0
+                replica_ids.append(teacher_replica_id)
+            replica_loads[teacher_replica_id] += 1
+        return min(replica_ids, key=lambda replica_id: (replica_loads[replica_id], replica_order[replica_id]))
+
     def _plan_teacher_replica_assignments(
         self,
         *,
@@ -468,6 +481,10 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
 
         def launch_lookahead_batch(sample_id: str, sample: DataProto, admission_order: int, worker_idx: int) -> None:
             worker = worker_for_idx(worker_idx)
+            teacher_replica_id = getattr(self, "_teacher_replica_pin_by_sample_id", {}).get(sample_id)
+            if teacher_replica_id is None:
+                teacher_replica_id = self._choose_teacher_replica_for_lookahead()
+                self._teacher_replica_pin_by_sample_id[sample_id] = teacher_replica_id
             task = asyncio.ensure_future(
                 worker.generate_skd_until_boundary.remote(
                     sample,
@@ -484,6 +501,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         "barrier_role": "lookahead",
                         "worker_capacity": worker_capacity,
                         "prefetch_worker_target": prefetch_worker_target,
+                        "teacher_replica_id": teacher_replica_id,
                     },
                 )
             )
@@ -495,6 +513,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 "source_type": "lookahead",
                 "barrier_role": "lookahead",
                 "launch_ts": time.time(),
+                "teacher_replica_id": teacher_replica_id,
             }
             emit_async_skd_event(
                 "lookahead_admit",
@@ -511,6 +530,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 lookahead_started_count=lookahead_started_count,
                 prefetch_limit=prefetch_limit,
                 reason="slot_available",
+                teacher_replica_id=teacher_replica_id,
             )
             emit_async_skd_event(
                 "sample_launch",
@@ -524,6 +544,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 worker_active_after=active_after,
                 worker_capacity=worker_capacity,
                 prefetch_worker_target=prefetch_worker_target,
+                teacher_replica_id=teacher_replica_id,
             )
             print(
                 "[ASYNC_SKD] prefetch_start "
@@ -535,6 +556,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
 
         def launch_lookahead_partial(partial_state: SkdPartialState, admission_order: int, worker_idx: int) -> None:
             worker = worker_for_idx(worker_idx)
+            teacher_replica_id = partial_state.extra_fields.get("teacher_replica_id")
             task = asyncio.ensure_future(
                 worker.generate_skd_until_boundary.remote(
                     None,
@@ -553,6 +575,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         "worker_capacity": worker_capacity,
                         "prefetch_worker_target": prefetch_worker_target,
                         "resumed_partial": True,
+                        "teacher_replica_id": teacher_replica_id,
                     },
                 )
             )
@@ -564,6 +587,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 "source_type": partial_state.source_type,
                 "barrier_role": "lookahead",
                 "launch_ts": time.time(),
+                "teacher_replica_id": teacher_replica_id,
             }
             emit_async_skd_event(
                 "sample_launch",
@@ -578,6 +602,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 worker_capacity=worker_capacity,
                 prefetch_worker_target=prefetch_worker_target,
                 resumed_partial=True,
+                teacher_replica_id=teacher_replica_id,
             )
 
         def try_admit_lookahead(worker_idx: int) -> None:
@@ -687,6 +712,11 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                         continue
 
                     partial = sample.require_partial()
+                    teacher_replica_id = meta.get("teacher_replica_id")
+                    if teacher_replica_id is not None and partial.extra_fields.get("teacher_replica_id") is None:
+                        partial.extra_fields["teacher_replica_id"] = teacher_replica_id
+                    if teacher_replica_id is not None:
+                        self._teacher_replica_pin_by_sample_id[partial.sample_id] = str(teacher_replica_id)
                     if not drain_requested and bool(current_active):
                         lookahead_continued_partial_count += 1
                         launch_lookahead_partial(partial, admission_order, worker_idx)

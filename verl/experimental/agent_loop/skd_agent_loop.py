@@ -655,6 +655,21 @@ class SkdAgentLoop(ToolAgentLoop):
                 # 2. Teacher verification
                 teacher_t0 = time.monotonic()
                 with simple_timer("skd_teacher_verify", agent_data.metrics):
+                    teacher_replica_id = agent_data.extra_fields.get("teacher_replica_id")
+                    teacher_routing_key = agent_data.extra_fields.get("teacher_routing_key")
+                    bind_sticky_request = getattr(self.teacher_server_manager, "bind_sticky_request", None)
+                    if (
+                        teacher_replica_id is not None
+                        and bind_sticky_request is not None
+                        and teacher_routing_key is not None
+                    ):
+                        result = bind_sticky_request(
+                            routing_key=teacher_routing_key,
+                            request_id=agent_data.request_id,
+                            server_id=str(teacher_replica_id),
+                        )
+                        if inspect.isawaitable(result):
+                            await result
                     verify_sequence = teacher_prompt_ids + chunk
                     logprob_start_len = max(len(teacher_prompt_ids) - 1, 0)
                     teacher_ids, teacher_logprobs = (
@@ -663,7 +678,7 @@ class SkdAgentLoop(ToolAgentLoop):
                             sequence_ids=verify_sequence,
                             logprob_start_len=logprob_start_len,
                             multi_modal_data=self._current_multi_modal_data(agent_data),
-                            routing_key=agent_data.extra_fields.get("teacher_routing_key"),
+                            routing_key=teacher_routing_key,
                         )
                     )
                 teacher_ms = (time.monotonic() - teacher_t0) * 1000
