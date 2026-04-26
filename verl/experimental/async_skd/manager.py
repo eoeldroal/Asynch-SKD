@@ -10,7 +10,17 @@ from typing import Any
 from omegaconf import OmegaConf
 import ray
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+try:
+    from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+except ModuleNotFoundError:  # pragma: no cover - local test environments may not have the full rollout stack
+    class AgentLoopManager:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+
+        def _performance_metrics(self, metrics: list[dict[str, Any]], output: DataProto) -> dict[str, Any]:
+            del metrics, output
+            return {}
+
 from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
@@ -30,6 +40,8 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         super().__init__(*args, **kwargs)
         self.agent_loop_workers_class = ray.remote(AsyncSkdAgentLoopWorker)
         self._async_skd_data_source = None
+        self._teacher_replica_pin_by_sample_id: dict[str, str] = {}
+        self._teacher_replica_last_plan_stats: dict[str, Any] = {}
 
     def set_async_skd_data_source(self, source: Any | None) -> None:
         self._async_skd_data_source = source
@@ -111,6 +123,110 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         carryover_count = len(getattr(self, "_async_skd_carryover_partials", []))
         return max(0, base_batch_size - carryover_count)
 
+    def _teacher_replica_ids_for_planning(
+        self,
+        carryover_partials: list[SkdPartialState] | None = None,
+    ) -> list[str]:
+        replica_ids: list[str] = []
+
+        explicit_replica_ids = getattr(self, "_teacher_replica_ids", None)
+        if explicit_replica_ids:
+            replica_ids.extend(str(replica_id) for replica_id in explicit_replica_ids)
+        else:
+            worker_count = len(getattr(self, "agent_loop_workers", []))
+            if worker_count <= 0:
+                worker_count = 1
+            replica_ids.extend(f"teacher-replica-{idx}" for idx in range(worker_count))
+
+        if carryover_partials is not None:
+            for partial in carryover_partials:
+                teacher_replica_id = partial.extra_fields.get("teacher_replica_id")
+                if teacher_replica_id is None:
+                    continue
+                teacher_replica_id = str(teacher_replica_id)
+                if teacher_replica_id not in replica_ids:
+                    replica_ids.append(teacher_replica_id)
+
+        for teacher_replica_id in getattr(self, "_teacher_replica_pin_by_sample_id", {}).values():
+            if teacher_replica_id not in replica_ids:
+                replica_ids.append(teacher_replica_id)
+
+        if not replica_ids:
+            replica_ids.append("teacher-replica-0")
+
+        return replica_ids
+
+    def _teacher_replica_id_from_partial(self, partial: SkdPartialState) -> str | None:
+        teacher_replica_id = partial.extra_fields.get("teacher_replica_id")
+        if teacher_replica_id is None:
+            return None
+        return str(teacher_replica_id)
+
+    def _plan_teacher_replica_assignments(
+        self,
+        *,
+        carryover_sample_ids: list[str],
+        fresh_sample_ids: list[str],
+        carryover_partials: list[SkdPartialState] | None = None,
+    ) -> dict[str, str]:
+        replica_ids = self._teacher_replica_ids_for_planning(carryover_partials=carryover_partials)
+        replica_order = {replica_id: idx for idx, replica_id in enumerate(replica_ids)}
+        replica_loads: dict[str, int] = {replica_id: 0 for replica_id in replica_ids}
+        assignments: dict[str, str] = {}
+        pinned_carryover_count = 0
+        fallback_carryover_count = 0
+
+        carryover_partial_by_sample_id = (
+            {partial.sample_id: partial for partial in carryover_partials} if carryover_partials is not None else {}
+        )
+
+        def choose_least_loaded_replica() -> str:
+            return min(replica_ids, key=lambda replica_id: (replica_loads[replica_id], replica_order[replica_id]))
+
+        for sample_id in carryover_sample_ids:
+            teacher_replica_id = getattr(self, "_teacher_replica_pin_by_sample_id", {}).get(sample_id)
+            hard_pinned = teacher_replica_id is not None
+            if teacher_replica_id is None:
+                partial = carryover_partial_by_sample_id.get(sample_id)
+                if partial is not None:
+                    teacher_replica_id = self._teacher_replica_id_from_partial(partial)
+                    hard_pinned = teacher_replica_id is not None
+            if teacher_replica_id is None:
+                teacher_replica_id = choose_least_loaded_replica()
+                fallback_carryover_count += 1
+            else:
+                teacher_replica_id = str(teacher_replica_id)
+
+            if teacher_replica_id not in replica_loads:
+                replica_order[teacher_replica_id] = len(replica_order)
+                replica_loads[teacher_replica_id] = 0
+                if teacher_replica_id not in replica_ids:
+                    replica_ids.append(teacher_replica_id)
+
+            assignments[sample_id] = teacher_replica_id
+            replica_loads[teacher_replica_id] += 1
+            if hard_pinned:
+                pinned_carryover_count += 1
+
+        for sample_id in fresh_sample_ids:
+            teacher_replica_id = choose_least_loaded_replica()
+            assignments[sample_id] = teacher_replica_id
+            replica_loads[teacher_replica_id] += 1
+
+        teacher_replica_pin_by_sample_id = getattr(self, "_teacher_replica_pin_by_sample_id", None)
+        if teacher_replica_pin_by_sample_id is None:
+            teacher_replica_pin_by_sample_id = {}
+            self._teacher_replica_pin_by_sample_id = teacher_replica_pin_by_sample_id
+        teacher_replica_pin_by_sample_id.update(assignments)
+        self._teacher_replica_last_plan_stats = {
+            "async_skd/teacher_pinned_carryover_count": pinned_carryover_count,
+            "async_skd/teacher_fallback_carryover_count": fallback_carryover_count,
+            "async_skd/teacher_rebalanced_fresh_count": len(fresh_sample_ids),
+            "async_skd/teacher_replica_count": len(replica_ids),
+        }
+        self._async_skd_last_step_metrics = dict(self._teacher_replica_last_plan_stats)
+        return assignments
+
     @auto_await
     async def generate_sequences_with_carryover(
         self,
@@ -139,6 +255,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
     ) -> list[DataProto]:
         fresh_count = len(fresh_prompts) if fresh_prompts is not None else 0
         current_items: list[tuple[str, int, Any]] = []
+        carryover_partial_by_sample_id = {partial.sample_id: partial for partial in carryover_partials}
 
         for pos, partial in enumerate(carryover_partials):
             current_items.append(("carryover", pos, partial))
@@ -154,10 +271,37 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         elif carryover_partials:
             logical_step = max(partial.logical_step for partial in carryover_partials)
         prefetch_limit = self._lookahead_prefetch_limit(len(current_items))
+
+        def sample_id_for_item(kind: str, order: int, payload: Any) -> str:
+            if kind == "carryover":
+                return str(payload.sample_id)
+            if isinstance(payload, DataProto):
+                for key in ("uid", "index", "input_pos"):
+                    if key in payload.non_tensor_batch:
+                        return str(payload.non_tensor_batch[key][0])
+            return f"current-{logical_step}-{order}"
+
+        carryover_sample_ids = [partial.sample_id for partial in carryover_partials]
+        fresh_sample_ids = [
+            sample_id_for_item(kind, order, payload)
+            for kind, order, payload in current_items
+            if kind == "fresh"
+        ]
+        current_teacher_replica_by_sample_id = self._plan_teacher_replica_assignments(
+            carryover_sample_ids=carryover_sample_ids,
+            fresh_sample_ids=fresh_sample_ids,
+            carryover_partials=carryover_partials,
+        )
+
+        def teacher_replica_id_for_item(kind: str, order: int, payload: Any) -> str | None:
+            sample_id = sample_id_for_item(kind, order, payload)
+            return current_teacher_replica_by_sample_id.get(sample_id)
+
         return await self._generate_current_work_with_lookahead(
             current_items,
             logical_step=logical_step,
             prefetch_limit=prefetch_limit,
+            teacher_replica_id_for_item=teacher_replica_id_for_item,
         )
 
     async def _generate_sequences_sample_async(self, prompts: DataProto) -> list[DataProto]:
@@ -219,6 +363,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         *,
         logical_step: int,
         prefetch_limit: int,
+        teacher_replica_id_for_item: Any | None = None,
     ) -> list[DataProto]:
         """Run current work and use freed worker slots for bounded lookahead."""
         if not current_items:
@@ -273,6 +418,9 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             worker = worker_for_idx(worker_idx)
             sample_id = sample_id_for_current(kind, order, payload)
             source_type = "resumed_current" if kind == "carryover" else "base_current"
+            teacher_replica_id = None
+            if teacher_replica_id_for_item is not None:
+                teacher_replica_id = teacher_replica_id_for_item(kind, order, payload)
             event_context = {
                 "global_step": logical_step,
                 "logical_step": logical_step,
@@ -282,6 +430,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 "source_type": source_type,
                 "barrier_role": "current",
                 "worker_capacity": worker_capacity,
+                "teacher_replica_id": teacher_replica_id,
             }
             if kind == "fresh":
                 task = asyncio.ensure_future(
@@ -298,10 +447,11 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 "order": order,
                 "worker_idx": worker_idx,
                 "sample_id": sample_id,
-                "source_type": source_type,
-                "barrier_role": "current",
-                "launch_ts": time.time(),
-            }
+                    "source_type": source_type,
+                    "barrier_role": "current",
+                    "launch_ts": time.time(),
+                    "teacher_replica_id": teacher_replica_id,
+                }
             emit_async_skd_event(
                 "sample_launch",
                 global_step=logical_step,
@@ -313,6 +463,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 barrier_role="current",
                 worker_active_after=active_after,
                 worker_capacity=worker_capacity,
+                teacher_replica_id=teacher_replica_id,
             )
 
         def launch_lookahead_batch(sample_id: str, sample: DataProto, admission_order: int, worker_idx: int) -> None:
@@ -582,6 +733,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             "async_skd/lookahead_promote_rate": lookahead_promoted_count / lookahead_denominator,
             "async_skd/lookahead_carryover_rate": lookahead_carryover_count / lookahead_denominator,
         }
+        self._async_skd_last_step_metrics.update(getattr(self, "_teacher_replica_last_plan_stats", {}))
         print(
             "[ASYNC_SKD] rollout "
             f"prefetch_limit={prefetch_limit} started={lookahead_started_count} "

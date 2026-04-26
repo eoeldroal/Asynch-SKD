@@ -209,6 +209,23 @@ def _make_partial(sample_id: str, logical_step: int = 4, committed_gen_chunks: i
     )
 
 
+def _make_partial_with_teacher_replica(
+    sample_id: str,
+    teacher_replica_id: str | None,
+    *,
+    logical_step: int = 4,
+    committed_gen_chunks: int = 1,
+) -> SkdPartialState:
+    partial = _make_partial(
+        sample_id,
+        logical_step=logical_step,
+        committed_gen_chunks=committed_gen_chunks,
+    )
+    if teacher_replica_id is not None:
+        partial.extra_fields["teacher_replica_id"] = teacher_replica_id
+    return partial
+
+
 def _make_partial_sample(
     sample_id: str,
     logical_step: int = 4,
@@ -254,6 +271,8 @@ def _make_manager(
     )
     manager.rollout_config = OmegaConf.create({"n": rollout_n})
     manager.stream_teacher_with_rollout = False
+    manager._teacher_replica_pin_by_sample_id = {}
+    manager._teacher_replica_last_plan_stats = {}
     manager.agent_loop_workers = [
         _FakeLookaheadWorker(
             name="worker-0",
@@ -314,6 +333,81 @@ async def test_manager_generates_only_carryover_current_work_without_fresh_promp
 
     assert output.non_tensor_batch["input_pos"].tolist() == [200]
     assert [call[1:] for call in calls] == [("carryover", "carry-200")]
+
+
+@pytest.mark.asyncio
+async def test_teacher_replica_planner_hard_pins_carryover_before_rebalancing_fresh_samples():
+    manager, _, _ = _make_manager(
+        prefetch_limit=0,
+        source_items=[],
+        lookahead_results={},
+    )
+    manager._teacher_replica_ids = [
+        "teacher-replica-0",
+        "teacher-replica-1",
+        "teacher-replica-2",
+    ]
+    manager._teacher_replica_pin_by_sample_id = {
+        "carry-a": "teacher-replica-0",
+        "carry-b": "teacher-replica-0",
+        "carry-c": "teacher-replica-2",
+    }
+
+    assignments = manager._plan_teacher_replica_assignments(
+        carryover_sample_ids=["carry-a", "carry-b", "carry-c"],
+        fresh_sample_ids=["base-0", "base-1", "base-2", "base-3", "base-4"],
+    )
+
+    assert assignments["carry-a"] == "teacher-replica-0"
+    assert assignments["carry-b"] == "teacher-replica-0"
+    assert assignments["carry-c"] == "teacher-replica-2"
+    assert "teacher-replica-1" in {assignments[sample_id] for sample_id in ["base-0", "base-1", "base-2", "base-3", "base-4"]}
+    assert manager._teacher_replica_pin_by_sample_id["base-0"] == assignments["base-0"]
+    assert manager._async_skd_last_step_metrics["async_skd/teacher_pinned_carryover_count"] == 3
+    assert manager._async_skd_last_step_metrics["async_skd/teacher_fallback_carryover_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_manager_tracks_teacher_replica_pins_from_partial_metadata_and_reports_fallback_counts():
+    manager, calls, _ = _make_manager(
+        prefetch_limit=0,
+        source_items=[],
+        lookahead_results={
+            "carry-a": [_make_completed_sample("carry-a", 200, source_type="resumed_current")],
+            "carry-b": [_make_completed_sample("carry-b", 201, source_type="resumed_current")],
+        },
+    )
+    manager._teacher_replica_ids = [
+        "teacher-replica-0",
+        "teacher-replica-1",
+        "teacher-replica-2",
+    ]
+
+    output = await manager.generate_sequences_with_carryover(
+        fresh_prompts=_make_prompts(1),
+        carryover_partials=[
+            _make_partial_with_teacher_replica("carry-a", "teacher-replica-2"),
+            _make_partial_with_teacher_replica("carry-b", None),
+        ],
+    )
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [200, 201, 0]
+    assert manager._teacher_replica_pin_by_sample_id["carry-a"] == "teacher-replica-2"
+    assert manager._teacher_replica_pin_by_sample_id["carry-b"] in {
+        "teacher-replica-0",
+        "teacher-replica-1",
+        "teacher-replica-2",
+    }
+    assert manager._teacher_replica_pin_by_sample_id["0"] in {
+        "teacher-replica-0",
+        "teacher-replica-1",
+        "teacher-replica-2",
+    }
+    metrics = output.meta_info["async_skd_metrics"]
+    assert metrics["async_skd/teacher_pinned_carryover_count"] == 1
+    assert metrics["async_skd/teacher_fallback_carryover_count"] == 1
+    assert [call[1:] for call in calls].count(("carryover", "carry-a")) == 1
+    assert [call[1:] for call in calls].count(("carryover", "carry-b")) == 1
 
 
 @pytest.mark.asyncio
