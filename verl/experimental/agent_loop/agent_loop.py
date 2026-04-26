@@ -155,6 +155,16 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests[server_id] += 1
         return server_id
 
+    def bind_request_to_server(self, request_id: str, server_id: str) -> None:
+        """Force future acquires for request_id onto server_id."""
+        if server_id not in self._inflight_requests:
+            raise ValueError(f"Invalid server_id for bind: {server_id}")
+        self._request_id_to_server[request_id] = server_id
+
+    def release_request_binding(self, request_id: str) -> None:
+        """Remove any sticky mapping for request_id."""
+        self._request_id_to_server.pop(request_id, None)
+
     def release_server(self, server_id: str) -> None:
         """Release a server after a request completes, decrementing its inflight count."""
         if server_id not in self._inflight_requests:

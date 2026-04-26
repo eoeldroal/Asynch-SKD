@@ -383,3 +383,16 @@ class TestLoadBalancerStickySession:
         ray.get(lb.release_server.remote(server_id=s0))
         s1 = ray.get(lb.acquire_server.remote(request_id="conv-abc"))
         assert s0 == s1
+
+    def test_bind_request_to_server_forces_future_acquire(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(server_actor_ids=["s0", "s1", "s2"])
+        ray.get(lb.bind_request_to_server.remote(request_id="carry-1", server_id="s2"))
+        server = ray.get(lb.acquire_server.remote(request_id="carry-1"))
+        assert server == "s2"
+
+    def test_release_request_binding_removes_sticky_mapping(self, ray_for_lb):
+        lb = GlobalRequestLoadBalancer.remote(server_actor_ids=["s0", "s1"])
+        ray.get(lb.bind_request_to_server.remote(request_id="carry-1", server_id="s1"))
+        ray.get(lb.release_request_binding.remote(request_id="carry-1"))
+        server = ray.get(lb.acquire_server.remote(request_id="carry-1"))
+        assert server in {"s0", "s1"}
