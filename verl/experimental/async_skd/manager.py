@@ -100,7 +100,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             "actor_rollout_ref.rollout.agent.async_skd_prefetch_limit",
             default=0,
         )
-        return max(0, min(int(value), batch_size))
+        return max(0, min(int(value), 2 * batch_size))
 
     def _lookahead_prefetch_worker_target(self, worker_capacity: int) -> int:
         value = OmegaConf.select(

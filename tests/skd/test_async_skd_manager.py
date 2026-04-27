@@ -248,3 +248,22 @@ def test_teacher_sticky_carryover_can_be_disabled_via_config():
         "async_skd/teacher_pinned_carryover_count": 0,
         "async_skd/teacher_fallback_carryover_count": 0,
     }
+
+
+def test_lookahead_prefetch_limit_allows_two_step_horizon():
+    manager, _ = _make_manager()
+    manager.config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "n": 1,
+                    "agent": {
+                        "async_skd_mode": "lookahead",
+                        "async_skd_prefetch_limit": 80,
+                    },
+                }
+            }
+        }
+    )
+
+    assert manager._lookahead_prefetch_limit(64) == 80

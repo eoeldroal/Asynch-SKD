@@ -173,6 +173,7 @@ def _assemble_async_skd_training_batch(
     async_skd_data_source=None,
     validate: bool = False,
     required_multiple: int | None = None,
+    max_promoted_count: int | None = None,
 ) -> tuple[DataProto, DataProto]:
     """Append promoted async-SKD rollout pairs to the current training batch."""
     if validate or async_skd_data_source is None:
@@ -180,6 +181,8 @@ def _assemble_async_skd_training_batch(
 
     promoted_available = async_skd_data_source.promoted_count()
     take_count = promoted_available
+    if max_promoted_count is not None and max_promoted_count > 0:
+        take_count = min(take_count, int(max_promoted_count))
     if required_multiple is not None and required_multiple > 1:
         take_count -= (len(base_input_batch) + take_count) % required_multiple
 
@@ -1567,12 +1570,18 @@ class RayPPOTrainer:
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     if async_skd_data_source is not None:
                         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        max_promoted_count = OmegaConf.select(
+                            self.config,
+                            "actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step",
+                            default=0,
+                        )
                         batch, gen_batch_output = _assemble_async_skd_training_batch(
                             batch,
                             gen_batch_output,
                             async_skd_data_source=async_skd_data_source,
                             validate=False,
                             required_multiple=dp_size,
+                            max_promoted_count=max_promoted_count,
                         )
                     batch = batch.union(gen_batch_output)
 

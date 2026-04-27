@@ -107,6 +107,7 @@ class AgentLoopConfig(BaseConfig):
     async_skd_prefetch_limit: int = 0
     async_skd_prefetch_worker_target: int = 0
     async_skd_teacher_sticky_carryover: bool = True
+    async_skd_max_promoted_per_step: int = 0
 
 
 @dataclass

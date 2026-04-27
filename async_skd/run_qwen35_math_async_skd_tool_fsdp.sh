@@ -71,9 +71,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.agent.default_agent_loop=skd_agent \
     +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager \
     +actor_rollout_ref.rollout.agent.async_skd_mode=lookahead \
-    +actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover=False \
+    +actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover=True \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=80 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=16 \
+    +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=48 \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -85,6 +86,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=64 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
+    actor_rollout_ref.actor.calculate_entropy=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288 \
     actor_rollout_ref.actor.veomni.param_offload=True \
     actor_rollout_ref.actor.veomni.optimizer_offload=True \
@@ -101,7 +103,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.val_before_train=True \
     trainer.resume_mode=disable \
     trainer.save_freq=20 \
-    trainer.test_freq=10 \
+    trainer.test_freq=50 \
     trainer.total_epochs=5 \
     +trainer.use_legacy_worker_impl=disable \
     "$@"

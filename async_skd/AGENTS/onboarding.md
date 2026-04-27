@@ -193,7 +193,7 @@ carryover가 많다는 로그는 “이번 step이 길고 무거웠다”는 간
 
 다만 student는 update phase에서 sleep / weight residency 전환을 거치므로, teacher처럼 step 간 KV reuse의 직접 대상이라고 보면 안 된다.
 
-이 기능은 `actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover`로 켜고 끌 수 있다. 현재 실행 스크립트는 이 값을 `False`로 두고 있으므로, 최근 런을 읽을 때는 carryover가 fresh처럼 다시 배치된다고 보는 편이 맞다.
+이 기능은 `actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover`로 켜고 끌 수 있다. 현재 실행 스크립트는 이 값을 `True`로 두고 있으므로, 최근 런을 읽을 때는 carryover가 가능한 한 같은 teacher replica로 다시 붙도록 설계된 상태라고 보는 편이 맞다.
 
 ### 5-2. validation은 student-only일 뿐 아니라 training source와도 격리된다
 
