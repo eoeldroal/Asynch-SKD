@@ -113,6 +113,8 @@ tool call 로그가 보인다고 해서 sandbox execution이 실제로 성공했
 따라서 validation 동작을 해석할 때는 teacher-guided train rollout과 구분해야 한다.  
 현재 구현은 validation에서도 agent-loop 경로를 타지만, trainer validation entrypoint에서 `skd_agent`를 `tool_agent`로 바꿔 student-only validation으로 처리하므로 teacher-guided training rollout과 동일하다고 보면 안 된다.
 
+또 하나 더 중요하다. validation은 training `AsyncSkdDataSource`를 건드리면 안 된다. 현재 trainer는 `_validate()` 동안 manager에서 training source를 잠깐 분리하므로, validation이 training future sample을 prefetch하거나 promoted/carryover를 training source에 기록해서는 안 된다. 이 보호가 깨지면 validation이 끝난 뒤 다음 training step에서 carryover quota가 비정상적으로 커지는 leakage가 발생한다.
+
 추가로 `best@4`, `mean@4`를 보려면:
 
 - `val_kwargs.n=4`
