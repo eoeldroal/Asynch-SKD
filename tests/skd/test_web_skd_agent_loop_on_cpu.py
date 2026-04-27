@@ -1,0 +1,181 @@
+import unittest
+from copy import deepcopy
+
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
+from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
+from verl.tools.base_tool import ToolResponse
+
+
+class _FakeTool:
+    name = "computer"
+    tool_schema = None
+
+    def __init__(self):
+        self.created = []
+        self.executed = []
+        self.rewards = []
+        self._instance_dict = {}
+
+    async def create(self, **kwargs):
+        self.created.append(kwargs)
+        self._instance_dict["instance-1"] = {
+            "task_id": kwargs["task_id"],
+            "request_id": kwargs["request_id"],
+            "include_a11y": kwargs["include_a11y"],
+            "reward": None,
+        }
+        return "instance-1", ToolResponse(text="A11Y_TREE:\nroot")
+
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters))
+        return ToolResponse(text="At failed_action_index 0, action Failed. Reason: target field was not focused"), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": len(parameters["actions"]),
+        }
+
+    async def calc_reward(self, instance_id, **kwargs):
+        self.rewards.append((instance_id, kwargs))
+        return 1.0
+
+    def restore_instance(self, instance_id, **kwargs):
+        self._instance_dict[instance_id] = dict(kwargs)
+
+
+def _build_loop():
+    loop = WebSkdAgentLoop.__new__(WebSkdAgentLoop)
+    loop.tools = {"computer": _FakeTool()}
+    loop.tool_schemas = []
+    loop.teacher_key = "data_source"
+    loop.response_length = 64
+    loop.loss_top_k = 4
+    loop.max_parallel_calls = 1
+    loop.max_tool_response_length = 4096
+    loop.tool_response_truncate_side = "left"
+    loop.teacher_system_prompt = None
+    loop.prompt_length = 64
+    loop.tool_parser_name = "qwen3_coder"
+    loop.processor = None
+    return loop
+
+
+class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
+    def test_web_skd_agent_is_still_skd(self):
+        self.assertTrue(issubclass(WebSkdAgentLoop, SkdAgentLoop))
+
+    async def test_pending_requests_a11y_but_only_teacher_prompt_gets_a11y(self):
+        loop = _build_loop()
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            if any("A11Y_TREE" in str(m.get("content")) for m in messages):
+                return [7, 8, 9]
+            return [1, 2, 3]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345", "request_id": 101}}},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+
+        state = await WebSkdAgentLoop._handle_pending_state(loop, agent_data, {})
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertTrue(loop.tools["computer"].created[0]["include_a11y"])
+        self.assertNotIn("A11Y_TREE", str(agent_data.messages))
+        self.assertTrue(agent_data.extra_fields["web_osgym_teacher_observation_text"].startswith("A11Y_TREE"))
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [7, 8, 9])
+
+    async def test_processing_tools_keeps_error_text_for_student_but_not_a11y(self):
+        loop = _build_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_request_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2},{"action_type":"CLICK","x":3,"y":4}]}',
+                },
+            )()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertIn("failed_action_index", str(agent_data.messages[-1]["content"]))
+        self.assertEqual(agent_data.metrics["web_osgym/action_count"], 2)
+        self.assertEqual(len(agent_data.extra_fields["teacher_ids_list"]), len(agent_data.response_mask))
+        self.assertEqual(len(agent_data.extra_fields["teacher_logprobs_list"]), len(agent_data.response_mask))
+
+    async def test_system_stop_fetches_reward_on_skd_loop(self):
+        loop = _build_loop()
+
+        async def _base_generating(self, agent_data, sampling_params, ignore_termination=False, stop_after_skd_chunk=False):
+            return AgentState.TERMINATED
+
+        original = SkdAgentLoop._handle_generating_state
+        SkdAgentLoop._handle_generating_state = _base_generating
+        try:
+            agent_data = AgentData(
+                messages=[],
+                image_data=[],
+                video_data=[],
+                metrics={},
+                request_id="req-1",
+                tools_kwargs={},
+            )
+            agent_data._active_tools = loop.tools
+            agent_data.extra_fields.update(
+                {
+                    "web_osgym_instance_id": "instance-1",
+                    "web_osgym_task_id": "12345",
+                    "web_osgym_request_id": 101,
+                    "web_osgym_include_a11y": True,
+                }
+            )
+
+            state = await WebSkdAgentLoop._handle_generating_state(loop, agent_data, {})
+        finally:
+            SkdAgentLoop._handle_generating_state = original
+
+        self.assertEqual(state, AgentState.TERMINATED)
+        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)

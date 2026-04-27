@@ -18,13 +18,16 @@ Before any task work starts, keep these invariants fixed:
    - For a given trajectory, `start -> action* -> reward` must reuse the same `request_id`.
    - `task_id` identifies the benchmark task; `request_id` identifies one rollout session on that task.
 
-2. **Model-facing interface is Computer 13, not protocol JSON.**
+2. **Model-facing interface is Computer 13 `actions` list, not protocol JSON.**
    - The model should emit one `computer` tool call using the current `qwen3_coder` XML format.
+   - The tool schema should expose `actions: [...]`, with each element representing one Computer 13 action object.
+   - The initial implementation should describe the schema but should **not** hard-code “single-action only” or “always multi-action” behavior in the prompt.
    - Internal code is responsible for converting parsed tool args into protocol `action` payloads.
 
 3. **`DONE` / `FAIL` stay inside the model-facing action schema but are treated as terminal actions internally.**
    - `DONE` / `FAIL` trigger reward fetch and loop termination.
    - `max_length` / `max_chunks` also fetch reward and terminate, but without an action request.
+   - `DONE` / `FAIL` are valid only as a standalone action list item, not mixed with other actions.
 
 4. **SKD uses teacher-only a11y.**
    - `WebSkdAgentLoop` must always request `include_a11y=True`.
@@ -38,6 +41,12 @@ Before any task work starts, keep these invariants fixed:
    - `verl/trainer/ppo/ray_trainer.py`
 
 The feature must plug in through `agent_name` selection, not by special-casing Web/OS gym inside the trainer or scheduler.
+
+6. **Action-list behavior is observed before it is optimized.**
+   - The first pass should accept protocol-native `actions: [...]` payloads end to end.
+   - Prompting should expose the schema, then let the model choose whether to emit one action or several.
+   - System-side validation may still reject empty action lists, oversized bundles, and invalid terminal-action mixes.
+   - Follow-up prompt or schema tightening should be driven by measured action-count distributions and failure rates.
 
 ---
 
@@ -353,7 +362,7 @@ git add \
 git commit -m "feat(web-osgym): add protocol client with session semantics"
 ```
 
-### Task 2: Add the persistent `computer` tool with model-facing Computer 13 schema
+### Task 2: Add the persistent `computer` tool with model-facing Computer 13 action-list schema
 
 **Files:**
 - Create: `verl/tools/web_osgym_tool.py`
@@ -375,16 +384,26 @@ def _tool_schema() -> OpenAIFunctionToolSchema:
             "type": "function",
             "function": {
                 "name": "computer",
-                "description": "Apply one low-level computer action.",
+                "description": "Apply one or more low-level computer actions.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action_type": {"type": "string", "description": "Computer 13 action type."},
-                        "x": {"type": "integer", "description": "Screen x coordinate."},
-                        "y": {"type": "integer", "description": "Screen y coordinate."},
-                        "text": {"type": "string", "description": "Typing payload."},
+                        "actions": {
+                            "type": "array",
+                            "description": "One or more Computer 13 actions executed sequentially within one environment request.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "action_type": {"type": "string", "description": "Computer 13 action type."},
+                                    "x": {"type": "integer", "description": "Screen x coordinate."},
+                                    "y": {"type": "integer", "description": "Screen y coordinate."},
+                                    "text": {"type": "string", "description": "Typing payload."},
+                                },
+                                "required": ["action_type"],
+                            },
+                        },
                     },
-                    "required": ["action_type"],
+                    "required": ["actions"],
                 },
             },
         }
@@ -426,7 +445,10 @@ async def test_tool_execute_uses_same_session_request_id():
     tool.client = _FakeClient()
     tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
 
-    response, reward, metrics = await tool.execute("i1", {"action_type": "CLICK", "x": 1, "y": 2})
+    response, reward, metrics = await tool.execute(
+        "i1",
+        {"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]},
+    )
 
     assert response.text == "A11Y_TREE:\\nnext"
     assert reward is None
@@ -448,9 +470,42 @@ async def test_tool_execute_marks_done_fail_as_terminal_without_fetching_reward(
     tool.client = _FakeClient()
     tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
 
-    _, _, metrics = await tool.execute("i1", {"action_type": "DONE"})
+    _, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "DONE"}]})
     assert metrics["terminated"] is True
     assert metrics["termination_reason"] == "model_done"
+
+
+@pytest.mark.asyncio
+async def test_tool_execute_preserves_multi_action_payload():
+    seen = {}
+
+    class _FakeClient:
+        async def action(self, **kwargs):
+            seen.update(kwargs)
+
+            class _Response:
+                text = "next"
+                image = None
+
+            return _Response()
+
+    tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+    tool.client = _FakeClient()
+    tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+
+    await tool.execute(
+        "i1",
+        {
+            "actions": [
+                {"action_type": "MOVE_TO", "x": 1, "y": 2},
+                {"action_type": "CLICK", "x": 1, "y": 2},
+            ]
+        },
+    )
+
+    assert len(seen["actions"]) == 2
+    assert seen["actions"][0]["action_type"] == "MOVE_TO"
+    assert seen["actions"][1]["action_type"] == "CLICK"
 
 
 @pytest.mark.asyncio
@@ -523,25 +578,37 @@ class WebOsGymTool(BaseTool):
         image = [response.image] if response.image is not None else None
         return instance_id, ToolResponse(text=response.text, image=image)
 
+    def _parse_actions(self, parameters: dict[str, Any]) -> list[WebOsGymAction]:
+        raw_actions = parameters.get("actions")
+        if not raw_actions:
+            raise ValueError("computer tool requires a non-empty actions list")
+        actions = [WebOsGymAction(**raw_action) for raw_action in raw_actions]
+        terminal_actions = [action for action in actions if action.action_type in {"DONE", "FAIL"}]
+        if terminal_actions and len(actions) != 1:
+            raise ValueError("DONE/FAIL must be sent as a standalone action list")
+        return actions
+
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
         state = self._instance_dict[instance_id]
-        action = WebOsGymAction(**parameters)
+        actions = self._parse_actions(parameters)
         response = await self.client.action(
             request_id=state["request_id"],
             task_id=state["task_id"],
             include_a11y=state["include_a11y"],
-            actions=[action],
+            actions=actions,
         )
         image = [response.image] if response.image is not None else None
-        terminated = action.action_type in {"DONE", "FAIL"}
+        terminal_action = actions[0] if len(actions) == 1 and actions[0].action_type in {"DONE", "FAIL"} else None
+        terminated = terminal_action is not None
         termination_reason = None
-        if action.action_type == "DONE":
+        if terminal_action and terminal_action.action_type == "DONE":
             termination_reason = "model_done"
-        elif action.action_type == "FAIL":
+        elif terminal_action and terminal_action.action_type == "FAIL":
             termination_reason = "model_fail"
         return ToolResponse(text=response.text, image=image), None, {
             "terminated": terminated,
             "termination_reason": termination_reason,
+            "action_count": len(actions),
         }
 
     async def calc_reward(self, instance_id: str, **kwargs) -> float:
@@ -567,41 +634,48 @@ tools:
       type: "function"
       function:
         name: "computer"
-        description: "Apply one low-level computer action to the remote environment."
+        description: "Apply one or more low-level computer actions to the remote environment."
         parameters:
           type: "object"
           properties:
-            action_type:
-              type: "string"
-              description: "One of MOVE_TO, CLICK, MOUSE_DOWN, MOUSE_UP, RIGHT_CLICK, DOUBLE_CLICK, DRAG_TO, SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, HOTKEY, WAIT, DONE, FAIL."
-            x:
-              type: "integer"
-              description: "Screen x coordinate."
-            y:
-              type: "integer"
-              description: "Screen y coordinate."
-            button:
-              type: "string"
-              description: "Mouse button."
-            num_clicks:
-              type: "integer"
-              description: "Number of clicks."
-            dx:
-              type: "integer"
-              description: "Horizontal scroll delta."
-            dy:
-              type: "integer"
-              description: "Vertical scroll delta."
-            text:
-              type: "string"
-              description: "Typing payload."
-            key:
-              type: "string"
-              description: "Single key."
-            keys:
+            actions:
               type: "array"
-              description: "Hotkey key list."
-          required: ["action_type"]
+              description: "One or more Computer 13 actions executed sequentially within one environment request."
+              items:
+                type: "object"
+                properties:
+                  action_type:
+                    type: "string"
+                    description: "One of MOVE_TO, CLICK, MOUSE_DOWN, MOUSE_UP, RIGHT_CLICK, DOUBLE_CLICK, DRAG_TO, SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, HOTKEY, WAIT, DONE, FAIL."
+                  x:
+                    type: "integer"
+                    description: "Screen x coordinate."
+                  y:
+                    type: "integer"
+                    description: "Screen y coordinate."
+                  button:
+                    type: "string"
+                    description: "Mouse button."
+                  num_clicks:
+                    type: "integer"
+                    description: "Number of clicks."
+                  dx:
+                    type: "integer"
+                    description: "Horizontal scroll delta."
+                  dy:
+                    type: "integer"
+                    description: "Vertical scroll delta."
+                  text:
+                    type: "string"
+                    description: "Typing payload."
+                  key:
+                    type: "string"
+                    description: "Single key."
+                  keys:
+                    type: "array"
+                    description: "Hotkey key list."
+                required: ["action_type"]
+          required: ["actions"]
 ```
 
 - [ ] **Step 5: Run test to verify it passes**
@@ -616,7 +690,7 @@ pytest -q tests/experimental/agent_loop/test_web_osgym_tool_on_cpu.py
 Expected:
 
 ```text
-4 passed
+5 passed
 ```
 
 - [ ] **Step 6: Commit**
@@ -892,12 +966,12 @@ async def test_processing_tools_executes_regular_action_and_returns_to_generatin
     )
     agent_data._active_tools = loop.tools
     agent_data.extra_fields["web_osgym_instance_id"] = "instance-1"
-    agent_data.tool_calls = [type("Call", (), {"name": "computer", "arguments": '{"action_type":"CLICK","x":1,"y":2}'})()]
+    agent_data.tool_calls = [type("Call", (), {"name": "computer", "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}'})()]
 
     state = await WebToolAgentLoop._handle_processing_tools_state(loop, agent_data)
 
     assert state == AgentState.GENERATING
-    assert loop.tools["computer"].executed[0][1]["action_type"] == "CLICK"
+    assert loop.tools["computer"].executed[0][1]["actions"][0]["action_type"] == "CLICK"
 
 
 @pytest.mark.asyncio
@@ -919,7 +993,7 @@ async def test_processing_tools_treats_done_as_terminal_and_fetches_reward():
     )
     agent_data._active_tools = loop.tools
     agent_data.extra_fields["web_osgym_instance_id"] = "instance-1"
-    agent_data.tool_calls = [type("Call", (), {"name": "computer", "arguments": '{"action_type":"DONE"}'})()]
+    agent_data.tool_calls = [type("Call", (), {"name": "computer", "arguments": '{"actions":[{"action_type":"DONE"}]}'})()]
 
     state = await WebToolAgentLoop._handle_processing_tools_state(loop, agent_data)
 
@@ -1003,6 +1077,7 @@ class WebToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         tool = self._get_active_tool(agent_data)
         instance_id = agent_data.extra_fields["web_osgym_instance_id"]
         tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
+        agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)
         agent_data.messages.append({"role": "tool", "content": tool_response.text or ""})
         if tool_response.image:
             if agent_data.image_data is None:
@@ -1365,6 +1440,86 @@ git commit -m "test(web-osgym): add agent loop registration smoke coverage"
 
 ---
 
+### Task 7: Measure model action-list behavior before prompt tuning
+
+**Files:**
+- Modify: `tests/experimental/agent_loop/test_web_tool_agent_loop_on_cpu.py`
+- Optional analysis note in `verl/async_skd/document/web_osgym/design.md`
+
+- [ ] **Step 1: Add a focused behavior test for multi-action payloads**
+
+The point of this test is **not** to force the model into single-action or multi-action behavior. The point is to confirm that:
+
+- the schema accepts `actions: [...]`
+- the parsed tool payload is forwarded intact
+- loop metrics capture action-count information so later prompt decisions can be evidence-driven
+
+Example assertion to add around the existing processing-tools tests:
+
+```python
+@pytest.mark.asyncio
+async def test_processing_tools_records_action_count_metric():
+    loop = _build_loop()
+
+    async def _fake_apply_chat_template(messages, **kwargs):
+        return [10, 11]
+
+    loop.apply_chat_template = _fake_apply_chat_template
+
+    agent_data = AgentData(
+        messages=[{"role": "user", "content": "task"}],
+        image_data=[],
+        video_data=[],
+        metrics={},
+        request_id="loop-req",
+        tools_kwargs={},
+    )
+    agent_data._active_tools = loop.tools
+    agent_data.extra_fields["web_osgym_instance_id"] = "instance-1"
+    agent_data.tool_calls = [
+        type(
+            "Call",
+            (),
+            {
+                "name": "computer",
+                "arguments": '{"actions":[{"action_type":"MOVE_TO","x":1,"y":2},{"action_type":"CLICK","x":1,"y":2}]}',
+            },
+        )()
+    ]
+
+    await WebToolAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+    assert agent_data.metrics["web_osgym/action_count"] == 2
+```
+
+- [ ] **Step 2: Run the focused behavior tests**
+
+Run:
+
+```bash
+cd /home/sogang_nlpy/verl
+pytest -q tests/experimental/agent_loop/test_web_osgym_tool_on_cpu.py
+pytest -q tests/experimental/agent_loop/test_web_tool_agent_loop_on_cpu.py
+```
+
+Expected:
+
+```text
+all pass
+```
+
+- [ ] **Step 3: Treat prompt tuning as a follow-up, not part of the first implementation**
+
+Initial rollout should:
+
+- expose the `actions: [...]` schema
+- keep only hard safety validation
+- log or retain `web_osgym/action_count`
+
+Only after observing action-count distributions and failure patterns should we decide whether prompt tightening is needed.
+
+---
+
 ## Self-Review
 
 ### Spec coverage
@@ -1372,6 +1527,7 @@ git commit -m "test(web-osgym): add agent loop registration smoke coverage"
 - `request_id` as trajectory session id: covered in Task 1 and Task 2
 - model-facing `qwen3_coder` XML + Computer 13 action schema: covered in Task 2 and Task 4
 - `DONE/FAIL` as terminal actions: covered in Task 2 and Task 4
+- action-list behavior measured before prompt tightening: covered in Task 2, Task 4, and Task 7
 - `max_length/max_chunks` reward-only finalization: covered in Task 4 and Task 5
 - student-only regular RL loop: covered in Task 4
 - teacher-only a11y in SKD: covered in Task 5
