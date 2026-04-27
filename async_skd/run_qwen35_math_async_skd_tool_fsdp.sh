@@ -100,7 +100,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.val_before_train=True \
     trainer.resume_mode=disable \
-    trainer.save_freq=25 \
+    trainer.save_freq=20 \
     trainer.test_freq=10 \
     trainer.total_epochs=5 \
     +trainer.use_legacy_worker_impl=disable \
