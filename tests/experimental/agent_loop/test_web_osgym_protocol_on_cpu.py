@@ -20,7 +20,7 @@ def _png_b64() -> str:
 class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
     async def test_start_preserves_session_request_id(self):
         payload = {
-            "request_id": 101,
+            "session_id": 101,
             "task_id": "12345",
             "status": "ok",
             "text": "A11Y_TREE:\nroot",
@@ -42,7 +42,7 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
                 return False
 
             async def post(self, url, json, timeout):
-                assert json["request_id"] == 101
+                assert json["session_id"] == 101
                 assert json["task_id"] == "12345"
                 assert json["op"] == "start"
                 return _FakeResponse()
@@ -57,7 +57,7 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
         finally:
             web_osgym_protocol.httpx.AsyncClient = original
 
-        self.assertEqual(response.request_id, 101)
+        self.assertEqual(response.session_id, 101)
         self.assertEqual(response.task_id, "12345")
         self.assertIsNotNone(response.image)
 
@@ -70,7 +70,7 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
 
             def json(self):
                 return {
-                    "request_id": 101,
+                    "session_id": 101,
                     "task_id": "12345",
                     "status": "ok",
                     "text": "A11Y_TREE:\nnext",
@@ -103,7 +103,7 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
         finally:
             web_osgym_protocol.httpx.AsyncClient = original
 
-        self.assertEqual(seen["payload"]["request_id"], 101)
+        self.assertEqual(seen["payload"]["session_id"], 101)
         self.assertEqual(seen["payload"]["task_id"], "12345")
         self.assertEqual(seen["payload"]["actions"][0]["action_type"], "CLICK")
 
@@ -113,7 +113,7 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
                 return None
 
             def json(self):
-                return {"request_id": 101, "task_id": "12345", "status": "ok", "reward": 1.0}
+                return {"session_id": 101, "task_id": "12345", "status": "ok", "reward": 1.0}
 
         class _FakeAsyncClient:
             async def __aenter__(self):
@@ -123,7 +123,7 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
                 return False
 
             async def post(self, url, json, timeout):
-                assert json == {"request_id": 101, "task_id": "12345", "op": "reward"}
+                assert json == {"session_id": 101, "task_id": "12345", "op": "reward"}
                 return _FakeResponse()
 
         from verl.experimental.agent_loop import web_osgym_protocol

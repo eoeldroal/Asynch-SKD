@@ -2,8 +2,8 @@ tools:
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config:
       type: native
-      base_url: "http://127.0.0.1:38081"
-      timeout: 30.0
+      base_url: "http://127.0.0.1:18000"
+      timeout: 60.0
       include_a11y: false
     tool_schema:
       type: "function"

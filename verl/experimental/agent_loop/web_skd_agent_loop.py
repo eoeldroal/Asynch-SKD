@@ -13,12 +13,27 @@ from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 
 @register("web_skd_agent")
 class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
-    def _split_env_text(self, env_text: str | None) -> tuple[str, str]:
+    def _split_env_observation(self, env_text: str | None, image_data: list[Any] | None) -> tuple[str, str]:
         if not env_text:
             return "", ""
-        if env_text.startswith("A11Y_TREE:"):
+        if image_data:
             return "", env_text
+
+        # Image-less Web/OSGym responses are treated as non-visual environment
+        # feedback, not teacher-only accessibility context. In practice this is
+        # how the environment reports action failures or screenshot capture
+        # failures: the student must see that text to recover on the next turn,
+        # while the teacher still sees the same feedback for alignment. Normal
+        # visual observations keep text teacher-only because that text is the
+        # privileged a11y/auxiliary channel.
         return env_text, env_text
+
+    def _extend_image_data(self, agent_data: AgentData, image_data: list[Any] | None) -> None:
+        if not image_data:
+            return
+        if agent_data.image_data is None:
+            agent_data.image_data = []
+        agent_data.image_data.extend(image_data)
 
     def _build_tool_message(self, tool_response_text: str | None, image_data: list[Any] | None):
         if image_data:
@@ -42,12 +57,8 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         del sampling_params
         start_response = await self._start_web_osgym_session(agent_data, include_a11y=True)
-        student_obs, teacher_obs = self._split_env_text(start_response.text)
-
-        if start_response.image:
-            if agent_data.image_data is None:
-                agent_data.image_data = []
-            agent_data.image_data.extend(start_response.image)
+        student_obs, teacher_obs = self._split_env_observation(start_response.text, start_response.image)
+        self._extend_image_data(agent_data, start_response.image)
 
         base_messages = deepcopy(agent_data.messages)
         teacher_messages = deepcopy(base_messages)
@@ -84,12 +95,8 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
         agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)
 
-        if tool_response.image:
-            if agent_data.image_data is None:
-                agent_data.image_data = []
-            agent_data.image_data.extend(tool_response.image)
-
-        student_obs, teacher_obs = self._split_env_text(tool_response.text)
+        self._extend_image_data(agent_data, tool_response.image)
+        student_obs, teacher_obs = self._split_env_observation(tool_response.text, tool_response.image)
 
         appended_len = 0
         if student_obs or tool_response.image:

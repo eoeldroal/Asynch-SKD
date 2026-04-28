@@ -21,7 +21,7 @@ class WebOsGymAction(BaseModel):
 
 
 class WebOsGymResponse(BaseModel):
-    request_id: int
+    session_id: int
     task_id: str
     status: str
     text: str | None = None
@@ -45,7 +45,7 @@ class WebOsGymClient:
     def _parse_response(payload: dict[str, Any]) -> WebOsGymResponse:
         image_payload = payload.get("image") or {}
         return WebOsGymResponse(
-            request_id=int(payload["request_id"]),
+            session_id=int(payload["session_id"]),
             task_id=str(payload["task_id"]),
             status=payload["status"],
             text=payload.get("text"),
@@ -63,7 +63,7 @@ class WebOsGymClient:
     async def start(self, *, request_id: int, task_id: str, include_a11y: bool) -> WebOsGymResponse:
         return await self._post(
             {
-                "request_id": request_id,
+                "session_id": request_id,
                 "task_id": task_id,
                 "op": "start",
                 "include_a11y": include_a11y,
@@ -80,7 +80,7 @@ class WebOsGymClient:
     ) -> WebOsGymResponse:
         return await self._post(
             {
-                "request_id": request_id,
+                "session_id": request_id,
                 "task_id": task_id,
                 "op": "action",
                 "include_a11y": include_a11y,
@@ -89,6 +89,6 @@ class WebOsGymClient:
         )
 
     async def reward(self, *, request_id: int, task_id: str) -> float:
-        response = await self._post({"request_id": request_id, "task_id": task_id, "op": "reward"})
+        response = await self._post({"session_id": request_id, "task_id": task_id, "op": "reward"})
         assert response.reward is not None
         return float(response.reward)

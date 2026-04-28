@@ -11,7 +11,7 @@ class WebOsGymLoopMixin:
         active_tools = getattr(agent_data, "_active_tools", {})
         return active_tools[self.web_osgym_tool_name]
 
-    def _allocate_web_osgym_request_id(self) -> int:
+    def _allocate_web_osgym_session_id(self) -> int:
         return uuid4().int % (2**31 - 1) or 1
 
     def _get_create_kwargs(self, agent_data) -> dict:
@@ -30,7 +30,7 @@ class WebOsGymLoopMixin:
         restore(
             instance_id,
             task_id=agent_data.extra_fields["web_osgym_task_id"],
-            request_id=agent_data.extra_fields["web_osgym_request_id"],
+            request_id=agent_data.extra_fields["web_osgym_session_id"],
             include_a11y=agent_data.extra_fields["web_osgym_include_a11y"],
             reward=agent_data.extra_fields.get("web_osgym_reward_score"),
         )
@@ -41,15 +41,15 @@ class WebOsGymLoopMixin:
         task_id = create_kwargs.get("task_id") or agent_data.extra_fields.get("task_id")
         if task_id is None:
             raise ValueError("Web/OS gym session requires task_id in tools_kwargs.create_kwargs or agent_data.extra_fields")
-        request_id = int(create_kwargs.get("request_id") or agent_data.extra_fields.get("web_osgym_request_id") or self._allocate_web_osgym_request_id())
+        session_id = int(agent_data.extra_fields.get("web_osgym_session_id") or self._allocate_web_osgym_session_id())
         instance_id, start_response = await tool.create(
             task_id=task_id,
-            request_id=request_id,
+            request_id=session_id,
             include_a11y=include_a11y,
         )
         agent_data.extra_fields["web_osgym_instance_id"] = instance_id
         agent_data.extra_fields["web_osgym_task_id"] = task_id
-        agent_data.extra_fields["web_osgym_request_id"] = request_id
+        agent_data.extra_fields["web_osgym_session_id"] = session_id
         agent_data.extra_fields["web_osgym_include_a11y"] = include_a11y
         return start_response
 
