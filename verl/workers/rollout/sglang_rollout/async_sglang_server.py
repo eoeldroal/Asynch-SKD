@@ -113,6 +113,7 @@ def _extract_skd_delta_prompt_logprobs_sglang(
     sequence_length: int,
     result_dict: dict[str, list],
     prompt_logprobs_start_len: int,
+    expected_mm_prefix_surplus: Optional[int] = None,
 ) -> None:
     """Extract SKD suffix rows from SGLang compact prompt-logprob delta output."""
     if prompt_logprobs_start_len <= 0:
@@ -150,12 +151,46 @@ def _extract_skd_delta_prompt_logprobs_sglang(
             prompt_logprobs_ls.append(logprobs)
 
     expected_len = sequence_length - prompt_logprobs_start_len - 1
-    if len(prompt_ids_ls) != expected_len:
+    if expected_len < 0:
         raise ValueError(
-            f"SGLang SKD delta prompt_logprobs length ({len(prompt_ids_ls)}) does not match expected suffix "
-            f"length ({expected_len}) for sequence_length={sequence_length}, "
+            f"Invalid SGLang SKD delta prompt_logprobs range: sequence_length={sequence_length}, "
             f"prompt_logprobs_start_len={prompt_logprobs_start_len}."
         )
+
+    returned_len = len(prompt_ids_ls)
+    if returned_len > expected_len:
+        trimmed_rows = returned_len - expected_len
+        if expected_mm_prefix_surplus is not None and trimmed_rows != expected_mm_prefix_surplus:
+            raise ValueError(
+                f"SGLang SKD delta prompt_logprobs has unexpected multimodal prefix surplus: "
+                f"actual_surplus={trimmed_rows}, expected_mm_prefix_surplus={expected_mm_prefix_surplus}, "
+                f"returned={returned_len}, expected_suffix={expected_len}, sequence_length={sequence_length}, "
+                f"prompt_logprobs_start_len={prompt_logprobs_start_len}. "
+                "For multimodal SKD this surplus must equal the cumulative expansion gap between the "
+                "processor-expanded teacher prompt and the logical server prompt."
+            )
+        logger.info(
+            "Trimming %s leading SGLang SKD delta prompt_logprobs rows "
+            "(returned=%s, expected_suffix=%s, sequence_length=%s, prompt_logprobs_start_len=%s, "
+            "expected_mm_prefix_surplus=%s). "
+            "This is expected for multimodal prompts whose image tokens are expanded inside SGLang.",
+            trimmed_rows,
+            returned_len,
+            expected_len,
+            sequence_length,
+            prompt_logprobs_start_len,
+            expected_mm_prefix_surplus,
+        )
+        prompt_ids_ls = prompt_ids_ls[trimmed_rows:]
+        prompt_logprobs_ls = prompt_logprobs_ls[trimmed_rows:]
+    elif returned_len < expected_len:
+        raise ValueError(
+            f"SGLang SKD delta prompt_logprobs length ({returned_len}) is shorter than expected suffix "
+            f"length ({expected_len}) for sequence_length={sequence_length}, "
+            f"prompt_logprobs_start_len={prompt_logprobs_start_len}. "
+            "This cannot be repaired by multimodal prefix trimming."
+        )
+
     result_dict["prompt_ids"] = prompt_ids_ls
     result_dict["prompt_logprobs"] = prompt_logprobs_ls
 
@@ -530,6 +565,7 @@ class SGLangHttpServer:
         # logprob only when K==0). Translate to SGLang's per-request logprob API.
         prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
         prompt_logprobs_start_len = sampling_params.pop("prompt_logprobs_start_len", None)
+        expected_mm_prefix_surplus = sampling_params.pop("expected_mm_prefix_surplus", None)
         if prompt_logprobs is not None:
             return_logprob = True
 
@@ -606,6 +642,7 @@ class SGLangHttpServer:
                     sequence_length=len(prompt_ids),
                     result_dict=extra_fields,
                     prompt_logprobs_start_len=prompt_logprobs_start_len,
+                    expected_mm_prefix_surplus=expected_mm_prefix_surplus,
                 )
             else:
                 _extract_prompt_logprobs_sglang(

@@ -77,7 +77,7 @@ conda activate skd
 
 python async_skd/mock_server/web_osgym_mock_server.py \
   --host 127.0.0.1 \
-  --port 18080 \
+  --port 18000 \
   --log-path logs/mock_web_osgym_requests.jsonl
 ```
 
@@ -85,7 +85,7 @@ Run the mock client:
 
 ```bash
 python async_skd/mock_server/web_osgym_mock_client.py \
-  --base-url http://127.0.0.1:18080 \
+  --base-url http://127.0.0.1:18000 \
   --session-id 777 \
   --task-id 12345
 ```
@@ -113,8 +113,7 @@ Only after mock protocol and loop integration pass should the real environment s
 
 ## Known Gaps / Next Work
 
-- Add a mock-specific tool config pointing to `http://127.0.0.1:18080`.
+- Use the existing WebGym RL tool config at [`web_osgym_tool_config_webgym_rl.yaml`](/home/sogang_nlpy/verl/examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml); the mock server defaults to the same `http://127.0.0.1:18000` endpoint.
 - Run `web_skd_agent` against the mock server through the actual trainer path with one sample and bounded prefetch.
 - Re-check `web_osgym_session_id` naming across tests and docs.
 - Keep real WebGym launch/debugging separate from protocol and loop verification.
-

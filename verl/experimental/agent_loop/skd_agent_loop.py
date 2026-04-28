@@ -662,6 +662,10 @@ class SkdAgentLoop(ToolAgentLoop):
         # path this stays local until the turn finishes.  In pause-aware
         # lookahead mode it must survive export/restore across chunk boundaries.
         turn_response_ids = list(agent_data.extra_fields.get(_SKD_PENDING_TURN_RESPONSE_IDS, []))
+        server_prompt_ids = agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids))
+        teacher_server_prompt_ids = agent_data.extra_fields.setdefault(
+            "teacher_server_prompt_ids", list(teacher_prompt_ids)
+        )
 
         # Debug: token-level alignment logging for first N samples
         SkdAgentLoop._debug_sample_count += 1
@@ -685,7 +689,7 @@ class SkdAgentLoop(ToolAgentLoop):
                 with simple_timer("skd_student_chunk", agent_data.metrics):
                     chunk_output = await self.server_manager.generate(
                         request_id=agent_data.request_id,
-                        prompt_ids=agent_data.prompt_ids,
+                        prompt_ids=server_prompt_ids,
                         sampling_params={**sampling_params, "max_tokens": actual_chunk_size},
                         image_data=agent_data.image_data,
                         video_data=agent_data.video_data,
@@ -721,6 +725,8 @@ class SkdAgentLoop(ToolAgentLoop):
                         teacher_replica_id=teacher_replica_id,
                         teacher_routing_key=teacher_routing_key,
                         teacher_prompt_len=len(teacher_prompt_ids),
+                        teacher_server_prompt_len=len(teacher_server_prompt_ids),
+                        teacher_mm_prefix_surplus=max(len(teacher_prompt_ids) - len(teacher_server_prompt_ids), 0),
                         chunk_len=len(chunk),
                     )
                     if (
@@ -740,13 +746,15 @@ class SkdAgentLoop(ToolAgentLoop):
                             teacher_replica_id=teacher_replica_id,
                             teacher_routing_key=teacher_routing_key,
                         )
-                    verify_sequence = teacher_prompt_ids + chunk
-                    logprob_start_len = max(len(teacher_prompt_ids) - 1, 0)
+                    verify_sequence = teacher_server_prompt_ids + chunk
+                    logprob_start_len = max(len(teacher_server_prompt_ids) - 1, 0)
+                    expected_mm_prefix_surplus = max(len(teacher_prompt_ids) - len(teacher_server_prompt_ids), 0)
                     teacher_ids, teacher_logprobs = (
                         await self.teacher_server_manager.compute_teacher_logprobs_single(
                             request_id=agent_data.request_id,
                             sequence_ids=verify_sequence,
                             logprob_start_len=logprob_start_len,
+                            expected_mm_prefix_surplus=expected_mm_prefix_surplus,
                             multi_modal_data=self._current_multi_modal_data(agent_data),
                             routing_key=teacher_routing_key,
                         )
@@ -799,6 +807,8 @@ class SkdAgentLoop(ToolAgentLoop):
                         f"[SKD_DBG] chunk={skd_metrics['chunk_count']:>3} "
                         f"student={student_ms:>7.1f}ms teacher={teacher_ms:>7.1f}ms "
                         f"teacher_prefix_len={len(teacher_prompt_ids)} "
+                        f"teacher_server_prefix_len={len(teacher_server_prompt_ids)} "
+                        f"teacher_mm_prefix_surplus={expected_mm_prefix_surplus} "
                         f"teacher_suffix_len={len(chunk)} "
                         f"teacher_seq_len={len(verify_sequence)} "
                         f"chunk_len={len(chunk)} accepted={acc} rejected={1 if rejection_pos is not None else 0} "
@@ -810,11 +820,15 @@ class SkdAgentLoop(ToolAgentLoop):
 
                 # Update agent_data (same pattern as ToolAgentLoop L244-246)
                 agent_data.prompt_ids += new_tokens
+                server_prompt_ids += new_tokens
                 teacher_prompt_ids += new_tokens
+                teacher_server_prompt_ids += new_tokens
                 agent_data.response_mask += [1] * len(new_tokens)
                 turn_response_ids.extend(new_tokens)
                 agent_data.response_ids = list(turn_response_ids)
                 agent_data.extra_fields[_SKD_PENDING_TURN_RESPONSE_IDS] = list(turn_response_ids)
+                agent_data.extra_fields["server_prompt_ids"] = list(server_prompt_ids)
+                agent_data.extra_fields["teacher_server_prompt_ids"] = list(teacher_server_prompt_ids)
 
                 # Accumulate teacher targets only for the committed rollout path.
                 # In delta mode, local row k already corresponds to committed token k.

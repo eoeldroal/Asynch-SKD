@@ -155,6 +155,7 @@ class AsyncTeacherLLMServerManager:
         routing_key: Optional[str] = None,
         request_id: Optional[str] = None,
         logprob_start_len: int = 0,
+        expected_mm_prefix_surplus: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
@@ -170,6 +171,8 @@ class AsyncTeacherLLMServerManager:
         sampling_params = _get_teacher_sampling_params(teacher_model_config, self.distillation_loss_config)
         if logprob_start_len > 0:
             sampling_params["prompt_logprobs_start_len"] = logprob_start_len
+        if expected_mm_prefix_surplus is not None:
+            sampling_params["expected_mm_prefix_surplus"] = int(expected_mm_prefix_surplus)
 
         server_manager = self.server_managers[teacher_key]
         _trace_async_skd(
@@ -179,6 +182,7 @@ class AsyncTeacherLLMServerManager:
             request_id=request_id,
             seq_len=len(sequence_ids),
             logprob_start_len=logprob_start_len,
+            expected_mm_prefix_surplus=expected_mm_prefix_surplus,
         )
         teacher_output = await server_manager.generate(
             request_id=request_id or uuid4().hex,

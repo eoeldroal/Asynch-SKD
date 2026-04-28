@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 _ASYNC_SKD_INPUT_NON_TENSOR_BATCH = "async_skd_input_non_tensor_batch"
 _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+_DEFAULT_SKD_AGENT_NAME = "skd_agent"
 
 
 def _trace_async_skd(stage: str, **fields: Any) -> None:
@@ -73,11 +74,23 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         saved = partial_state.extra_fields.get(_ASYNC_SKD_INPUT_NON_TENSOR_BATCH)
         if saved is None:
             raw_prompt = partial_state.extra_fields.get("raw_prompt", partial_state.messages)
+            agent_name = str(partial_state.extra_fields.get("agent_name", _DEFAULT_SKD_AGENT_NAME))
             return {
                 "raw_prompt": self._object_array(raw_prompt),
-                "agent_name": np.array(["skd_agent"], dtype=object),
+                "agent_name": np.array([agent_name], dtype=object),
             }
         return {key: np.asarray(value, dtype=object) for key, value in saved.items()}
+
+    @staticmethod
+    def _agent_name_from_input_non_tensor_batch(
+        input_non_tensor_batch: dict[str, np.ndarray],
+        *,
+        default: str = _DEFAULT_SKD_AGENT_NAME,
+    ) -> str:
+        values = input_non_tensor_batch.get("agent_name")
+        if values is None or len(values) == 0:
+            return default
+        return str(values[0])
 
     def _strip_internal_async_skd_extra_fields(self, output: AgentLoopOutput) -> None:
         output.extra_fields.pop(_ASYNC_SKD_INPUT_NON_TENSOR_BATCH, None)
@@ -154,6 +167,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             kwargs = {}
             validate = False
             input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
+            agent_name = self._agent_name_from_input_non_tensor_batch(input_non_tensor_batch, default=agent_name)
         _trace_async_skd(
             "worker.generate_until_boundary.entry",
             sample_id=sample_id,
@@ -191,6 +205,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             )
 
         if isinstance(result, SkdPartialState):
+            result.extra_fields.setdefault("agent_name", agent_name)
             if batch is not None:
                 result.extra_fields[_ASYNC_SKD_INPUT_NON_TENSOR_BATCH] = deepcopy(input_non_tensor_batch)
             _trace_async_skd(
@@ -262,6 +277,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             committed_prefix_tokens=partial_state.committed_prefix_tokens,
         )
         input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
+        agent_name = self._agent_name_from_input_non_tensor_batch(input_non_tensor_batch, default=agent_name)
         sampling_params = self._build_sampling_params(validate=False)
         agent_loop = self._get_or_create_agent_loop(agent_name)
         from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop

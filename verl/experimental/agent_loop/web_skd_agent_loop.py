@@ -9,6 +9,8 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
+from verl.utils.chat_template import apply_chat_template
+from verl.utils.tokenizer import normalize_token_ids
 
 
 @register("web_skd_agent")
@@ -54,6 +56,50 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             videos=agent_data.video_data,
         )
 
+    async def _apply_server_chat_template(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        *,
+        remove_system_prompt: bool = False,
+    ) -> list[int]:
+        """Tokenize the chat for SGLang's multimodal server contract.
+
+        ``AgentLoopBase.apply_chat_template`` uses the HF processor when one is
+        available. For Qwen VL processors that expands one logical image marker
+        into many image token ids, which is the right representation for local
+        training tensors. SGLang's token-in/token-out multimodal endpoint,
+        however, expects the unexpanded chat-template ids plus the actual images
+        in ``image_data``. Keeping this server-side representation separate
+        prevents real Web/OSGym screenshots from being counted as hundreds of
+        independent images during teacher logprob requests.
+        """
+        tokenized = await self.loop.run_in_executor(
+            None,
+            lambda: apply_chat_template(
+                self.tokenizer,
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                **self.apply_chat_template_kwargs,
+            ),
+        )
+        prompt_ids = normalize_token_ids(tokenized)
+        if remove_system_prompt:
+            prompt_ids = prompt_ids[len(self.system_prompt) :]
+        return prompt_ids
+
+    async def _recompute_server_prompt_ids(self, agent_data: AgentData, messages: list[dict]) -> list[int]:
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        return await self._apply_server_chat_template(messages, tools=schemas)
+
+    async def _recompute_teacher_server_prompt_ids(self, agent_data: AgentData) -> list[int]:
+        teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
+        teacher_messages = self._build_teacher_messages(teacher_messages)
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        return await self._apply_server_chat_template(teacher_messages, tools=schemas)
+
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         del sampling_params
         start_response = await self._start_web_osgym_session(agent_data, include_a11y=True)
@@ -75,9 +121,13 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             images=agent_data.image_data,
             videos=agent_data.video_data,
         )
+        agent_data.extra_fields["server_prompt_ids"] = await self._recompute_server_prompt_ids(
+            agent_data, agent_data.messages
+        )
         agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
         agent_data.extra_fields["teacher_prompt_ids"] = await self._recompute_teacher_prompt_ids(agent_data)
+        agent_data.extra_fields["teacher_server_prompt_ids"] = await self._recompute_teacher_server_prompt_ids(agent_data)
         return AgentState.GENERATING
 
     def _restore_partial_state(self, partial_state):
@@ -108,8 +158,14 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 videos=None,
                 remove_system_prompt=True,
             )
+            server_response_ids = await self._apply_server_chat_template(
+                [student_message],
+                remove_system_prompt=True,
+            )
             appended_len = len(response_ids)
             agent_data.prompt_ids += response_ids
+            agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids[:-appended_len]))
+            agent_data.extra_fields["server_prompt_ids"].extend(server_response_ids)
             agent_data.response_mask += [0] * appended_len
             if agent_data.response_logprobs:
                 agent_data.response_logprobs += [0.0] * appended_len
@@ -117,10 +173,24 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
 
         teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
         if teacher_obs or tool_response.image:
-            teacher_messages.append(self._build_tool_message(teacher_obs, tool_response.image))
+            teacher_message = self._build_tool_message(teacher_obs, tool_response.image)
+            teacher_messages.append(teacher_message)
+            teacher_response_ids = await self.apply_chat_template(
+                [teacher_message],
+                images=tool_response.image if tool_response.image else None,
+                videos=None,
+                remove_system_prompt=True,
+            )
+            teacher_server_response_ids = await self._apply_server_chat_template(
+                [teacher_message],
+                remove_system_prompt=True,
+            )
+            teacher_prompt_ids = agent_data.extra_fields.setdefault("teacher_prompt_ids", [])
+            agent_data.extra_fields.setdefault("teacher_server_prompt_ids", list(teacher_prompt_ids))
+            teacher_prompt_ids.extend(teacher_response_ids)
+            agent_data.extra_fields["teacher_server_prompt_ids"].extend(teacher_server_response_ids)
         agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
-        agent_data.extra_fields["teacher_prompt_ids"] = await self._recompute_teacher_prompt_ids(agent_data)
 
         self._append_dummy_teacher_rows(agent_data, appended_len)
         self._assert_teacher_alignment(agent_data)

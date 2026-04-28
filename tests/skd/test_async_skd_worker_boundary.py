@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import MethodType
 from typing import Any
 
@@ -110,7 +111,7 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
     stream_teacher_with_rollout = False
     processor = None
 
-    def __init__(self, loop_result: AgentLoopOutput | SkdPartialState):
+    def __init__(self, loop_result: AgentLoopOutput | SkdPartialState, *, expected_agent_name: str = "skd_agent"):
         self.rollout_config = OmegaConf.create(
             {
                 "temperature": 0.7,
@@ -126,6 +127,8 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
         self.tokenizer = _FakeTokenizer()
         self.loop = SkdAgentLoop.__new__(SkdAgentLoop)
         self.loop.calls = []
+        self.expected_agent_name = expected_agent_name
+        self.agent_names = []
 
         async def fake_run_until_exportable_boundary(
             loop_self,
@@ -171,7 +174,8 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
         self.loop.run_from_partial_to_completion = MethodType(fake_run_from_partial_to_completion, self.loop)
 
     def _get_or_create_agent_loop(self, agent_name: str):
-        assert agent_name == "skd_agent"
+        self.agent_names.append(agent_name)
+        assert agent_name == self.expected_agent_name
         return self.loop
 
 
@@ -303,6 +307,42 @@ async def test_generate_skd_until_boundary_wraps_completed_result_from_partial_s
     assert "async_skd_input_non_tensor_batch" not in batch.non_tensor_batch
     assert batch.batch["responses"].shape == (1, 4)
     assert worker.loop.calls[0]["partial_state"] is partial
+
+
+def test_partial_fallback_input_preserves_agent_name_from_partial_extra_fields():
+    partial = make_partial()
+    partial.extra_fields.pop("async_skd_input_non_tensor_batch")
+    partial.extra_fields["agent_name"] = "web_skd_agent"
+    worker = _DummyWorker(partial)
+
+    input_non_tensor_batch = worker._input_non_tensor_from_partial(partial)
+
+    assert input_non_tensor_batch["agent_name"].tolist() == ["web_skd_agent"]
+
+
+def test_generate_skd_until_boundary_uses_saved_agent_name_for_partial_resume():
+    output = AgentLoopOutput(
+        prompt_ids=[1, 2, 3],
+        response_ids=[10, 20],
+        response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={"turn_scores": [], "tool_rewards": []},
+    )
+    partial = make_partial()
+    partial.extra_fields["async_skd_input_non_tensor_batch"]["agent_name"] = np.array(["web_skd_agent"], dtype=object)
+    worker = _DummyWorker(output, expected_agent_name="web_skd_agent")
+
+    asyncio.run(
+        worker.generate_skd_until_boundary(
+            None,
+            partial_state=partial,
+            sample_id="partial-sample",
+            logical_step=12,
+            source_type="resumed_current",
+        )
+    )
+
+    assert worker.agent_names == ["web_skd_agent"]
 
 
 @pytest.mark.asyncio

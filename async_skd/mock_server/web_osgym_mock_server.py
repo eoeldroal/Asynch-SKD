@@ -18,6 +18,11 @@ from fastapi import FastAPI, HTTPException, Request
 from PIL import Image, ImageDraw
 
 
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 18000
+DEFAULT_LOG_PATH = "logs/mock_web_osgym_requests.jsonl"
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -208,9 +213,9 @@ def run_mock_server_in_thread(*, host: str, port: int, log_path: str | Path) -> 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=18080)
-    parser.add_argument("--log-path", default="logs/mock_web_osgym_requests.jsonl")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--log-path", default=DEFAULT_LOG_PATH)
     args = parser.parse_args()
 
     app = create_app(args.log_path)
