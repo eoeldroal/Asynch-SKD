@@ -25,7 +25,7 @@ class _FakeTool:
             "include_a11y": kwargs["include_a11y"],
             "reward": None,
         }
-        return "instance-1", ToolResponse(text="A11Y_TREE:\nroot")
+        return "instance-1", ToolResponse(text="A11Y_TREE:\nroot", image=["start-image"])
 
     async def execute(self, instance_id, parameters, **kwargs):
         self.executed.append((instance_id, parameters))
@@ -43,6 +43,16 @@ class _FakeTool:
         self._instance_dict[instance_id] = dict(kwargs)
 
 
+class _ImageFakeTool(_FakeTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters))
+        return ToolResponse(text="A11Y_TREE:\nroot", image=["image-1"]), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": len(parameters["actions"]),
+        }
+
+
 def _build_loop():
     loop = WebSkdAgentLoop.__new__(WebSkdAgentLoop)
     loop.tools = {"computer": _FakeTool()}
@@ -57,12 +67,30 @@ def _build_loop():
     loop.prompt_length = 64
     loop.tool_parser_name = "qwen3_coder"
     loop.processor = None
+
+    async def _fake_apply_server_chat_template(messages, **kwargs):
+        return [21, 22]
+
+    loop._apply_server_chat_template = _fake_apply_server_chat_template
     return loop
 
 
 class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
     def test_web_skd_agent_is_still_skd(self):
         self.assertTrue(issubclass(WebSkdAgentLoop, SkdAgentLoop))
+
+    def test_tool_message_has_one_marker_per_image(self):
+        loop = _build_loop()
+
+        message = loop._build_tool_message("obs", ["image-1", "image-2"])
+
+        self.assertEqual(
+            message,
+            {
+                "role": "tool",
+                "content": [{"type": "image"}, {"type": "image"}, {"type": "text", "text": "obs"}],
+            },
+        )
 
     async def test_pending_requests_a11y_but_only_teacher_prompt_gets_a11y(self):
         loop = _build_loop()
@@ -119,9 +147,11 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             {
                 "web_osgym_instance_id": "instance-1",
                 "web_osgym_task_id": "12345",
-                "web_osgym_request_id": 101,
+                "web_osgym_session_id": 101,
                 "web_osgym_include_a11y": True,
                 "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
                 "teacher_ids_list": [],
                 "teacher_logprobs_list": [],
                 "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
@@ -146,6 +176,76 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(agent_data.extra_fields["teacher_ids_list"]), len(agent_data.response_mask))
         self.assertEqual(len(agent_data.extra_fields["teacher_logprobs_list"]), len(agent_data.response_mask))
 
+    async def test_processing_tools_discards_whole_observation_bundle_on_response_cutoff(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _ImageFakeTool()}
+        loop.response_length = 4
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12, 13, 14]
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            return [31, 32]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        before_messages = deepcopy(agent_data.messages)
+        before_extra = deepcopy(agent_data.extra_fields)
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                },
+            )()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.TERMINATED)
+        self.assertEqual(agent_data.messages, before_messages)
+        self.assertEqual(agent_data.prompt_ids, [1, 2, 3])
+        self.assertEqual(agent_data.response_mask, [])
+        self.assertEqual(agent_data.image_data, [])
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], before_extra["teacher_prompt_ids"])
+        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], before_extra["teacher_server_prompt_ids"])
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], before_extra["server_prompt_ids"])
+        self.assertEqual(
+            agent_data.extra_fields["web_osgym_teacher_messages"], before_extra["web_osgym_teacher_messages"]
+        )
+        self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_response_budget_exhausted")
+        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+
     async def test_system_stop_fetches_reward_on_skd_loop(self):
         loop = _build_loop()
 
@@ -168,7 +268,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 {
                     "web_osgym_instance_id": "instance-1",
                     "web_osgym_task_id": "12345",
-                    "web_osgym_request_id": 101,
+                    "web_osgym_session_id": 101,
                     "web_osgym_include_a11y": True,
                 }
             )

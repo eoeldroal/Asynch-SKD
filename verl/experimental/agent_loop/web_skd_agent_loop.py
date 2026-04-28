@@ -39,7 +39,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
 
     def _build_tool_message(self, tool_response_text: str | None, image_data: list[Any] | None):
         if image_data:
-            content = [{"type": "image"}]
+            content = [{"type": "image"} for _ in image_data]
             if tool_response_text:
                 content.append({"type": "text", "text": tool_response_text})
             return {"role": "tool", "content": content}
@@ -145,16 +145,17 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
         agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)
 
-        self._extend_image_data(agent_data, tool_response.image)
         student_obs, teacher_obs = self._split_env_observation(tool_response.text, tool_response.image)
+        image_data = tool_response.image if tool_response.image else None
 
-        appended_len = 0
-        if student_obs or tool_response.image:
-            student_message = self._build_tool_message(student_obs, tool_response.image)
-            agent_data.messages.append(student_message)
+        student_message = None
+        response_ids: list[int] = []
+        server_response_ids: list[int] = []
+        if student_obs or image_data:
+            student_message = self._build_tool_message(student_obs, image_data)
             response_ids = await self.apply_chat_template(
                 [student_message],
-                images=tool_response.image if tool_response.image else None,
+                images=image_data,
                 videos=None,
                 remove_system_prompt=True,
             )
@@ -162,6 +163,39 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 [student_message],
                 remove_system_prompt=True,
             )
+
+        teacher_message = None
+        teacher_response_ids: list[int] = []
+        teacher_server_response_ids: list[int] = []
+        if teacher_obs or image_data:
+            teacher_message = self._build_tool_message(teacher_obs, image_data)
+            teacher_response_ids = await self.apply_chat_template(
+                [teacher_message],
+                images=image_data,
+                videos=None,
+                remove_system_prompt=True,
+            )
+            teacher_server_response_ids = await self._apply_server_chat_template(
+                [teacher_message],
+                remove_system_prompt=True,
+            )
+
+        # Treat the environment observation as one atomic bundle. The local
+        # prompt ids, server prompt ids, teacher prompt ids, teacher messages,
+        # response mask, and image_data must either all advance together or all
+        # remain unchanged; otherwise Qwen-VL postprocessing can see image
+        # tensors whose image tokens were never admitted into the final
+        # sequence.
+        if response_ids and len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_response_budget_exhausted")
+            return AgentState.TERMINATED
+
+        if image_data:
+            self._extend_image_data(agent_data, image_data)
+
+        appended_len = 0
+        if student_message is not None:
+            agent_data.messages.append(student_message)
             appended_len = len(response_ids)
             agent_data.prompt_ids += response_ids
             agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids[:-appended_len]))
@@ -172,19 +206,8 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             agent_data.user_turns += 1
 
         teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
-        if teacher_obs or tool_response.image:
-            teacher_message = self._build_tool_message(teacher_obs, tool_response.image)
+        if teacher_message is not None:
             teacher_messages.append(teacher_message)
-            teacher_response_ids = await self.apply_chat_template(
-                [teacher_message],
-                images=tool_response.image if tool_response.image else None,
-                videos=None,
-                remove_system_prompt=True,
-            )
-            teacher_server_response_ids = await self._apply_server_chat_template(
-                [teacher_message],
-                remove_system_prompt=True,
-            )
             teacher_prompt_ids = agent_data.extra_fields.setdefault("teacher_prompt_ids", [])
             agent_data.extra_fields.setdefault("teacher_server_prompt_ids", list(teacher_prompt_ids))
             teacher_prompt_ids.extend(teacher_response_ids)
