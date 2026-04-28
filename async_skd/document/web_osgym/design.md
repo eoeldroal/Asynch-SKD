@@ -1,280 +1,367 @@
 # Web / OS Gym Integration Design
 
-## 0. 목적
+## 0. Purpose
 
-이 문서는 `verl`의 agent-loop 기반 rollout에 **WebGym / OSWorld 계열 remote environment protocol**을 통합할 때의 상위 설계 원칙을 정리한다.
+이 문서는 `verl` agent-loop rollout에 WebGym / OSWorld 계열 stateful remote environment를 통합하는 설계를 정리한다.
 
-여기서 말하는 environment는 다음 특성을 가진다.
+현재 구현은 real WebGym stack에 바로 의존하지 않고, protocol-compatible mock Web/OSGym server로 먼저 검증한다. mock 검증 후 같은 protocol surface를 real server에 붙이는 것이 기본 순서다.
 
-- 외부 서버가 client가 지정한 `session_id`를 기준으로 세션 상태를 관리한다
-- observation은 screenshot과 a11y tree를 포함한다
-- action은 `computer_13` 계열 low-level action schema를 따른다
-- 최종 reward는 environment가 계산해 응답한다
+## 1. Environment Model
 
-이 문서의 목표는 "어떤 상태 기계와 책임 분리 위에 이 기능을 올릴 것인가"를 고정하는 것이다.  
-구체적인 클래스 이름, 함수 시그니처, 내부 helper 구성은 이후 구현 단계에서 바뀔 수 있다.
+환경은 stateless function이 아니라 trajectory-lifetime session을 가진 remote environment다.
 
-## 1. 설계 목표
+Protocol operations:
 
-통합의 목표는 다음과 같다.
+- `start`: task와 session을 열고 initial observation을 반환한다.
+- `action`: 같은 session에 action list를 적용하고 다음 observation을 반환한다.
+- `reward`: 종료 후 scalar reward를 반환한다.
 
-1. `verl`의 기존 agent-loop 구조를 최대한 유지한다.
-2. environment 세션 시작, action 적용, reward 회수를 명확히 분리한다.
-3. screenshot / a11y tree를 모델 입력으로 자연스럽게 제공한다.
-4. `DONE` / `FAIL`과 시스템 종료를 모두 일관된 종료 프로토콜로 수렴시킨다.
-5. environment가 계산한 최종 reward를 현재 강화학습 업데이트 경로에 자연스럽게 실어 나른다.
+Session identity:
 
-## 2. 비목표
+- `task_id`: dataset/server task identifier
+- `session_id`: runtime/client-owned trajectory session identifier
 
-이 문서는 다음을 다루지 않는다.
+`session_id`는 dataset에서 오지 않는다. agent loop가 trajectory 시작 시 생성하고, 같은 trajectory의 모든 request에서 재사용한다.
 
-- low-level HTTP client 구현 상세
-- 구체적인 prompt 문구 또는 serializer 포맷
-- tokenizer, image preprocessing, transport retry 정책의 세부 코드
-- 특정 모델 전용 tool-call 파서의 세부 구현
-- reward shaping이나 dense intermediate reward 설계
+## 2. Design Goals
 
-즉 이 문서는 **구현 문서가 아니라 구조 문서**다.
+1. 기존 `ToolAgentLoop` / `SkdAgentLoop` 상태 기계를 유지한다.
+2. environment lifecycle을 `PENDING -> GENERATING -> PROCESSING_TOOLS -> TERMINATED`에 자연스럽게 대응시킨다.
+3. screenshot image와 a11y/text observation을 모델 입력으로 제공한다.
+4. student와 teacher의 observation visibility를 분리한다.
+5. `DONE` / `FAIL`과 system cutoff를 모두 reward 회수로 수렴시킨다.
+6. async SKD scheduler/trainer가 Web/OSGym protocol을 직접 알 필요 없게 한다.
 
-## 3. 핵심 관점
+## 3. State Mapping
 
-이 integration은 일반적인 계산 tool을 하나 더 붙이는 작업이 아니다.  
-본질적으로는 **stateful remote environment를 tool-agent loop 안에 넣는 작업**이다.
+### PENDING
 
-따라서 핵심은 다음 두 가지다.
+`PENDING`은 environment `start` 단계다.
 
-- environment는 trajectory 동안 유지되는 **세션**을 가진다
-- tool response는 단순 실행 결과가 아니라 **새 observation** 역할을 한다
+수행:
 
-즉 이 통합에서 tool은 "코드를 실행해 문자열을 돌려주는 함수"가 아니라,  
-**정책이 상호작용하는 외부 환경의 step function**에 가깝다.
+- runtime `session_id` 생성
+- dataset/tool kwargs에서 `task_id` 확보
+- server `start` request 전송
+- initial screenshot/text 수신
+- initial observation bundle 구성
 
-## 4. 프로토콜 추상화
+이 단계는 단순 prompt 준비가 아니라 환경과 첫 동기화를 수행한다.
 
-환경 서버는 세 종류의 요청을 가진다.
+### GENERATING
 
-### 4.1 Start
+모델이 다음 `computer` tool call을 생성한다.
 
-세션을 열고 최초 observation을 가져온다.
+모델은 Web/OSGym protocol JSON을 직접 생성하지 않는다. 모델-facing schema는 다음 형태다.
 
-- 입력: `task_id`, `session_id`, 기타 시작 옵션
-- 출력: 최초 screenshot, a11y tree
+```json
+{
+  "actions": [
+    {"action_type": "CLICK", "x": 100, "y": 200, "button": "left"}
+  ]
+}
+```
 
-### 4.2 Action
+### PROCESSING_TOOLS
 
-현재 세션에 action을 적용하고 다음 observation을 가져온다.
+`WebOsGymTool`이 model-facing tool call을 server protocol request로 바꾼다.
 
-- 입력: action list
-- 출력: 다음 screenshot, a11y tree, 또는 action failure message
+수행:
 
-### 4.3 Reward
+- action list parse
+- malformed payload safety handling
+- server `action` request
+- next observation 수신
+- terminal action이면 reward 회수 준비
 
-종료 후 최종 reward를 가져온다.
+### TERMINATED
 
-- 입력: 세션 식별자
-- 출력: scalar reward
+더 이상 action을 생성하지 않는다. 종료 시에는 reward를 회수해 `AgentLoopOutput.reward_score`로 넘긴다.
 
-이 세 요청은 environment protocol 차원에서는 분리되지만, agent-loop 차원에서는 하나의 trajectory lifecycle로 묶여야 한다.
+## 4. Observation Policy
 
-## 5. 상태 기계 매핑
+정상 visual observation:
 
-현재 `ToolAgentLoop` / `SkdAgentLoop`의 큰 상태 구조를 유지하면서 environment protocol을 매핑하는 것이 기본 방향이다.
+- student sees screenshot image
+- teacher sees screenshot image + a11y/text
 
-### 5.1 `PENDING`
+Image-less failure observation:
 
-`PENDING`은 environment 세션을 시작하고 최초 observation을 확보하는 단계다.
+- image가 없으면 실패 원인이 text에만 있을 수 있다.
+- 이 경우 student와 teacher 모두 text를 본다.
 
-여기서 수행되는 논리는 다음과 같다.
+이 예외는 action failure를 복구 가능한 환경 feedback으로 취급하기 위한 것이다.
 
-- `task_id`를 바탕으로 environment에 `start` 요청을 보낸다
-- 최초 screenshot과 a11y tree를 받는다
-- 이를 task instruction과 함께 초기 모델 입력 메시지로 구성한다
+## 5. A11y/Text Policy
 
-즉 `PENDING`은 더 이상 단순 prompt 준비 단계가 아니라,  
-**환경과의 첫 동기화 단계**가 된다.
+a11y tree는 server가 `text` 필드에 제공하는 observation text다. WebSKD loop는 정상 image-bearing observation에서 이 text를 teacher-only channel에 둔다.
 
-### 5.2 `GENERATING`
+중요한 점:
 
-모델이 다음 행동을 제안하는 단계다.
+- server가 특정 a11y 포맷을 강제할 필요는 없다.
+- loop는 image 유무를 기준으로 student text visibility를 결정한다.
+- image가 있으면 student는 text/a11y를 보지 않는다.
+- image가 없으면 failure feedback으로 보고 student도 text를 본다.
 
-모델은 화면과 a11y tree를 보고 다음 행동을 tool-call 형태로 생성한다.  
-이 출력은 내부적으로 environment action schema로 정규화될 수 있어야 한다.
+## 6. Image Handling
 
-중요한 점은, 이 단계의 책임은 어디까지나 **행동 제안**이지 환경 적용이 아니라는 것이다.
+Protocol wire format은 base64 PNG다.
 
-### 5.3 `PROCESSING_TOOLS`
+```json
+{
+  "image": {
+    "data": "...",
+    "mimeType": "image/png"
+  }
+}
+```
 
-모델이 제안한 action을 실제 environment에 적용하는 단계다.
+`web_osgym_protocol.py`는 이를 PIL image로 decode한다. 내부 multimodal data path는 기존 verl multimodal interface와 맞추기 위해 image object list를 사용한다.
 
-여기서 수행되는 논리는 다음과 같다.
+현재 manager는 image를 다시 SGLang request payload에 실어 보낸다. 따라서 server에서 screenshot이 와도 SGLang student/teacher request에 image가 빠지는 문제는 이 계층에서 막아야 한다.
 
-- 모델 출력에서 action을 파싱한다
-- 이를 environment `action` 요청으로 보낸다
-- 새 screenshot, a11y tree, failure message를 받는다
-- 이를 다음 턴의 모델 입력으로 사용할 observation으로 만든다
+## 7. Prompt Stream Policy
 
-이 단계에서 tool response는 사실상 **environment observation carrier**다.
+WebSKD는 local processor ids와 SGLang logical server ids를 분리한다.
 
-### 5.4 `TERMINATED`
+- `prompt_ids`: student local ids
+- `teacher_prompt_ids`: teacher local ids
+- `server_prompt_ids`: student SGLang logical ids
+- `teacher_server_prompt_ids`: teacher SGLang logical ids
 
-environment interaction이 끝난 상태다.  
-이후에는 추가 action을 생성하지 않으며, 최종 reward가 회수되어 있어야 한다.
+image가 포함되면 local ids에는 image expansion이 반영될 수 있다. server prompt ids는 SGLang `/generate`와 prompt-logprob delta contract의 기준이다.
 
-## 6. 초기 observation 원칙
+따라서 WebSKD에서 local ids를 server ids로 fallback하면 안 된다.
 
-모델은 첫 턴부터 다음 세 가지를 함께 받아야 한다.
+## 8. Atomic Observation Commit
 
-- task instruction
-- 현재 screenshot
-- 현재 a11y tree
+Web observation은 다음 상태를 함께 바꾼다.
 
-즉 environment integration의 첫 관문은 "모델이 action을 낼 준비가 되었는가"이지,  
-"서버 연결이 되었는가"만이 아니다.
+- image data
+- messages
+- prompt ids
+- server prompt ids
+- teacher prompt ids
+- teacher server prompt ids
+- response mask
+- dummy teacher rows
 
-이 원칙 때문에 최초 `start` 응답은 단순 side-effect가 아니라,  
-**실질적인 initial observation**으로 취급되어야 한다.
+이 상태는 모두 성공한 뒤 한 번에 commit되어야 한다. 일부만 commit되면 carryover, cutoff, teacher verification에서 상태가 깨진다.
 
-SKD 경로에서는 a11y/text observation을 teacher-only auxiliary channel로 취급할 수 있다. 단, environment가 screenshot을 반환하지 못하는 action failure 계열 응답에서는 text 자체가 복구에 필요한 환경 feedback이므로 student와 teacher가 모두 볼 수 있어야 한다.
+Cutoff나 teacher context guard에 걸리면 observation bundle 전체를 commit하지 않는다.
 
-## 7. Action 표현 원칙
+## 9. Teacher Context
 
-environment action은 `computer_13` 계열 low-level action schema를 따른다.
+Teacher는 a11y/text와 image expansion 때문에 student보다 긴 context를 가진다.
 
-여기서 중요한 설계 원칙은 다음과 같다.
+따라서 WebSKD는 observation commit 전 prospective teacher context를 검사한다. non-terminal observation을 넣은 뒤 최소 1 token을 teacher가 verify할 수 없다면 해당 observation을 commit하지 않고 sample을 `teacher_context_exhausted`로 종료한다.
 
-- 모델 관점에서는 action space가 단일해야 한다
-- `CLICK`, `SCROLL`, `TYPE`, `WAIT`, `DONE`, `FAIL`은 모두 같은 표면 action schema 안에 존재할 수 있다
-- 내부 구현은 필요할 경우 이를 일반 action과 종료 action으로 나누어 해석할 수 있다
+Terminal observation/reward path는 더 이상 future verification이 없으므로 같은 guard를 적용하지 않는다.
 
-즉 **표면 schema는 통일하되, 상태 기계에서의 의미는 다를 수 있다**는 것이 기본 원칙이다.
+## 10. Action Semantics
 
-## 8. 종료 의미론
+Action schema는 Computer 13 계열 low-level action을 따른다.
 
-종료는 두 갈래에서 발생한다.
+Supported action names:
 
-### 8.1 모델 주도 종료
+```text
+MOVE_TO, CLICK, MOUSE_DOWN, MOUSE_UP, RIGHT_CLICK, DOUBLE_CLICK,
+DRAG_TO, SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, HOTKEY,
+WAIT, DONE, FAIL
+```
 
-모델이 `DONE` 또는 `FAIL`을 action으로 생성하는 경우다.
+`DONE`과 `FAIL`은 표면상 action이지만 loop 의미상 terminal request다. 단독 action으로 보내는 것이 원칙이다.
 
-이 경우 `DONE` / `FAIL`은 겉으로는 action schema 안에 있지만,  
-실질적으로는 **종료 요청 action**이다.
+## 11. Failure Semantics
 
-따라서 이 경우 loop는:
+Transport-level failure와 action failure는 다르다.
 
-1. environment에 종료 의도를 전달하고
-2. 최종 reward를 요청하고
-3. 현재 trajectory를 종료해야 한다
+- transport failure: server request 자체가 실패한 것
+- action failure: 환경이 action을 처리했지만 실패 feedback을 반환한 것
 
-### 8.2 시스템 주도 종료
+Action failure는 policy가 다음 행동을 고치는 데 필요한 observation일 수 있다. image가 없으면 text feedback을 student와 teacher 모두에게 제공한다.
 
-예:
+Malformed model action payload도 가능하면 action failure observation으로 바꿔 trajectory를 계속 진행한다.
 
-- `max_length`
-- `max_chunks`
-- 기타 시스템 hard stop
+## 12. Reward Semantics
 
-이 경우 모델이 종료 action을 명시적으로 내리지는 않았지만,  
-loop는 일관성을 위해 동일한 종료 수순을 따라야 한다.
+Reward source of truth는 environment server다.
 
-즉:
+Loop는 종료 시점에 reward를 회수하고, trainer는 protocol을 직접 알 필요 없이 기존 batch path에서 reward를 받는다.
 
-1. 더 이상의 generation/action 반복을 중단하고
-2. environment에 대해 reward를 요청하고
-3. trajectory를 종료한다
+종료 이유:
 
-## 9. 종료 경로 통일 원칙
+- model `DONE`
+- model `FAIL`
+- response/model length cutoff
+- max chunks
+- teacher context exhausted
+- 기타 system termination
 
-종료 이유와 관계없이 마지막은 하나의 공통 규칙으로 수렴하는 것이 좋다.
+종료 이유와 무관하게 가능한 경우 reward request는 한 번 수행한다.
 
-**종료 시에는 항상 최종 reward를 한 번 회수하고 loop를 끝낸다.**
+## 13. Mock Server Role
 
-구체적으로는:
+Mock server는 policy quality를 평가하는 서버가 아니다. protocol과 trainer integration을 확인하는 서버다.
 
-- `DONE` / `FAIL`: 종료 action 이후 reward 회수
-- `max_length` / `max_chunks`: 별도 종료 action 없이 reward 회수
+검증 대상:
 
-즉 종료 이유는 다를 수 있지만, 학습 시스템이 받는 마지막 산출물은 항상 **final scalar reward**여야 한다.
+- `GET /health`
+- `POST /` with `op=start|action|reward`
+- same `session_id` across a trajectory
+- stable `task_id`
+- base64 PNG observation
+- optional a11y text
+- action list logging
+- reward return
 
-## 10. Reward 통합 원칙
+Mock server를 통과한 뒤 real WebGym / Omnibox readiness와 task-specific 동작을 본다.
 
-이 integration에서 reward는 외부 reward model이 아니라 **environment가 계산한 최종 answer**다.
+## 14. Current Implementation Map
 
-따라서 reward의 source of truth는 environment server다.
+현재 구현의 source-of-truth는 다음 파일들이다.
 
-중요한 설계 원칙은:
+Protocol / tool boundary:
 
-- reward는 agent loop 종료 시점에 회수한다
-- trainer가 environment protocol을 직접 알 필요는 없다
-- agent loop는 회수한 최종 reward를 기존 RL batch 경로에 실어 나른다
+- `verl/experimental/agent_loop/web_osgym_protocol.py`
+  - `POST /` with `op=start|action|reward`
+  - wire field `session_id`
+  - base64 PNG image parsing
+- `verl/tools/web_osgym_tool.py`
+  - model-facing `computer` tool
+  - `actions: [...]` parsing
+  - protocol request construction
+  - malformed action payload safety path
+  - `DONE` / `FAIL` terminal action handling
 
-즉 reward 통합은 "trainer가 서버를 직접 호출한다"가 아니라,  
-**agent loop가 environment reward를 받아 trajectory output의 일부로 넘긴다**는 구조가 더 자연스럽다.
+Loop integration:
 
-## 11. Tool response의 의미
+- `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
+  - runtime-owned `web_osgym_session_id`
+  - session restore for partial/carryover state
+  - final reward fetch
+- `verl/experimental/agent_loop/web_skd_agent_loop.py`
+  - registered as `web_skd_agent`
+  - `include_a11y=True`
+  - pending initial observation bundle
+  - tool observation atomic commit
+  - student/teacher observation split
+  - server prompt ids and teacher server prompt ids maintenance
+  - teacher context guard before non-terminal observation commit
+  - final environment reward propagation
 
-이 통합에서 tool response는 일반적인 "실행 결과 문자열"보다 넓은 의미를 가진다.
+Mock server assets:
 
-실질적으로 tool response는 다음 중 하나를 담는다.
+- `async_skd/mock_server/web_osgym_mock_server.py`
+- `async_skd/mock_server/web_osgym_mock_client.py`
+- `async_skd/mock_server/create_mock_web_osgym_dataset.py`
+- `async_skd/mock_server/reward_fn_mock_web_osgym.py`
 
-- 새 screenshot
-- 새 a11y tree
-- action failure message
-- 종료 이후의 reward 관련 상태
+Trainer entrypoint:
 
-즉 이 tool은 일반 utility tool이 아니라,  
-**모델에게 다음 observation을 공급하는 environment bridge**다.
+- `async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh`
 
-## 12. Session lifecycle 원칙
+Tool config:
 
-이 integration은 trajectory 동안 environment session을 유지해야 한다.
+- `examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
 
-따라서 다음 원칙이 필요하다.
+## 15. Current Verification Flow
 
-- `session_id`는 client/runtime이 생성하고 environment server는 이를 세션 키로 사용한다
-- 세션 시작은 한 trajectory당 한 번이어야 한다
-- action은 같은 세션 위에서 순차적으로 누적되어야 한다
-- 종료 후에는 reward를 회수하고 세션을 닫아야 한다
+### Protocol smoke
 
-즉 이 tool은 stateless one-shot tool이 아니라,  
-**trajectory-lifetime session tool**이어야 한다.
+Start the mock server:
 
-## 13. Failure 처리 원칙
+```bash
+cd /home/sogang_nlpy/verl
+conda activate skd
 
-environment action 실패는 transport-level exception과 동일하게 다루면 안 된다.
+python async_skd/mock_server/web_osgym_mock_server.py \
+  --host 127.0.0.1 \
+  --port 18000 \
+  --log-path logs/mock_web_osgym_requests.jsonl
+```
 
-action failure 응답은 정책에게 중요한 observation일 수 있다.  
-예를 들어 focus가 안 맞아서 typing이 실패했다는 정보는 다음 action을 바꾸는 데 직접 필요하다.
+Run the mock client:
 
-따라서 기본 원칙은:
+```bash
+python async_skd/mock_server/web_osgym_mock_client.py \
+  --base-url http://127.0.0.1:18000 \
+  --session-id 777 \
+  --task-id 12345
+```
 
-- action failure는 가능하면 **관측 가능한 환경 응답**으로 모델에 다시 보여준다
-- screenshot을 반환할 수 없는 failure 응답에서는 text가 실패 원인을 담는 shared observation이 된다
-- 단순히 예외를 던지고 trajectory를 끊는 방향은 기본값이 아니다
+Expected request sequence:
 
-즉 실패도 environment state의 일부로 취급한다.
+```text
+start -> action(CLICK) -> action(DONE) -> reward
+```
 
-## 14. Validation / Training 해석
+All events must keep the same `session_id` and `task_id`.
 
-이 integration은 원칙적으로 training rollout뿐 아니라 validation rollout에도 적용될 수 있다.  
-다만 validation은 teacher guidance를 평가하는 단계가 아니라 **student policy 자체를 평가하는 단계**로 해석해야 한다.
+### Trainer mock run
 
-즉 environment integration 자체와 async SKD의 teacher-guided semantics를 섞어 생각하지 않는 것이 중요하다.
+Generate the mock dataset if needed:
 
-## 15. 안정적인 추상 기준
+```bash
+python async_skd/mock_server/create_mock_web_osgym_dataset.py \
+  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
+  --num-samples 64
+```
 
-이 문서에서 바뀌지 말아야 하는 기준은 다음과 같다.
+Run the mock server detached:
 
-1. `PENDING`은 environment `start`와 initial observation 획득 단계다
-2. `GENERATING`은 행동 제안 단계다
-3. `PROCESSING_TOOLS`는 environment action 적용과 다음 observation 획득 단계다
-4. `DONE` / `FAIL`은 표면상 action schema에 있으나 의미상 종료 요청이다
-5. 시스템 종료와 모델 종료는 모두 최종 reward 회수로 수렴한다
-6. reward의 source of truth는 environment server다
-7. environment session은 trajectory 동안 유지되어야 한다
-8. tool response는 observation carrier로 이해해야 한다
+```bash
+nohup python async_skd/mock_server/web_osgym_mock_server.py \
+  --host 127.0.0.1 \
+  --port 18000 \
+  --log-path logs/mock_web_osgym_requests.jsonl \
+  > logs/mock_web_osgym_server.log 2>&1 &
+```
 
-## 16. 한 줄 요약
+Run the trainer:
 
-이 통합을 가장 짧게 표현하면 다음과 같다.
+```bash
+nohup bash async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh \
+  > logs/web_mock_async_skd_train.log 2>&1 &
 
-**Web / OS Gym integration은 `tool_agent` 위에 stateful remote environment session을 얹고, start/action/reward를 agent-loop 상태 기계에 대응시켜 최종 environment reward를 기존 RL 업데이트 경로로 연결하는 설계다.**
+tail -f logs/web_mock_async_skd_train.log
+```
+
+Default script shape:
+
+```text
+TRAIN_BATCH_SIZE=16
+DATA_MAX_RESPONSE_LENGTH=1024
+STUDENT_MAX_MODEL_LEN=3073
+TEACHER_MAX_MODEL_LEN=8073
+TOTAL_TRAINING_STEPS=4
+default_agent_loop=web_skd_agent
+```
+
+## 16. Current Milestone Interpretation
+
+`7a404f2f` is the current WebSKD mock GPU milestone.
+
+It confirms:
+
+- actual trainer path, not isolated smoke-only generation
+- mock server protocol integration
+- image-bearing student generation
+- teacher SGLang prompt-logprob verification
+- multimodal prefix surplus trimming
+- async lookahead, promotion, carryover
+- non-tensor metadata normalization
+- distillation loss and actor update
+
+It does not claim:
+
+- real WebGym / Omnibox readiness
+- browser task quality
+- long-horizon dataset coverage
+- policy convergence
+
+Operational note: with 64 mock rows and prefetch enabled, a 4-step run can exhaust the source before the final step. Increase dataset size or lower prefetch for longer runs.
+
+## 17. One-line Summary
+
+Web / OS Gym integration은 `tool_agent`/`skd_agent` 위에 stateful remote environment session을 얹고, screenshot/a11y observation과 final environment reward를 기존 rollout/training path로 전달하는 구조다.

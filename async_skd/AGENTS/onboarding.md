@@ -1,350 +1,233 @@
-# On-Policy SKD 빠른 온보딩
+# Async SKD Onboarding
 
-## 이 문서의 역할
+이 문서는 `verl/async_skd` 작업 영역을 처음 다시 잡을 때 보는 빠른 지도다. 자세한 구현 설명은 `imp_detail.md`, 운영상 주의점은 `warning.md`, 장애/런 메모는 `details.md`를 본다.
 
-이 문서는 이 작업 영역의 **entry point** 다.  
-목표는 처음 들어온 사람이 짧은 시간 안에 다음 네 가지를 바로 파악하게 하는 것이다.
+## 현재 기준 상태
 
-1. 현재 실험이 무엇을 하려는지
-2. 어디부터 코드를 읽어야 하는지
-3. 어떤 로그를 먼저 봐야 하는지
-4. 무엇이 correctness 이슈이고, 무엇이 systems/perf 이슈인지
+현재 브랜치의 핵심 마일스톤은 두 개다.
 
-더 자세한 설명은 [`AGENTS/imp_detail.md`](/home/sogang_nlpy/verl/async_skd/AGENTS/imp_detail.md) 로 내려간다.
+1. `e104f23a Milestone: finalize async SKD implementation runbook`
+   - text/tool 기반 async SKD 실행 경로를 정리한 기준점이다.
+   - validation은 student-only로 분리되고, training `AsyncSkdDataSource`와 격리된다.
+   - lookahead, promoted, carryover, teacher sticky carryover가 trainer 경로에서 동작한다.
 
-## 현재 작업의 한 줄 요약
+2. `7a404f2f Milestone: validate WebSKD mock RL on real GPUs`
+   - mock Web/OSGym 서버와 실제 GPU 기반 `web_skd_agent` trainer 경로를 연결해 검증한 기준점이다.
+   - image observation, student SGLang generation, teacher SGLang prompt-logprob verification, multimodal prefix surplus trimming, lookahead prefetch, carryover, promotion, batch assembly, actor update까지 실제 경로를 통과했다.
+   - `Training Progress 75% (3/4)`에서 보인 종료는 SKD crash가 아니라 64-row mock dataset을 작은 step 수 + prefetch로 소모한 결과다.
 
-현재 작업은 **tool-aware speculative knowledge distillation (SKD)** 를 `verl`의 agent-loop 위에 구현하고,  
-학생 `Qwen3.5-9B`를 교사 `Qwen3.5-27B`로부터 on-policy distillation 하는 것이다.
+## 주요 실행 경로
 
-현재 실험의 주요 특징은 다음과 같다.
-
-- `skd_agent` 기반 chunked generation + teacher verification
-- tool-aware multi-turn rollout (`code_interpreter`)
-- Web / OS Gym 계열 원격 환경 통합은 `web_skd_agent`와 `computer` tool 경로로 분리되어 있으며, 실서버를 바로 붙이기 전에는 `async_skd/mock_server`의 mock Web/OSGym server/client로 protocol을 먼저 확인한다
-- teacher-only system prompt 지원
-- bounded async SKD lookahead (`AsyncSkdAgentLoopManager`)
-- distillation `forward_kl_topk` with `topk=32`
-- FSDP distillation forward는 현재 `logsumexp_gather` 구현 선택 가능하며, 현 스크립트는 그 경로를 사용한다
-- event-log 기반 dashboard 관측
-- train: `Nemotron-Cascade-RL-Math`
-- validation: `AIME-2024` + `MATH500`
-- validation sampling: `n=4` (`mean@4`, `best@4`), `skd_agent -> tool_agent` student-only path
-
-## 가장 먼저 볼 파일
-
-다음 순서로 보면 가장 빠르다.
-
-1. 실행 스크립트
-   [`run_qwen35_math_async_skd_tool_fsdp.sh`](/home/sogang_nlpy/verl/async_skd/run_qwen35_math_async_skd_tool_fsdp.sh)
-   현재 bounded async SKD 실험의 기본 entry point다. `AsyncSkdAgentLoopManager`, lookahead prefetch, teacher distillation 설정, 학생 학습 엔진, student rollout / teacher inference SGLang backend가 여기서 결정된다. 현재 기본값은 `MAX_PROMPT_LENGTH=1024`, `MAX_RESPONSE_LENGTH=8192`, `MODEL_ENGINE=veomni`다.
-
-2. SKD 루프 본체
-   [`skd_agent_loop.py`](/home/sogang_nlpy/verl/verl/experimental/agent_loop/skd_agent_loop.py)
-   chunk generate, teacher verify, tool-aware teacher alignment, teacher-only prompt stream, `skd_agent` registration이 여기에 있다.
-
-3. async SKD manager / source
-   [`manager.py`](/home/sogang_nlpy/verl/verl/experimental/async_skd/manager.py), [`data_source.py`](/home/sogang_nlpy/verl/verl/experimental/async_skd/data_source.py)
-   current work, lookahead, promoted, carryover, per-worker admission target, source ledger가 여기에 있다.
-
-4. teacher interface
-   [`teacher_manager.py`](/home/sogang_nlpy/verl/verl/experimental/teacher_loop/teacher_manager.py)
-   teacher prompt-logprob contract와 backend별 차이를 여기서 흡수한다.
-
-5. SGLang wrapper
-   [`async_sglang_server.py`](/home/sogang_nlpy/verl/verl/workers/rollout/sglang_rollout/async_sglang_server.py)
-   `prompt_logprobs_start_len`, teacher payload 반환 규약, backend 선택(`triton` / `triton_attn`), single-node `nccl_port` 계산이 여기서 나온다.
-
-6. teacher tensor 재구성 / backend validation
-   [`agent_loop.py`](/home/sogang_nlpy/verl/verl/experimental/agent_loop/agent_loop.py)
-   SKD가 online으로 모은 teacher rows를 downstream distillation 경로가 이해하는 형태로 다시 맞추고, async SKD backend contract validation을 담당한다.
-
-7. trainer 조립
-   [`ray_trainer.py`](/home/sogang_nlpy/verl/verl/trainer/ppo/ray_trainer.py)
-   actor/rollout/teacher resource pool 조립, validation, async rollout manager 생성, Ray worker group wiring이 여기 있다.
-
-8. Web / OS Gym mock protocol 확인
-   [`web_osgym_mock_server.py`](/home/sogang_nlpy/verl/async_skd/mock_server/web_osgym_mock_server.py), [`web_osgym_mock_client.py`](/home/sogang_nlpy/verl/async_skd/mock_server/web_osgym_mock_client.py)
-   실제 WebGym/Omnibox를 붙이기 전, `session_id`, `task_id`, `start/action/reward`, image base64, JSONL request logging이 protocol대로 동작하는지 확인하는 최소 환경이다.
-
-## 현재 실험에서 중요한 입력/리소스
-
-### 모델
-- student: [`models/Qwen3.5-9B`](/home/sogang_nlpy/verl/models/Qwen3.5-9B)
-- teacher: [`models/Qwen3.5-27B`](/home/sogang_nlpy/verl/models/Qwen3.5-27B)
-
-현재 student `Qwen3.5-9B`는 이름상 9B지만, 실제 checkpoint total size 기준 bf16 parameter count는 약 `9.653B`다.  
-즉 actor memory를 볼 때는 막연히 “9B라 여유 있을 것”으로 보면 안 된다.
-
-### 데이터
-- train: [`data/nemotron_cascade_rl_math_multiturn_w_tool/train.parquet`](/home/sogang_nlpy/verl/data/nemotron_cascade_rl_math_multiturn_w_tool/train.parquet)
-- val:
-  - [`data/aime-2024.parquet`](/home/sogang_nlpy/verl/data/aime-2024.parquet)
-  - [`data/math500/test.parquet`](/home/sogang_nlpy/verl/data/math500/test.parquet)
-
-### teacher prompt
-- current: [`teacher_system_prompt_math_planning.txt`](/home/sogang_nlpy/verl/async_skd/test_mixedgen/teacher_system_prompt_math_planning.txt)
-
-### async SKD 기본값
-- `TRAIN_BATCH_SIZE=64`
-- `PREFETCH_LIMIT=64`
-- `PREFETCH_WORKER_TARGET=16`
-- `SKD_CHUNK_SIZE=128`
-- `SKD_VERIFY_TOP_K=5`
-- `SKD_MAX_CHUNKS=512`
-- `MAX_PROMPT_LENGTH=1024`
-- `MAX_RESPONSE_LENGTH=8192`
-- `max_model_len=9217` (= MAX_RESPONSE + MAX_PROMPT + 1, student rollout·teacher 공통)
-- `actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288`
-- `MODEL_ENGINE=veomni`
-- `DISTILLATION_TOPK=32`
-- `FORWARD_KL_TOPK_IMPL=logsumexp_gather`
-- `distillation.distillation_loss.loss_max_clamp=10.0`
-- `distillation.distillation_loss.log_prob_min_clamp=-10.0`
-- `distillation.distillation_loss.use_task_rewards=False`
-- `distillation.distillation_loss.use_policy_gradient=False`
-- student rollout backend: `sglang` with `attention_backend=triton`, `mm_attention_backend=triton_attn`
-- teacher inference backend: `sglang` with `attention_backend=triton`, `mm_attention_backend=triton_attn`
-- current script offload:
-  - `param_offload=True`
-  - `optimizer_offload=True`
-- current script rollout memory fraction:
-  - `actor_rollout_ref.rollout.gpu_memory_utilization=0.9`
-- tool config path: `examples/sglang_multiturn/config/tool_config/sandbox_fusion_tool_config.yaml`
-- multi_turn format: `qwen3_coder`
-
-환경 변수 (스크립트 상단에서 설정):
-- `VERL_SKD_DEBUG=1`: per-chunk diagnostics 활성화 (`=2`이면 batch당 첫 3 sample의 token-level alignment 검증 로그 추가 출력)
-- `SGLANG_NUMA_BIND_V2=0`: NUMA binding 비활성화 (multi-GPU 환경에서 SGLang process 고정 방지)
-- `SGLANG_ENABLE_TORCH_INFERENCE_MODE=1`: SGLang 내부 `torch.inference_mode()` 활성화
-
-기타 주요 config:
-- `data.truncation=error`: 오버롱 prompt는 silently truncate하지 않고 에러로 처리
-- `data.shuffle=False`: curriculum / 순서 보존을 위해 shuffle 끔
-- `data.return_raw_chat=True`: raw message list를 dataset에서 반환
-- `trainer.use_legacy_worker_impl=disable`: legacy worker 구현 경로 비활성화 (신규 VeOmni engine 경로 사용)
-- `trainer.resume_mode=disable`: 체크포인트 resume 비활성화 (fresh start)
-
-`PREFETCH_LIMIT=0`은 lookahead prefetch만 끈다. 이 경우에도 `AsyncSkdAgentLoopManager`의 sample-level current scheduling은 남으므로 기존 동기 SKD와 완전히 같다고 보면 안 된다. 동기 baseline은 동기 SKD 스크립트를 따로 사용한다.
-
-### Web / OS Gym mock server
-
-Web / OS Gym 경로는 실서버를 바로 붙이면 browser/Omnibox/Redis/외부 사이트 상태가 함께 섞인다. 먼저 [`async_skd/mock_server`](/home/sogang_nlpy/verl/async_skd/mock_server)의 server/client로 wire contract를 확인한다.
-
-확인 기준은 단순하다. `logs/mock_web_osgym_requests.jsonl`에 `start -> action -> action -> reward` 순서가 같은 `session_id`와 `task_id`로 기록되어야 한다. 구체 명령은 [`document/web_osgym/implementation_plan.md`](/home/sogang_nlpy/verl/async_skd/document/web_osgym/implementation_plan.md)를 본다.
-
-## 구현에서 기억할 핵심 계약
-
-### 1. SKD는 first-rejection 방식이다
-
-학생 chunk 안에서 첫 rejection이 나오면:
-- reject 이전 accepted prefix만 유지
-- reject 위치는 teacher top-1로 교체
-- 그 뒤 학생 suffix는 버린다
-
-즉 distillation target도 항상 **실제로 커밋된 경로**에만 맞아야 한다.
-
-### 2. tool/user span은 `response_mask=0`이다
-
-tool-aware trajectory에서는 response 안에:
-- assistant token
-- tool response token
-- interaction/user token
-
-이 섞인다.  
-현재 구현은 tool/user span에도 dummy teacher row를 같이 넣어서,
-
-- `len(response_mask) == len(teacher_ids_list)`
-
-를 유지한다.
-
-### 3. teacher는 별도 prompt stream을 쓴다
-
-teacher-only system prompt가 들어가면 student prefix와 teacher prefix가 달라진다.  
-그래서 현재는:
-
-- student: `agent_data.prompt_ids`
-- teacher: `agent_data.extra_fields["teacher_prompt_ids"]`
-
-를 따로 유지한다.
-
-teacher verification은 항상 teacher prompt stream 기준으로 이뤄진다.
-
-### 4. teacher-only prompt를 쓰면 teacher budget reserve가 자동으로 붙는다
-
-teacher prompt가 student prompt보다 길어지므로,
-config 레벨에서 teacher inference budget에 고정 `512` 토큰 reserve를 자동으로 더한다.
-
-즉 run script의 raw `max_model_len` 값만 보면 teacher 실제 예산을 과소평가할 수 있다.
-
-### 5. bounded async SKD는 promoted와 carryover를 분리한다
-
-`lookahead` sample이 step barrier 전에 `TERMINATED`가 되면 promoted sample이다. trainer는 promoted input/output pair를 현재 train batch 뒤에 붙인다. 단, final train batch가 DP size로 나누어지도록 append 가능한 수만 붙이고, 남은 promoted pair는 source ledger에 pending으로 남긴다.
-
-`lookahead` sample이 완료되지 못하면 partial carryover다. carryover는 다음 step의 current work 앞쪽에 들어가고, 그만큼 fresh quota가 줄어든다. promoted row는 next-step fresh quota에서 차감하지 않는다.
-
-즉 **carryover는 promoted가 아니다.**  
-carryover가 많다는 로그는 “이번 step이 길고 무거웠다”는 간접 신호일 수는 있지만, 그 자체가 곧 현재 actor update batch에 append된 promoted sample이라는 뜻은 아니다.
-
-### 5-1. teacher sticky pin은 carryover에 대해 step 간 유지될 수 있다
-
-현재 구현은 teacher 쪽에 한해 carryover sample의 sticky routing을 step 간으로 연장하는 기능을 지원한다.
-
-- carryover partial은 `extra_fields["teacher_replica_id"]`를 함께 들고 간다
-- manager는 `sample_id -> real teacher server_id`와 `sample_id -> teacher_routing_key`를 함께 유지한다
-- resumed carryover는 가능한 한 같은 teacher pool 안의 같은 real teacher server로 **hard pin** 된다
-- 새 base sample은 carryover pinned load를 먼저 반영한 뒤, 그 위에서 rebalance된다
-
-기능이 켜져 있을 때 현재 정책은:
-
-- carryover: reuse 우선
-- base: carryover를 고려한 재분배
-
-중요한 점은, 여기서 말하는 pin 대상이 `teacher-replica-0` 같은 manager 내부 가상 이름이 아니라는 것이다. 실제 source of truth는 teacher load balancer가 아는 **real server_id**다. planner가 실제 teacher server ID를 모르면 bind하지 않고 fallback acquire 경로를 타는 쪽이 맞다.
-
-다만 student는 update phase에서 sleep / weight residency 전환을 거치므로, teacher처럼 step 간 KV reuse의 직접 대상이라고 보면 안 된다.
-
-이 기능은 `actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover`로 켜고 끌 수 있다. 현재 실행 스크립트는 이 값을 `True`로 두고 있으므로, 최근 런을 읽을 때는 carryover가 가능한 한 같은 teacher replica로 다시 붙도록 설계된 상태라고 보는 편이 맞다.
-
-### 5-2. validation은 student-only일 뿐 아니라 training source와도 격리된다
-
-validation batch는 `tool_agent`로 돌기 때문에 teacher-guided SKD rollout이 아니다. 하지만 그것만으로는 충분하지 않다. validation이 같은 `AsyncSkdAgentLoopManager`를 재사용하는 동안 training `AsyncSkdDataSource`가 붙어 있으면, validation 중에도 training future sample을 prefetch해서 promoted/carryover state를 오염시킬 수 있다.
-
-현재 trainer는 `_validate()` 동안 manager에서 training source를 잠깐 떼고 끝나면 다시 붙인다. 따라서 validation 직후에는:
-
-- validation carryover가 training source에 남지 않고
-- 다음 training step의 fresh quota / carryover count가 validation 때문에 변하지 않아야 한다
-
-### 6. 현재 VeOmni memory 레버는 active/inactive를 구분해서 본다
-
-현재 런에서 실제로 메모리/속도에 크게 듣는 축은 다음이다.
-
-- `enable_gradient_checkpointing=True`
-- `use_dynamic_bsz=True`
-- `ppo_max_token_len_per_gpu`
-- `param_offload`, `optimizer_offload`
-- rollout SGLang `gpu_memory_utilization`
-
-반대로 코드베이스에 있어도 현재 VeOmni async SKD 런에서 핵심 축으로 보면 안 되는 것들이 있다.
-
-- `TiledMLP`: 코드베이스에는 있으나 현재 VeOmni 경로의 활성 최적화로 보면 안 된다
-- entropy chunking / entropy checkpointing: 현재 pure distillation 런에서는 주역이 아니다
-- activation offload context: 코드 경로는 있으나 현재 기본은 `enable_activation_offload=False`다
-
-## 로그에서 먼저 볼 것
-
-### correctness
-- `teacher_mass_max`
-- `distillation/loss_max`
-- `AssertionError`
-- `Prompt length ... exceeds ...`
-- `distillation/loss_max` ≫ 10이면 teacher row 정렬 문제 가능성이 높다. `VERL_SKD_DEBUG=2`로 재실행하면 batch당 첫 3 sample의 token-level alignment 로그를 확인할 수 있다.
-
-### rollout dynamics
-- `[SKD] ... done=eos / max_chunks / budget_exhausted`
-- `avg_tok/chunk`
-- `accept`, `reject`, `rate`
-- `student=...ms`, `teacher=...ms`
-- `[ASYNC_SKD] step_input`
-- `[ASYNC_SKD] rollout`
-- `[ASYNC_SKD] train`
-
-### async SKD dashboard
-
-dashboard는 event log를 tail해서 scheduler worker, student replica, teacher replica, LT candidate, carryover/promoted 상태를 보여준다.
-
-현재 teacher carryover pin 관련해서는 다음 두 metric만 보면 된다.
-
-- `async_skd/teacher_pinned_carryover_count`
-- `async_skd/teacher_fallback_carryover_count`
-
-콘솔은 일반 carryover/rollout 상태만 요약하고, sticky 관측은 위 두 metric을 source of truth로 본다.
+### Text/tool async SKD
 
 ```bash
 cd /home/sogang_nlpy/verl
+conda activate skd
 
-nohup /home/sogang_nlpy/miniconda3/envs/skd/bin/python -m verl.experimental.async_skd.dashboard \
-  --event-log /home/sogang_nlpy/verl/logs/async_skd_events_live.jsonl \
-  --host 0.0.0.0 \
-  --port 10001 \
-  > /home/sogang_nlpy/verl/logs/async_skd_dashboard_live.log 2>&1 &
+bash async_skd/run_qwen35_math_async_skd_tool_fsdp.sh
 ```
 
-훈련은 `VERL_ASYNC_SKD_EVENT_LOG`가 가리키는 JSONL에 이벤트를 쓴다. 기록 보존이 필요하면 run별 event log를 만들고 `logs/async_skd_events_live.jsonl`을 symlink로 연결한다.
+특징:
 
-### training / systems
-- `step:`
-- `time/step`
-- `throughput`
-- `torch.OutOfMemoryError`
-- `ActorDiedError`
+- `default_agent_loop=skd_agent`
+- SandboxFusion tool config 사용
+- teacher-only math planning prompt 사용
+- 기본 train batch 64, response length 8192
+- validation은 `tool_agent`로 전환되어 teacher guidance 없이 student policy를 평가한다.
 
-## 현재까지 자주 나온 문제 유형
+### WebSKD mock RL
 
-1. **teacher row alignment 문제**  
-   tool response가 중간에 들어가는데 teacher row를 assistant token만 기준으로 쌓으면 `1280` pathology가 재발한다.
+먼저 mock Web/OSGym 서버를 띄운다.
 
-2. **teacher prompt로 인한 context budget 초과**  
-   teacher-only prompt를 넣으면 teacher prefix가 길어지므로 별도 reserve가 필요하다.
+```bash
+cd /home/sogang_nlpy/verl
+conda activate skd
 
-3. **tool runtime startup side effect**  
-   dataset 단계에서 tool backend를 실제로 띄우면 startup이 불안정해진다.
+nohup python async_skd/mock_server/web_osgym_mock_server.py \
+  --host 127.0.0.1 \
+  --port 18000 \
+  --log-path logs/mock_web_osgym_requests.jsonl \
+  > logs/mock_web_osgym_server.log 2>&1 &
+```
 
-4. **SGLang backend mismatch**  
-   Blackwell 환경에서 `fa3` backend가 잡히면 teacher/student SGLang server가 startup 단계에서 실패한다. 현재 기준으로는 `attention_backend=triton`, `mm_attention_backend=triton_attn`를 명시해야 한다.
+데이터셋이 없으면 생성한다.
 
-5. **포트 충돌이 레이어별로 따로 난다**  
-   Ray worker group master port 충돌과 SGLang 내부 `nccl_port` 충돌은 다른 문제다. 하나를 고쳤다고 다른 하나가 자동으로 해결되지는 않는다.
+```bash
+python async_skd/mock_server/create_mock_web_osgym_dataset.py \
+  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
+  --num-samples 64
+```
 
-6. **agent registry import 누락**  
-   `skd_agent`처럼 decorator 등록형 loop는 startup import가 빠지면 registry에서 사라진다. `Agent loop skd_agent not registered`가 뜨면 registration decorator 자체보다 package import chain을 먼저 본다.
+훈련 경로는 다음 스크립트를 사용한다.
 
-7. **actor-side OOM**  
-   긴 response + 큰 batch + update_actor backward에서 자주 난다. 이 경우 teacher가 아니라 actor mini-batch budget 문제로 보는 게 맞다.
+```bash
+bash async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh
+```
 
-8. **unsupported offload 조합**  
-   현재 코드 계약상 `param_offload=False`, `optimizer_offload=True`는 지원되지 않는다. train/eval context 진입 시 `engine.to(model=False, optimizer=True, grad=False)`가 만들어지고, base invariant assert에 걸린다.
+특징:
 
-9. **student rollout resume OOM**  
-   actor update는 통과했는데 그 다음 `update_weights -> rollout.resume(tags=["weights"])`에서 `resume_memory_occupation` timeout과 `SGLangHttpServer ... out of memory`가 나면, 이건 actor backward가 아니라 student rollout weight resume 실패다. 특히 `param_offload=False`일 때 actor residency가 GPU에 남아 있으면 이 문제가 잘 난다.
+- `default_agent_loop=web_skd_agent`
+- tool config: `examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
+- mock server 기본 endpoint: `http://127.0.0.1:18000`
+- 기본 train batch 16, response length 1024
+- teacher max model len은 기본 8073으로 student보다 여유를 둔다.
+- prefetch 기본값은 batch/worker 비율에서 계산된다.
 
-## 무엇을 먼저 의심할 것인가
+## 핵심 코드 위치
 
-문제가 생기면 아래 순서로 본다.
+### SKD 의미론
 
-1. config/context 문제인가  
-   - `teacher_system_prompt_path`
-   - teacher budget
-   - backend override (`triton` / `triton_attn`)
-   - script가 실제로 `model_engine=veomni`를 타는지
-   - validation `n`
+- `verl/experimental/agent_loop/skd_agent_loop.py`
+  - student chunk generation
+  - teacher verification
+  - first-rejection correction
+  - teacher row / response mask alignment
+  - teacher context overflow guard
 
-2. teacher alignment 문제인가  
-   - `teacher_mass_max`
-   - `loss_max`
+### Async scheduling
 
-3. rollout 자체가 너무 긴가  
-   - `done=budget_exhausted`
-   - `avg_tok/chunk`
-   - `resp_len`
+- `verl/experimental/async_skd/manager.py`
+  - current / lookahead / promoted / carryover scheduling
+  - output finalize
+- `verl/experimental/async_skd/worker.py`
+  - fresh sample과 partial carryover sample 실행 primitive
+- `verl/experimental/async_skd/source.py`
+  - future sample reservation, promoted ledger, carryover ledger
+- `verl/experimental/async_skd/metadata.py`
+  - `DataProto.concat()` / `DataProto.union()` 경계에서 non-tensor metadata key 정규화
 
-4. systems startup 문제인가  
-   - `EADDRINUSE`
-   - `DistNetworkError`
-   - `Agent loop skd_agent not registered`
-   - `fa3` / `Blackwell`
+### Teacher / SGLang
 
-5. actor update memory 문제인가  
-   - traceback이 `update_actor` / `loss.backward()`인지 확인
+- `verl/experimental/teacher_loop/teacher_manager.py`
+  - teacher routing, sticky binding, routing-key별 max model len 조회
+- `verl/workers/rollout/sglang_rollout/async_sglang_server.py`
+  - SGLang prompt-logprob delta extraction
+  - multimodal prefix surplus trimming
 
-6. student rollout resume 문제인가  
-   - traceback이 `update_weights -> rollout.resume(tags=["weights"])`인지 확인
-   - `resume_memory_occupation`
-   - `SGLangHttpServer ... out of memory`
-   - HTTP timeout 3회
+### Web / OSGym
 
-## 현재 문서 이후 읽기
+- `verl/experimental/agent_loop/web_skd_agent_loop.py`
+  - `web_skd_agent`
+  - initial observation commit
+  - tool observation commit
+  - student/teacher observation split
+  - image observation과 logical server prompt stream 유지
+- `verl/experimental/agent_loop/web_osgym_protocol.py`
+  - `POST /` protocol client
+- `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
+  - runtime-owned `web_osgym_session_id` allocation and restore
+- `verl/tools/web_osgym_tool.py`
+  - model-facing `computer` tool
+  - `actions: [...]` parsing
+  - `DONE` / `FAIL` terminal handling
+- `async_skd/mock_server`
+  - session-aware mock Web/OSGym server, client, dataset generator, reward function
 
-구현 의도와 시스템 최적화를 더 자세히 보려면 바로 다음 문서로 간다.
+## WebSKD의 현재 입력 계약
 
-- [`AGENTS/imp_detail.md`](/home/sogang_nlpy/verl/async_skd/AGENTS/imp_detail.md)
+Dataset row는 `task_id`만 제공한다. `session_id`는 dataset에서 오지 않는다.
+
+- `task_id`: 서버에 등록된 환경 task 식별자
+- `session_id`: agent loop/runtime이 trajectory 시작 시 생성하는 환경 세션 식별자
+
+같은 trajectory에서는 `start -> action* -> reward`가 모두 같은 `session_id`를 사용해야 한다. 이 계약은 이후 GRPO 계열 강화학습에서 여러 세션을 병렬로 굴릴 때 중요하다.
+
+## Student / Teacher observation split
+
+정상 visual observation:
+
+- student: screenshot image를 본다.
+- teacher: screenshot image와 a11y/text를 본다.
+
+Image-less failure observation:
+
+- image가 없으면 action 실패 원인이 `text`에만 들어있을 수 있다.
+- 이 경우 student와 teacher 모두에게 text를 제공한다.
+
+이 예외는 복구 가능한 환경 feedback을 student에게 숨기지 않기 위한 것이다.
+
+## Prompt stream 구분
+
+WebSKD에서는 두 종류의 prompt id가 의도적으로 다르다.
+
+- local prompt ids
+  - processor/chat-template 적용 후의 로컬 ids
+  - image expansion이 반영될 수 있다.
+- server prompt ids
+  - SGLang `/generate`로 보내는 logical ids
+  - teacher prompt-logprob delta의 기준이다.
+
+따라서 `server_prompt_ids`와 `teacher_server_prompt_ids`가 없으면 WebSKD는 추측하지 않고 fail-fast하거나 재계산해야 한다. local ids를 server ids로 대체하면 multimodal logprob alignment가 조용히 깨진다.
+
+## Multimodal teacher delta
+
+이미지가 포함된 prompt에서는 SGLang이 내부적으로 image token을 확장한다. 그 결과 teacher가 반환하는 prompt-logprob rows에는 logical suffix chunk 외에 multimodal prefix surplus가 섞일 수 있다.
+
+현재 구현은 surplus를 고정값으로 가정하지 않는다.
+
+- 현재 teacher local prefix length
+- 현재 teacher server logical prefix length
+- SGLang 반환 rows
+- 요청한 chunk length
+
+이 정보를 바탕으로 매 검증 시점마다 앞쪽 surplus rows를 버리고, 실제 SKD 검증 대상인 suffix chunk rows만 사용한다.
+
+## Teacher context guard
+
+학생 쪽은 response cutoff에 가까운 하드 budget으로 종료된다. 교사 쪽은 teacher-only prompt, a11y text, multimodal expansion 때문에 student보다 길어질 수 있으므로 별도 guard가 필요하다.
+
+현재 guard는 두 군데 있다.
+
+1. teacher verification 직전
+   - `teacher_server_prompt_ids + chunk`가 teacher max model len을 넘으면 teacher call 전에 정상 종료한다.
+
+2. Web tool observation commit 직전
+   - non-terminal observation을 teacher context에 넣은 뒤 최소 1 token verify 공간이 남지 않으면 observation을 commit하지 않고 정상 종료한다.
+
+종료 reason은 `teacher_context_exhausted`로 기록된다.
+
+## Async source와 dataset size
+
+lookahead prefetch는 실제 dataset row를 미리 reserve한다. 작은 dataset으로 여러 step을 돌릴 때는 current batch 외에 prefetch가 row를 더 소비한다.
+
+예를 들어 64-row mock dataset, train batch 16, prefetch가 켜진 4-step run에서는 마지막 step 전에 source가 고갈될 수 있다. 이것은 rollout crash가 아니라 source exhaustion이다. 여러 step을 안정적으로 보려면 dataset row 수를 batch + prefetch 총량보다 여유 있게 잡는다.
+
+## 로그에서 먼저 볼 것
+
+SKD health:
+
+- `[SKD_DBG]`
+- `[SKD] ... done=... accept=... reject=... rate=...`
+- `teacher_prefix_len`
+- `teacher_server_prefix_len`
+- `teacher_mm_prefix_surplus`
+- `teacher_logprobs_accumulated`
+
+Async scheduling:
+
+- `[ASYNC_SKD] rollout`
+- `lookahead_started_count`
+- `lookahead_promoted_count`
+- `lookahead_carryover_count`
+- `teacher_pinned_carryover_count`
+- `teacher_fallback_carryover_count`
+
+Trainer:
+
+- `actor/distillation/loss`
+- `actor/distillation/teacher_mass`
+- `response/aborted_ratio`
+- `critic/score/mean`
+- `Training Progress`
+
+W&B 종료 시점의 `Exception ignored in atexit callback` / closed `UnixTransport` 로그는 Ray/W&B teardown noise일 수 있다. 직전 step metric과 traceback의 실제 예외 위치를 먼저 본다.
+
+## 문서 읽는 순서
+
+1. 이 문서
+2. `AGENTS/imp_detail.md`
+3. `AGENTS/details.md`
+4. `AGENTS/warning.md`
+5. `document/async_skd/design.md`
+6. `document/web_osgym/design.md`
+7. `document/web_osgym/protocol.md`

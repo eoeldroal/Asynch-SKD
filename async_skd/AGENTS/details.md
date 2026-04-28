@@ -1,258 +1,239 @@
-# On-Policy SKD 운영 메모
+# Async SKD Details
 
-이 문서는 [`AGENTS/onboarding.md`](/home/sogang_nlpy/verl/async_skd/AGENTS/onboarding.md) 와 [`AGENTS/imp_detail.md`](/home/sogang_nlpy/verl/async_skd/AGENTS/imp_detail.md) 사이에 있는 내부 메모다.  
-목적은 구현을 미화하는 것이 아니라, 실제로 반복해서 부딪힌 실수와 판별 기준을 남겨 같은 실수를 다시 하지 않게 하는 데 있다.
+이 문서는 최근 구현과 실행에서 확인된 세부 운영 지식을 정리한다. 오래된 단발성 장애 메모는 제거하고, 지금도 재사용할 수 있는 판단 기준만 남긴다.
 
-## 서론
+## 1. Validation은 training source와 분리한다
 
-이번 축에서 반복적으로 문제를 만든 것은 세 가지였다.
+validation은 teacher-guided rollout이 아니라 student policy 평가다.
 
-1. 레이어 책임 혼동  
-   dataset, runtime, config, manager, loop의 책임을 섞으면 startup failure와 원인 미분리가 곧바로 따라왔다.
-2. 정렬 계약 위반  
-   tool/user span이 response 안에 섞이는 순간 teacher target 정렬이 조금만 틀어져도 `teacher_mass_max=128`, `distillation/loss_max=1280`이 바로 재발했다.
-3. 병목과 크래시의 혼동  
-   teacher가 느린 것, student rollout이 무거운 것, actor backward가 죽는 것은 서로 다른 문제였다.
+현재 trainer는 validation 시:
 
-이 문서는 위 세 가지를 기준으로 정리한다.
+1. `skd_agent`를 `tool_agent`로 바꾼다.
+2. `AsyncSkdAgentLoopManager`에서 training `AsyncSkdDataSource`를 잠깐 detach한다.
+3. validation 이후 source를 복원한다.
 
-## 본론
+이 격리가 없으면 validation 중에도 future training samples가 reserve되어 promoted/carryover ledger가 오염된다.
 
-### 1. Dataset 단계에서는 실제 tool을 띄우지 않는다
+정상 validation 직후에는 async scheduling metric에서 lookahead 흔적이 없어야 한다.
 
-초기에는 prompt filtering이나 schema 조회 단계에서도 tool config를 instantiate했다. 잘못된 판단이었다. dataset이 필요로 하는 것은 실행기가 아니라 `tool_schema`다. 실제 tool runtime을 dataset init에서 띄우면 startup 시 sandbox actor가 먼저 생기고, rollout 이전부터 side effect가 생긴다. 현재 원칙은 단순하다. dataset은 YAML에서 static schema만 읽고, 실제 backend는 rollout worker가 책임진다.
+```text
+lookahead_started_count=0
+lookahead_promoted_count=0
+lookahead_carryover_count=0
+```
 
-### 2. Sample마다 agent loop를 새로 만들면 대규모 배치에서 런이 무너진다
+## 2. Async lookahead는 dataset row를 실제로 소비한다
 
-초기 구조에서 sample마다 `ToolAgentLoop`를 다시 만들었고, 그 결과 sample마다 tool 객체와 sandbox execution worker도 함께 재생성됐다. 증상은 `ExecutionWorker` abort, `ActorDiedError`, step `0` 장기 정체였다. 이 문제는 알고리즘 문제가 아니라 lifetime 설계 문제였다. 현재는 worker-level cache로 정리되어, 같은 `AgentLoopWorker` 안에서는 agent loop와 tool runtime을 재사용한다.
+lookahead는 가짜 예약이 아니라 `AsyncSkdDataSource`에서 future row를 reserve한다. 따라서 작은 dataset에서는 prefetch가 source를 빠르게 소모한다.
 
-### 3. SandboxFusion 서버 readiness를 확인하지 않으면 tool 실험은 성립하지 않는다
+Web mock milestone에서 `Training Progress 75% (3/4)`까지 간 뒤 종료된 것은 rollout crash가 아니라 64-row dataset과 prefetch 설정의 조합으로 source가 고갈된 결과다.
 
-tool call이 로그에 보인다고 해서 실제 tool execution이 들어간다고 보면 안 된다. `localhost:8080/run_code`에 서버가 안 떠 있으면 tool 호출은 형식상 수행되지만 실제 결과는 `Connection refused`이고, 모델은 실패 응답만 본다. 최소 체크는 두 가지다. SandboxFusion 서버를 먼저 띄우고, `curl` 또는 단일 `code_interpreter` smoke test로 실제 출력이 반환되는지 확인한다. 이 두 단계를 건너뛰고 RL을 먼저 태우면 런은 돌아가는 척해도 실험 의미는 틀어진다.
+실험을 길게 보려면:
 
-### 4. Optional runtime component는 생성 경로뿐 아니라 정리 경로도 `None` 안전해야 한다
+- dataset row 수를 늘린다.
+- `ASYNC_SKD_PREFETCH_LIMIT`을 낮춘다.
+- `TOTAL_TRAINING_STEPS`를 dataset size에 맞춘다.
 
-`enable_global_rate_limit=False`일 때도 `release.remote`를 호출하는 경로가 남아 있어서 `NoneType.release`가 터진 적이 있다. 이 유형은 흔하다. optional component는 “안 만든다”로 끝나지 않는다. acquire, release, cleanup 모두가 `None` 안전해야 한다. 따라서 optional actor는 항상 “생성 여부”와 “생성 안 된 상태의 후속 호출”을 함께 점검한다.
+## 3. DataProto non-tensor metadata는 boundary에서 정규화한다
 
-### 5. Tool-aware SKD에서 핵심은 teacher row 정렬이다
+Async SKD에서는 fresh output, promoted output, carryover continuation output이 서로 다른 경로에서 나온다. 이때 `agent_name`, `tools_kwargs`, `extra_info` 같은 non-tensor keys가 조금만 어긋나도 `DataProto.concat()` 또는 `DataProto.union()`에서 터진다.
 
-single-turn SKD만 보면 놓치기 쉽지만, tool/user span이 response 안에 들어오면 정렬이 가장 먼저 깨진다. 예를 들어 `AAA TTT AAA`에 대해 mask가 `111 000 111`이면, assistant token에 대해서만 teacher row를 누적할 경우 뒤쪽 `AAA`가 왼쪽으로 밀린다. loss는 `response_mask=1` 위치만 보기 때문에, 그 위치가 dummy row를 먹기 시작하는 순간 pathology가 난다. 초기에 `im_end` 같은 특수 토큰 문제로 보기도 했지만 본질은 특정 토큰이 아니라 `0-mask` span 전체를 teacher 쪽에서 정확히 반영하지 않은 것이었다.
+현재 정리된 원칙:
 
-### 6. Dummy는 supervision이 아니라 dense tensor 계약을 위한 placeholder다
+- worker나 loop 내부에서 ad hoc하게 key를 맞추지 않는다.
+- `verl/experimental/async_skd/metadata.py` helper를 source of truth로 둔다.
+- concat 전에는 `align_non_tensor_keys_for_concat()`.
+- trainer union 전에는 `sync_output_non_tensor_with_input()`.
 
-“어차피 loss는 `response_mask`만 보는데 dummy가 왜 필요한가”라는 질문은 자연스럽지만, 현재 `verl` distillation 경로는 full-sequence dense tensor를 기대한다. 즉 dummy는 학습적으로 중요한 row가 아니라, full-sequence shape와 left-shift slicing 계약을 맞추기 위한 placeholder다. 정리하면, loss는 mask만 보지만 현재 코드 구조는 dense teacher tensor를 먼저 요구한다. 따라서 dummy는 불필요한 장식이 아니라 인터페이스 적합성의 일부다.
+이 경계 정규화가 없으면 다음 류의 에러가 난다.
 
-### 7. Dummy width는 runtime 추론보다 config `topk`를 source of truth로 두는 편이 낫다
+```text
+AssertionError: Key 'agent_name' is not present
+AssertionError: `agent_name` ... are not the same object
+AssertionError: key agent_name length ... is not equal to batch size
+```
 
-초기에는 첫 teacher row 길이에서 dummy width를 추론하는 방식을 떠올리기 쉽다. 그러나 현재 구조에선 `distillation.distillation_loss.topk`가 더 올바른 기준이다. teacher top-k width는 config 계약이고, runtime에서 조용히 추론하면 mismatch를 따라가 버린다. 이런 경우는 조용히 맞추는 것보다, config를 source of truth로 두고 실제 row width와 다르면 바로 assert로 잡는 편이 안전하다.
+## 4. Teacher row alignment 불변식
 
-### 8. Teacher-only system prompt는 teacher prompt stream을 별도로 가져가야 한다
+SKD target은 assistant-generated token에 대해서만 실제 teacher row를 가진다. tool/user/interact span은 KD 대상이 아니므로 dummy row를 넣고 `response_mask=0`이어야 한다.
 
-teacher에만 추가 prompt를 주고 싶다고 해서 teacher manager에서 token 몇 개를 앞에 붙이는 식으로 처리하면 안 된다. teacher manager는 이미 token sequence만 보고, message 구조와 chat template를 모른다. 또 `logprob_start_len`은 prefix 길이에 직접 민감하다. 현재 구조에서 안전한 해법은 student와 teacher prompt stream을 분리하는 것이다. 즉 `agent_data.prompt_ids`와 `agent_data.extra_fields["teacher_prompt_ids"]`를 따로 유지하고, teacher verify는 언제나 teacher stream 기준으로 수행한다.
+깨면 안 되는 불변식:
 
-### 9. Teacher-only prompt를 넣으면 teacher budget reserve도 자동으로 따라가야 한다
+```text
+len(response_mask) == len(teacher_ids_list)
+len(response_mask) == len(teacher_logprobs_list)
+```
 
-teacher-only system prompt를 넣고도 teacher `max_model_len`을 student 기준으로 그대로 두면, 실제 teacher prefix가 길어지면서 context overflow가 난다. 이건 한 번 크게 터졌다. 현재는 teacher prompt path가 켜져 있으면 teacher inference budget에 고정 512-token margin을 자동으로 더한다. 여기서 또 하나 배운 점이 있다. 이 로직을 넣을 때 `self.skd.teacher_system_prompt_path`처럼 dataclass attribute 접근을 쓰면 Hydra 경로에서 `self.skd`가 dict일 때 config init이 터진다. config layer의 기존 기조에 맞춰 nested config는 `get()` 방식으로 읽는 것이 맞다.
+tool result를 중간에 append하면서 dummy row를 빼먹으면 distillation loss가 잘못된 token에 붙는다.
 
-### 10. Validation은 student 평가 단계이지 teacher-guided rollout 재현 단계가 아니다
+## 5. First-rejection correction
 
-validation을 train과 동일한 `skd_agent` 경로로 그대로 이해하면 student 평가와 teacher guidance를 혼동하기 쉽다. 현재 구현은 validation에서도 agent-loop 경로를 타지만, trainer validation entrypoint에서 `skd_agent`를 `tool_agent`로 바꿔 student-only validation으로 처리한다. 즉 validation은 teacher-guided train rollout과 동일하지 않고, 어디까지나 student policy 자체를 본다.
+teacher verification에서 첫 rejection이 나오면:
 
-여기서 중요한 보호장치가 하나 더 있다. validation 동안에는 trainer가 `AsyncSkdAgentLoopManager`에서 training `AsyncSkdDataSource`를 잠깐 분리한다. 즉 validation은 async manager를 재사용하더라도:
+1. reject 이전 accepted prefix만 유지한다.
+2. reject 위치는 teacher top-1 token으로 교체한다.
+3. 그 뒤 student suffix는 버린다.
 
-- training future sample을 lookahead로 reserve하지 않고
-- validation 중 생긴 speculative state를 training source에 `record_promoted()` / `record_carryover()` 하지 않는다
+따라서 실제 commit된 trajectory와 teacher target이 항상 같은 sequence 위에 있어야 한다. async carryover도 이 commit 경계 밖에서만 export된다.
 
-따라서 validation이 끝난 뒤 다음 training step의 fresh quota나 carryover buffer가 오염되면 안 된다. 과거 `carryover_count=111 exceeds base_batch_size=64` 유형의 장애는 바로 이 격리가 없을 때 발생했다.
+## 6. WebSKD observation은 atomic bundle로 commit한다
 
-또 `n=4`만 준다고 `best@4`가 생기지 않는다. `do_sample=False`면 greedy 결과를 4번 복제하는 것과 다르지 않다. 실제 `mean@4`, `best@4`를 보려면 `val_kwargs.n=4`와 `do_sample=True`가 함께 필요하다.
+Web tool observation은 여러 상태를 동시에 바꾼다.
 
-### 11. Teacher가 느려 보여도 항상 teacher가 병목인 것은 아니다
+- image data
+- student messages
+- teacher messages
+- local prompt ids
+- server prompt ids
+- teacher server prompt ids
+- response mask
+- dummy teacher rows
 
-초기에는 32B teacher와 repeated prompt-logprob 때문에 teacher가 확실한 병목이었다. 하지만 Nemotron과 long response 설정으로 오면서 sample-level summary 기준으로 student cumulative time이 teacher보다 큰 런도 생겼다. 특히 `AsyncLLMServerManager.generate.total`만 보고 병목을 판단하면 student와 teacher 경로가 섞여 오판하기 쉽다. 병목 판단은 가능한 한 sample-level `[SKD] student=... teacher=...` 누적 summary를 기준으로 한다.
+이 중 일부만 들어가면 다음 carryover나 teacher verification에서 상태가 어긋난다. 현재 WebSKD는 pending observation과 tool observation 모두 tokenization/recompute/guard가 성공한 뒤 한 번에 commit한다.
 
-### 11-1. 최근 teacher 최적화의 핵심은 carryover hard pin이다
+response length cutoff나 teacher context guard에 걸리면 bundle 전체가 들어가지 않는다.
 
-teacher는 student와 달리 training 내내 별도 inference instance로 살아 있으므로, carryover sample에 대해서는 step 간 prefix-cache locality를 노릴 여지가 있다. 현재 구현은 이 점을 반영한 step-cross carryover pin 기능을 지원한다.
+## 7. WebSKD prompt stream은 두 층이다
 
-- carryover partial은 `teacher_replica_id`를 들고 넘어간다
-- manager는 `sample_id -> real teacher server_id`와 `sample_id -> teacher_routing_key`를 직접 기억한다
-- resumed carryover는 가능한 한 같은 teacher pool 안의 같은 real server로 hard pin 한다
-- base sample은 carryover pinned load를 먼저 반영한 뒤 나머지 replica로 재분배한다
+WebSKD에서는 local prompt ids와 server prompt ids가 다르다.
 
-즉 기능이 켜져 있을 때 teacher scheduling 원칙은 “reuse 우선, 이후 그 전제 하에서 balancing”이다. 다만 이 동작은 항상-on 가정이 아니다. 현재는 `actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover`로 켜고 끌 수 있다. 이 값을 `False`로 두면 carryover는 fresh처럼 다시 배치되고, `async_skd/teacher_pinned_carryover_count` / `async_skd/teacher_fallback_carryover_count`도 사실상 0 근처로 가는 것이 정상이다.
+- local prompt ids: processor-expanded ids. image가 들어가면 길이가 커질 수 있다.
+- server prompt ids: SGLang logical prompt ids. `/generate` 요청과 prompt-logprob delta 계산 기준이다.
 
-여기서 중요한 것은, 이 정책이 **base sample을 안 건드리는 것**은 아니라는 점이다. base도 teacher replica assignment를 받지만, 그 목적은 carryover reuse를 깨지 않으면서 남은 부하를 채우기 위한 rebalance다.
+따라서 WebSKD에서 `server_prompt_ids` / `teacher_server_prompt_ids`를 local ids로 fallback하는 것은 위험하다. 현재 WebSKD는 prompt stream이 없으면 fail-fast하거나 messages에서 재계산한다.
 
-그리고 더 중요한 정정이 하나 있다. 이 pin은 `teacher-replica-0` 같은 manager 내부 placeholder 이름을 쓰는 구조가 아니다. 실제 bind는 teacher load balancer가 알고 있는 **real teacher server_id**에 대해서만 유효하다. 따라서 planner의 source of truth도 real server IDs여야 하고, stale/invalid placeholder pin은 hard pin으로 인정하지 않고 pool 내부 fallback으로 처리해야 한다.
+## 8. Multimodal prefix surplus는 동적으로 처리한다
 
-현재 관측은 다음 두 metric으로 압축한다.
+이미지는 SGLang 내부에서 여러 token row로 확장될 수 있다. 이 expansion 크기는 이미지 수, 모델 processor, backend 구현에 따라 달라질 수 있으므로 고정값으로 보면 안 된다.
 
+현재 teacher logprob extraction은 다음 구조를 따른다.
+
+```text
+teacher local prefix length
+- teacher server logical prefix length
+= expected multimodal prefix surplus
+```
+
+SGLang이 반환한 prompt-logprob rows에서 surplus에 해당하는 앞부분은 SKD 검증 대상이 아니므로 버리고, 뒤쪽 suffix chunk rows만 사용한다.
+
+여러 턴에서 이미지가 누적되어도 prefix length 차이로 매번 계산하므로 고정 `219` 같은 값을 가정하지 않는다.
+
+## 9. Teacher context overflow는 graceful termination으로 처리한다
+
+교사는 student보다 긴 context를 볼 수 있다.
+
+- teacher-only system prompt
+- a11y tree
+- image expansion
+- tool observation text
+
+이 때문에 student는 아직 괜찮아도 teacher call이 max model len을 넘을 수 있다. 이 경우 SGLang server-side ValueError로 터뜨리지 않고 loop가 정상 종료해야 한다.
+
+현재 guard:
+
+- SKD chunk verify 직전: `teacher_server_prompt_ids + chunk` 길이를 검사한다.
+- Web observation commit 직전: observation을 넣은 뒤 최소 1 verified token 공간이 남는지 검사한다.
+
+초과 시 `teacher_context_exhausted`로 종료한다.
+
+## 10. Malformed computer tool payload
+
+모델이 `actions`를 schema대로 내지 않을 수 있다. 예를 들어 list 안에 dict가 아니라 string이 들어올 수 있다.
+
+이 경우를 Python `TypeError`로 trainer까지 터뜨리면 안 된다. 현재 `WebOsGymTool`은 malformed action을 action failure observation으로 바꿔 loop에 돌려준다. image가 없기 때문에 이 text는 student와 teacher 모두에게 제공된다.
+
+이 처리는 모델 형식 오류를 환경 feedback처럼 처리하기 위한 것이며, transport failure와 다르다.
+
+## 11. Session ID와 Task ID
+
+`task_id`는 dataset row에서 온다. 서버에 어떤 task를 열지 지정한다.
+
+`session_id`는 agent loop/runtime이 만든다. 같은 trajectory 안의 `start`, `action`, `reward` 요청은 모두 같은 `session_id`를 사용한다.
+
+이 둘을 섞으면 병렬 Web/OSGym training에서 서로 다른 trajectory가 같은 서버 세션을 공유하거나, 같은 trajectory가 중간에 세션을 잃는 문제가 생긴다.
+
+## 12. SGLang backend와 model len
+
+현재 실행 스크립트는 SGLang backend를 명시한다.
+
+```text
+attention_backend=triton
+mm_attention_backend=triton_attn
+```
+
+Blackwell 계열 환경에서 자동 선택된 backend가 맞지 않으면 student/teacher server startup 단계에서 깨질 수 있다.
+
+Web mock script는 teacher max model len을 student보다 크게 둔다.
+
+```text
+STUDENT_MAX_MODEL_LEN=3073
+TEACHER_MAX_MODEL_LEN=8073
+```
+
+teacher-only 정보가 늘어나면 teacher max model len과 max num batched tokens를 같이 조정한다.
+
+## 13. Actor memory 문제는 phase별로 나눈다
+
+모든 OOM을 같은 문제로 보면 안 된다.
+
+1. actor backward OOM
+   - 위치: `update_actor -> loss.backward()`
+   - 주요 레버: `ppo_max_token_len_per_gpu`, batch size, offload
+
+2. student rollout weight-resume OOM
+   - 위치: `update_weights -> rollout.resume(tags=["weights"])`
+   - 주요 레버: rollout `gpu_memory_utilization`, actor residency, offload
+
+3. unsupported offload 조합
+   - `param_offload=False`, `optimizer_offload=True`는 현재 invariant와 맞지 않는다.
+
+## 14. W&B teardown noise
+
+학습 종료 시점에 다음과 같은 로그가 나올 수 있다.
+
+```text
+Exception ignored in atexit callback
+RuntimeError: unable to perform operation on <UnixTransport closed=True ...>
+```
+
+이 로그만으로 SKD 실패라고 판단하지 않는다. 직전의 trainer step metric, Ray traceback, 실제 exception 위치를 먼저 본다. Web mock milestone에서는 이 로그가 나왔지만 step metric은 정상 기록되었다.
+
+## 15. Debug log 레벨
+
+```text
+VERL_SKD_DEBUG=0  # quiet
+VERL_SKD_DEBUG=1  # chunk summary
+VERL_SKD_DEBUG=2  # token/alignment detail
+```
+
+Web mock script는 기본 `VERL_SKD_DEBUG=2`와 `VERL_ASYNC_SKD_TRACE=2`를 사용한다. 장시간 run에서는 로그량과 성능 영향을 고려해 낮출 수 있다.
+
+## 16. 현재 가장 먼저 볼 metric
+
+Async:
+
+- `async_skd/lookahead_started_count`
+- `async_skd/lookahead_promoted_count`
+- `async_skd/lookahead_carryover_count`
 - `async_skd/teacher_pinned_carryover_count`
 - `async_skd/teacher_fallback_carryover_count`
 
-### 12. 최종 크래시는 teacher가 아니라 actor backward OOM이었다
+Distillation:
 
-teacher를 크게 바꾸고 FP8로 올리면 자연스럽게 teacher memory나 teacher latency를 먼저 의심하게 된다. 하지만 실제 최종 크래시는 rollout 이후 `update_actor`의 `loss.backward()`에서 났다. 즉 메모리 리스크는 teacher inference보다 `b128`, 긴 response, actor backward accumulation 조합에 있었다. 이 점이 중요하다. teacher top-k를 `128 -> 32`로 줄이면 teacher payload와 extraction cost는 줄지만 actor backward activation memory는 거의 직접 줄지 않는다. teacher 최적화와 actor OOM 대응은 별개로 본다.
+- `actor/distillation/loss`
+- `actor/distillation/teacher_mass`
+- `actor/distillation/teacher_mass_min`
+- `actor/distillation/loss_max`
 
-### 12-1. 다만 최근 장애는 actor backward 하나로 끝나지 않았다
+Rollout:
 
-이후 런에서는 actor backward OOM만이 아니라, actor update를 통과한 뒤:
+- `response_length/max`
+- `response_length/clip_ratio`
+- `response/aborted_ratio`
+- `[SKD] ... done=... rate=...`
 
-- `checkpoint_manager.update_weights()`
-- `WorkerDict.actor_rollout_update_weights()`
-- `self.rollout.resume(tags=["weights"])`
+Web server:
 
-경로에서 student rollout SGLang 서버가 `resume_memory_occupation`에 실패하며 죽는 문제도 나왔다.  
-즉 최근 장애는 적어도 두 축으로 나뉘어 있다.
-
-1. `update_actor -> loss.backward()`에서의 actor peak OOM
-2. `update_weights -> rollout.resume(tags=["weights"])`에서의 student rollout weight-resume OOM
-
-이 둘을 하나의 “메모리 부족”으로 뭉개면 조정 방향이 계속 엇나간다.
-
-### 12-2. `param_offload=False`는 actor util에는 유리하지만, pressure를 다음 단계로 민다
-
-offload를 끄면 actor train/eval phase 경계에서 model residency가 GPU에 남는다.  
-그 결과 actor backward util/MFU에는 유리할 수 있지만, 그 다음 student rollout이 자기 weight를 다시 GPU에 잡으려는 순간 memory collision이 날 수 있다.
-
-즉 최근 관측은 다음 패턴에 가깝다.
-
-- offload on:
-  - actor util 손해
-  - rollout resume은 상대적으로 쉬움
-- offload off:
-  - actor util 개선 가능
-  - rollout resume(weights) OOM 위험 증가
-
-따라서 offload는 단순한 “메모리 절약 옵션”이 아니라, **어느 phase에 메모리 pressure를 둘 것인가를 정하는 스위치**로 읽는 편이 맞다.
-
-### 12-3. 현재 코드에서는 optimizer-only offload를 쓸 수 없다
-
-최근에 자연스럽게 떠오른 타협안은:
-
-- `param_offload=False`
-- `optimizer_offload=True`
-
-였지만, 현재 `BaseEngine.to()` 계약상 이 조합은 지원되지 않는다.  
-context switch 시 `model=False, optimizer=True, grad=False` 호출이 만들어지고 바로 assert가 난다.
-
-즉 코드 수정 없이 실제로 쓸 수 있는 조합은 사실상:
-
-- both off
-- both on
-
-둘뿐이다.
-
-### 13. `ppo_max_token_len_per_gpu`는 sample truncation이 아니라 micro-batch budget이다
-
-이 값은 “한 sample을 몇 토큰까지만 backprop한다”는 뜻이 아니다. 정확히는 GPU 한 장이 동시에 처리하는 총 token budget 상한에 가깝다. 값을 줄이면 한 번에 묶는 sample 수가 줄고, 필요하면 micro-batch 수가 늘어난다. 즉 학습 의미를 자르는 것이 아니라 동시 처리량을 낮춰 메모리를 맞추는 것이다. 다만 이 값만 조금 줄이는 미세 조정에는 한계가 있었다. 이미 12개 micro-batch까지 쪼개고도 OOM이 난 상황에서는 `18000 -> 16000` 같은 조정보다 `batch 128 -> 64`처럼 배치 자체를 줄이는 편이 더 직접적이었다.
-
-추가로 최근 9B 런의 실제 OOM 로그를 기준으로 보면, `32768`은 분명히 공격적이었다.  
-실측치를 거칠게 역산하면 현재 workload에서 runtime-calibrated 안전선은 대략 `24k` 전후로 읽히며, 그래서 `24000 ~ 24576` 같은 값이 감이 아니라 실제 로그와 맞는 중간값 후보가 된다. 반대로 `16384`는 더 보수적인 안정값으로 볼 수 있다.
-
-**현재 실행 스크립트 기준값은 `12288`이다.** `16384`보다 더 보수적인 선택으로, offload를 켠 상태(`param_offload=True`, `optimizer_offload=True`)에서 안정성 우선으로 조정된 값이다. offload 설정이 달라지면 이 값도 함께 재검토해야 한다.
-
-### 14. `PREFETCH_LIMIT=0`은 동기 SKD가 아니다
-
-`PREFETCH_LIMIT=0`은 lookahead sample admission만 막는다. `actor_rollout_ref.rollout.agent.async_skd_mode=lookahead`와 `AsyncSkdAgentLoopManager`가 그대로 켜져 있으면 current batch는 여전히 sample-level async scheduling을 탄다. 따라서 이 설정은 “prefetch 없는 async manager ablation”이지 “기존 SKD baseline”이 아니다. 동기 baseline은 async manager를 끄거나 동기 SKD 실행 스크립트를 사용한다.
-
-### 15. Async SKD에서 promoted와 carryover는 학습 의미가 다르다
-
-promoted sample은 lookahead 중 terminal까지 끝난 sample이다. trainer는 source가 보관한 promoted input/output pair를 current batch 뒤에 붙이되, DP size divisibility를 만족하는 수만 붙인다. append되지 못한 promoted pair는 pending으로 남고 다음 기회에 학습 batch에 들어간다.
-
-carryover sample은 terminal이 아니라 exportable boundary에서 멈춘 partial이다. 다음 step의 current work 앞쪽에서 이어서 completion까지 간다. carryover는 fresh quota를 줄인다. promoted는 fresh quota를 줄이지 않는다.
-
-### 16. 지금 구현에는 `async_skd_max_old_gen_chunks` cap이 없다
-
-초기 설계 문서에는 stale continuation을 `async_skd_max_old_gen_chunks`로 제한하는 안이 있었지만, 현재 코드의 source of truth는 아니다. 현재 generation 종료 cap은 `distillation.skd.max_chunks_per_sample`이고, async lookahead는 current work가 남아 있는 동안 partial을 exportable boundary 단위로 재개한다. current가 모두 끝나면 남은 partial은 drain/carryover로 넘어간다.
-
-### 17. Nemotron train set은 mixed-task라는 점을 잊지 않는다
-
-`Nemotron-Cascade-RL-Math`는 단순 direct solving dataset이 아니다. 일반 수학 문제와 solution critique, earliest-error index task가 섞여 있다. 현재는 이걸 전부 train으로 쓴다. 따라서 전처리의 목적은 task를 억지로 하나로 바꾸는 것이 아니라 의미를 보존하는 데 있다. 현재 원칙은 `problem`을 그대로 쓰고, `answer`도 가공 없이 ground truth로 두며, `task_type`과 `source`를 추적 가능하게 남기고, `\boxed{}` carrier instruction만 제거하되 `decimal`, `base 10`, `without units` 같은 semantic format constraint는 유지하는 것이다.
-
-### 18. Reward는 대부분 버티지만, 모든 sample이 깔끔하다고 가정하면 안 된다
-
-현재 reward는 사실상 `math_verify` 기반이고, 대부분의 direct math sample에는 잘 맞는다. 하지만 mixed-task dataset이므로 index answer, decimal/base-10 formatting, 드문 비수식 answer는 잠재 리스크다. 한동안 마지막 `\boxed{}`만 먼저 채점하거나 긴 unboxed 출력을 바로 `0`으로 두는 wrapper를 실험했지만, 실제 dump 기준으로 under-score가 확인되어 그 분기는 원복했다. 현재 운영 원칙은 다시 단순하다. `solution_str` 전체를 `math_verify`에 넘기는 기존 경로를 유지하고, parseability audit이나 reward 수정은 실제 failure pattern이 충분히 쌓였을 때만 좁혀 들어간다.
-
-### 19. `math_verify` hang 문제는 scorer만이 아니라 실행 경계를 같이 봐야 한다
-
-한동안 base RL run이 step 후반에서 멈췄고, 표면상으로는 `RewardLoopWorker.compute_score`가 끝나지 않는 것처럼 보였다. 처음에는 단순히 scorer 안에 바깥 timeout만 더 두는 식으로 생각하기 쉽다. 그러나 실제 call chain은 `RewardLoopWorker -> NaiveRewardManager.run_single() -> run_in_executor(None, compute_score)`였고, 여기서 핵심은 `math_verify`가 내부 timeout 구현에 `signal.alarm()`을 쓴다는 점이었다.
-
-즉 문제의 본질은 “느린 sample이 있다”보다 더 정확히는, **timeout이 필요한 라이브러리를 thread executor 안에 넣었다**는 데 있었다. 이 상태에서 바깥 `future.result(timeout=...)`만 걸면 호출자 대기만 끊기고, 실제 scoring thread는 worker 안에서 계속 남는다. pathological case가 한 번 들어오면 worker 안에 CPU를 먹는 stray task가 남고, 이런 상태가 누적되면 결국 전체 reward path가 막힌다.
-
-그래서 이번에 건드린 축은 scorer 로직 자체보다 **실행 경계**였다. 현재 `math_verify` 경로는 lazily initialized process pool 안에서 돌고, `parse`와 `verify`는 그 child process의 main thread에서 자신의 timeout을 정상적으로 쓴다. 즉 “timeout이 필요한 코드를 main thread에서 실행한다”는 라이브러리의 전제를 맞춘 것이다. 이건 단순한 기워내기보다, 기존 thread 기반 실행 모델이 애초에 라이브러리와 맞지 않았다는 판단에 따른 수정이다.
-
-다만 이것으로 구조 문제가 완전히 끝난 것은 아니다. 지금 패치는 `math_verify` 경로를 안전하게 만든 것이지, reward execution policy 전체를 일반화한 것은 아니다. 더 근본적으로는 `RewardLoopWorker` 또는 `NaiveRewardManager` 레벨에서 sync custom reward를 어떤 격리 경계에서 돌릴지, timeout/crash를 어떻게 처리할지, worker를 언제 recycle할지를 framework policy로 올리는 편이 맞다. 정리하면 현재 patch는 **현재 장애의 직접 원인에는 맞는 수정**이지만, 장기적으로는 reward isolation 자체를 scorer 바깥 계층으로 승격해야 한다.
-
-### 20. constrained decoding은 보류했다
-
-Hermes tool calling 위에 SGLang의 trigger-based constrained decoding을 붙이는 방향을 검토했고, 실제로 parser span 계산, `response_mask` 보정, `structural_tag` 주입까지 작은 프로토타입도 만들었다. 그러나 현재 `verl`의 SKD 구조와는 정합성이 충분하지 않아, 이번 축에서는 전부 원복했다.
-
-보류 이유는 두 가지다.
-
-1. **SKD는 fresh-request chunk generation이다.**  
-   학생이 chunk를 한 번 생성할 때마다 새 request를 보내므로, partial tool-call 상태를 online grammar state로 자연스럽게 이어받기 어렵다.
-
-2. **우리가 원한 건 사후 loss masking이 아니라 online verification 제외였다.**  
-   구조 토큰을 정말 teacher supervision에서 빼려면, turn 종료 후 `response_mask`를 고치는 것이 아니라 SKD accept/reject 단계에서부터 그 토큰들을 건너뛰어야 한다. 이건 partial tool-call 상태를 안정적으로 해석하는 추가 설계가 필요하다.
-
-즉 현재 결론은 명확하다.
-
-- constrained decoding은 아이디어 자체는 유망하다
-- 하지만 지금 `verl`의 SKD 경로에 억지로 붙이면 구현 복잡도와 semantics mismatch가 크다
-- 따라서 현재 코드베이스에서는 **기존 Hermes 자유 생성 + 사후 파싱**을 유지한다
-
-이번 단계에서 하지 않는 것은 다음과 같다.
-
-- exact jump-forward provenance 복원
-- partial tool-call 상태를 위한 online structural masking
-- constrained decoding을 SKD online verification에 연결하는 것
-- nested / parallel tool call 지원
-- Qwen3-Coder 별도 XML-ish format 동시 지원
-
-즉 이 문서 기준의 현재 상태는 **constrained decoding 실험은 철회했고, 기존 `verl` tool calling contract를 유지한다**는 것이다.
-
-### 21. 최근 시스템 장애는 SKD semantics보다 startup/integration 쪽에서 더 많이 났다
-
-최근 런에서 실제로 반복된 문제는 다음 네 가지였다.
-
-1. Hydra struct override 키를 일반 override로 덮어쓰다가 startup이 깨지는 문제
-2. Blackwell 환경에서 SGLang backend가 `fa3`로 잡혀 teacher/student server가 실패하는 문제
-3. Ray master port와 SGLang 내부 `nccl_port`가 서로 다른 레이어에서 각각 충돌하는 문제
-4. `skd_agent`가 decorator 등록형인데 package import chain에서 빠져 registry에 안 올라가던 문제
-
-즉 현재는 correctness/semantics 이슈와 별개로, **시스템 startup 계층을 독립적으로 점검하는 운영 습관**이 필요하다. `AssertionError`, `ActorDiedError`, `DistNetworkError`, `EADDRINUSE`, `fa3`, `Agent loop ... not registered`는 먼저 시스템 통합 문제로 보고 분리해서 읽는다.
-
-### 22. 현재 9B 메모리 추산은 이름보다 실제 checkpoint/log를 기준으로 본다
-
-현재 student `Qwen3.5-9B`는 checkpoint total size 기준 bf16 parameter count가 약 `9.653B`다.  
-따라서 “9B니까 32k token budget도 되겠지” 같은 감은 잘 맞지 않았다.
-
-최근 actor OOM 로그를 기준으로 보면:
-
-- full bf16 weights 자체만 약 `17.98 GiB`
-- AdamW 상태와 grad residency를 더하면 static류가 이미 100 GiB대를 자연스럽게 차지할 수 있고
-- 실제 실패 step에서는 dynamic 잔여량이 대략 50 GiB 안팎까지 올라간 것으로 읽힌다
-
-즉 현재 workload에선 모델 이름보다:
-
-- 실제 시퀀스 길이 분포
-- `ppo_max_token_len_per_gpu`
-- offload 여부
-- rollout resume weight 충돌
-
-이 메모리 판단의 더 직접적인 기준이다.
-
-## 결론
-
-이번 작업에서 다시 반복하지 말아야 할 실수는 세 가지다.
-
-1. 레이어 책임을 섞지 않는다.  
-   dataset, runtime, config, manager, loop의 책임이 다르다.
-2. tool-aware SKD에서는 정렬을 최우선으로 본다.  
-   0-mask span이 끼는 순간 teacher row 정렬이 깨지면 loss pathology가 바로 난다.
-3. 병목과 크래시는 분리해서 본다.  
-   teacher가 느린 것, student rollout이 무거운 것, actor backward가 죽는 것은 같은 문제가 아니다.
-
-실제로 안정화에 가장 크게 기여한 것은 화려한 최적화보다, 위 세 가지를 뒤늦게라도 분리해서 본 것이었다.
+- `logs/mock_web_osgym_requests.jsonl`
+- same `session_id` across `start -> action* -> reward`
+- expected `task_id`
