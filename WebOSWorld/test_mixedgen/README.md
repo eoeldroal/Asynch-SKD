@@ -93,7 +93,7 @@ For the default Qwen3.5-9B student plus Qwen3.5-27B BF16 teacher setup, run:
 
 ```bash
 cd /home/sogang_nlpy/verl
-async_skd/test_mixedgen/run_qwen35_27b_bf16_dataset_probe.sh
+WebOSWorld/test_mixedgen/run_qwen35_27b_bf16_dataset_probe.sh
 ```
 
 This wrapper sets the usual defaults, converts a few prompts from
@@ -105,7 +105,7 @@ The default model paths are:
 
 - Student: `/home/sogang_nlpy/model/Qwen3.5-9B`
 - Teacher: `/home/sogang_nlpy/APSKD/checkpoints/Qwen3.5-27B`
-- Teacher-only prompt: `/home/sogang_nlpy/verl/async_skd/test_mixedgen/teacher_system_prompt_math_planning.txt`
+- Teacher-only prompt: `/home/sogang_nlpy/verl/WebOSWorld/test_mixedgen/teacher_system_prompt_math_planning.txt`
 
 The teacher path is the BF16 checkpoint, so the wrapper leaves
 `TEACHER_SGLANG_ARGS` empty by default. The probe also enables a teacher-only
@@ -114,7 +114,7 @@ stepwise math style. To check the resolved configuration and generated prompts
 without launching servers:
 
 ```bash
-PROBE_DRY_RUN=1 async_skd/test_mixedgen/run_qwen35_27b_bf16_dataset_probe.sh
+PROBE_DRY_RUN=1 WebOSWorld/test_mixedgen/run_qwen35_27b_bf16_dataset_probe.sh
 ```
 
 Useful optional overrides:
@@ -124,7 +124,7 @@ PROBE_DATASET_PATH=/home/sogang_nlpy/APSKD/data/math500/test.parquet \
 PROBE_NUM_DIRECT=4 \
 TEACHER_CUDA_VISIBLE_DEVICES=1 \
 PROBE_TEACHER_SYSTEM_PROMPT_PATH=/path/to/custom_teacher_prompt.txt \
-async_skd/test_mixedgen/run_qwen35_27b_bf16_dataset_probe.sh
+WebOSWorld/test_mixedgen/run_qwen35_27b_bf16_dataset_probe.sh
 ```
 
 ## Launch SGLang Servers
@@ -133,7 +133,7 @@ From the repo root:
 
 ```bash
 cd /home/sogang_nlpy/verl
-async_skd/test_mixedgen/launch_two_sglang_servers.sh
+WebOSWorld/test_mixedgen/launch_two_sglang_servers.sh
 ```
 
 The launcher writes:
@@ -162,7 +162,7 @@ After both SGLang servers are healthy:
 
 ```bash
 cd /home/sogang_nlpy/verl
-async_skd/test_mixedgen/run_live_mixedgen_probe.sh
+WebOSWorld/test_mixedgen/run_live_mixedgen_probe.sh
 ```
 
 The wrapper creates timestamped files:
@@ -179,7 +179,7 @@ Useful knobs:
 ```bash
 export STUDENT_URL=http://127.0.0.1:31000
 export TEACHER_URL=http://127.0.0.1:31001
-export PROBE_PROMPTS=async_skd/test_mixedgen/prompts.jsonl
+export PROBE_PROMPTS=WebOSWorld/test_mixedgen/prompts.jsonl
 export PROBE_MAX_PROMPT=1024
 export PROBE_MAX_RESPONSE=96
 export PROBE_CHUNK_SIZE=32
@@ -203,7 +203,7 @@ as the run progresses:
 
 ```bash
 export PROBE_STREAM=1
-async_skd/test_mixedgen/run_live_mixedgen_probe.sh
+WebOSWorld/test_mixedgen/run_live_mixedgen_probe.sh
 ```
 
 The wrapper starts `stream_probe.py` before `live_mixedgen_probe.py`, follows the
@@ -246,7 +246,7 @@ Replay an existing log without following for new writes:
 
 ```bash
 PYTHONPATH=/home/sogang_nlpy/verl conda run -n kd python \
-  async_skd/test_mixedgen/stream_probe.py \
+  WebOSWorld/test_mixedgen/stream_probe.py \
   --probe-log logs/live_mixedgen_probe_<timestamp>.jsonl \
   --tokenizer "${STUDENT_MODEL_PATH}" \
   --verify-top-k "${VERIFY_TOP_K:-5}"

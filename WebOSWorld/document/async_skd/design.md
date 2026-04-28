@@ -296,7 +296,7 @@ Guard 위치:
 Text/tool script:
 
 ```text
-async_skd/run_qwen35_math_async_skd_tool_fsdp.sh
+WebOSWorld/run_qwen35_math_async_skd_tool_fsdp.sh
 default_agent_loop=skd_agent
 train_batch_size=64
 max_response_length=8192
@@ -308,7 +308,7 @@ async_skd_max_promoted_per_step=48
 Web mock script:
 
 ```text
-async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh
+WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh
 default_agent_loop=web_skd_agent
 train_batch_size=16
 max_response_length=1024

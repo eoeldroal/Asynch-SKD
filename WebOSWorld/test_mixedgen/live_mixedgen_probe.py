@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 import torch
 from transformers import AutoTokenizer
 
-from async_skd.test_mixedgen.observer import JsonlProbeWriter, ObservedStudentManager, ObservedTeacherManager
+from WebOSWorld.test_mixedgen.observer import JsonlProbeWriter, ObservedStudentManager, ObservedTeacherManager
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.async_skd.state import SkdPartialState
@@ -711,7 +711,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Manual live Async SKD mixed-generation probe.")
     parser.add_argument("--student-model", required=True, help="Student model path or HF id, used for tokenizer.")
     parser.add_argument("--teacher-model", default=None, help="Teacher model path or HF id, recorded as metadata only.")
-    parser.add_argument("--prompts", default="async_skd/test_mixedgen/prompts.jsonl")
+    parser.add_argument("--prompts", default="WebOSWorld/test_mixedgen/prompts.jsonl")
     parser.add_argument("--probe-log", required=True)
     parser.add_argument("--student-url", default="http://127.0.0.1:31000")
     parser.add_argument("--teacher-url", default="http://127.0.0.1:31001")

@@ -1,13 +1,13 @@
 # Live Mixed-Gen Probe Plan
 
-Goal: add a test-only probe under `async_skd/test_mixedgen` that can attach to
+Goal: add a test-only probe under `WebOSWorld/test_mixedgen` that can attach to
 real SGLang student and teacher servers, run small Async SKD trajectories, and
 diagnose empty or very short outputs without adding noisy logging to production
 SKD code.
 
 ## Scope
 
-- Add only test/runbook files under `async_skd/test_mixedgen`.
+- Add only test/runbook files under `WebOSWorld/test_mixedgen`.
 - Do not modify production trainer, SKD loop, teacher loop, or SGLang runtime
   files for logging.
 - Use external observer wrappers around the student and teacher manager
@@ -20,14 +20,14 @@ SKD code.
 
 ## Implemented Files
 
-- `async_skd/test_mixedgen/observer.py`
+- `WebOSWorld/test_mixedgen/observer.py`
   - Thread-safe JSONL writer.
   - Student manager wrapper logs prompt length/tail, sampling params, generated
     token IDs, stop reason, and extra fields.
   - Teacher manager wrapper logs sequence length/tail, `logprob_start_len`,
     expected suffix length, returned teacher IDs/logprobs shape, and errors.
 
-- `async_skd/test_mixedgen/analyze_probe.py`
+- `WebOSWorld/test_mixedgen/analyze_probe.py`
   - Parses probe JSONL.
   - Reconstructs student chunk versus teacher top-k verification.
   - Detects first-token rejection, teacher top-1 replacement, EOS/special
@@ -36,7 +36,7 @@ SKD code.
     boundary/resume probes do not look short only because the exported partial
     is short.
 
-- `async_skd/test_mixedgen/live_mixedgen_probe.py`
+- `WebOSWorld/test_mixedgen/live_mixedgen_probe.py`
   - Attaches to existing SGLang HTTP `/generate` endpoints for student and
     teacher.
   - Builds a small text-only `SkdAgentLoop` directly.
@@ -45,18 +45,18 @@ SKD code.
     resume it, then run fresh prompts in the same probe process. It does not
     prove trainer/Ray queue interleaving.
 
-- `async_skd/test_mixedgen/run_live_mixedgen_probe.sh`
+- `WebOSWorld/test_mixedgen/run_live_mixedgen_probe.sh`
   - Runs the live probe and analyzer.
   - Defaults to `PROBE_MODE=mixed`.
 
-- `async_skd/test_mixedgen/launch_two_sglang_servers.sh`
+- `WebOSWorld/test_mixedgen/launch_two_sglang_servers.sh`
   - Convenience launcher for separate student and teacher SGLang servers.
   - Passes teacher quantization/custom flags through `TEACHER_SGLANG_ARGS`.
 
-- `async_skd/test_mixedgen/prompts.jsonl`
+- `WebOSWorld/test_mixedgen/prompts.jsonl`
   - Small deterministic math prompt set.
 
-- `async_skd/test_mixedgen/README.md`
+- `WebOSWorld/test_mixedgen/README.md`
   - Runbook, environment variables, and interpretation notes.
 
 ## Deliberate Limitations
@@ -75,15 +75,15 @@ Run from `/home/sogang_nlpy/verl`:
 
 ```bash
 PYTHONPATH=/home/sogang_nlpy/verl conda run -n kd python -m py_compile \
-  async_skd/test_mixedgen/observer.py \
-  async_skd/test_mixedgen/analyze_probe.py \
-  async_skd/test_mixedgen/live_mixedgen_probe.py
+  WebOSWorld/test_mixedgen/observer.py \
+  WebOSWorld/test_mixedgen/analyze_probe.py \
+  WebOSWorld/test_mixedgen/live_mixedgen_probe.py
 
-bash -n async_skd/test_mixedgen/run_live_mixedgen_probe.sh
-bash -n async_skd/test_mixedgen/launch_two_sglang_servers.sh
+bash -n WebOSWorld/test_mixedgen/run_live_mixedgen_probe.sh
+bash -n WebOSWorld/test_mixedgen/launch_two_sglang_servers.sh
 
 PYTHONPATH=/home/sogang_nlpy/verl conda run -n kd python \
-  async_skd/test_mixedgen/live_mixedgen_probe.py --help
+  WebOSWorld/test_mixedgen/live_mixedgen_probe.py --help
 
 git diff --check
 ```

@@ -18,7 +18,7 @@ conda activate skd
 다음 문서는 논문 draft 성격이므로 일반 문서 정리에서 수정하지 않는다.
 
 ```text
-async_skd/document/paper_draft/Implementation Detail.md
+WebOSWorld/document/paper_draft/Implementation Detail.md
 ```
 
 ## 3. Real WebGym보다 mock server를 먼저 본다

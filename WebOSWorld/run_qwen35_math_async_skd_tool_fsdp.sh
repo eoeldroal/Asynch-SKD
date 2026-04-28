@@ -51,7 +51,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.skd.chunk_size=64 \
     distillation.skd.verify_top_k=3 \
     distillation.skd.max_chunks_per_sample=512 \
-    distillation.skd.teacher_system_prompt_path=/home/sogang_nlpy/verl/async_skd/test_mixedgen/teacher_system_prompt_math_planning.txt \
+    distillation.skd.teacher_system_prompt_path=/home/sogang_nlpy/verl/WebOSWorld/test_mixedgen/teacher_system_prompt_math_planning.txt \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \

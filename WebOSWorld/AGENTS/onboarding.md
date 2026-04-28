@@ -24,7 +24,7 @@
 cd /home/sogang_nlpy/verl
 conda activate skd
 
-bash async_skd/run_qwen35_math_async_skd_tool_fsdp.sh
+bash WebOSWorld/run_qwen35_math_async_skd_tool_fsdp.sh
 ```
 
 특징:
@@ -43,7 +43,7 @@ bash async_skd/run_qwen35_math_async_skd_tool_fsdp.sh
 cd /home/sogang_nlpy/verl
 conda activate skd
 
-nohup python async_skd/mock_server/web_osgym_mock_server.py \
+nohup python WebOSWorld/mock_server/web_osgym_mock_server.py \
   --host 127.0.0.1 \
   --port 18000 \
   --log-path logs/mock_web_osgym_requests.jsonl \
@@ -53,7 +53,7 @@ nohup python async_skd/mock_server/web_osgym_mock_server.py \
 데이터셋이 없으면 생성한다.
 
 ```bash
-python async_skd/mock_server/create_mock_web_osgym_dataset.py \
+python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
   --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
   --num-samples 64
 ```
@@ -61,7 +61,7 @@ python async_skd/mock_server/create_mock_web_osgym_dataset.py \
 훈련 경로는 다음 스크립트를 사용한다.
 
 ```bash
-bash async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh
+bash WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh
 ```
 
 특징:
@@ -120,7 +120,7 @@ bash async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh
   - model-facing `computer` tool
   - `actions: [...]` parsing
   - `DONE` / `FAIL` terminal handling
-- `async_skd/mock_server`
+- `WebOSWorld/mock_server`
   - session-aware mock Web/OSGym server, client, dataset generator, reward function
 
 ## WebSKD의 현재 입력 계약

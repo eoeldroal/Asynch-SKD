@@ -58,7 +58,7 @@ export PROBE_REPETITION_PENALTY="${PROBE_REPETITION_PENALTY:-1.0}"
 
 export SGLANG_NUMA_BIND_V2="${SGLANG_NUMA_BIND_V2:-0}"
 export SGLANG_ENABLE_TORCH_INFERENCE_MODE="${SGLANG_ENABLE_TORCH_INFERENCE_MODE:-1}"
-export PROBE_TEACHER_SYSTEM_PROMPT_PATH="${PROBE_TEACHER_SYSTEM_PROMPT_PATH:-${ROOT}/async_skd/test_mixedgen/teacher_system_prompt_math_planning.txt}"
+export PROBE_TEACHER_SYSTEM_PROMPT_PATH="${PROBE_TEACHER_SYSTEM_PROMPT_PATH:-${ROOT}/WebOSWorld/test_mixedgen/teacher_system_prompt_math_planning.txt}"
 
 # Default to the BF16 teacher checkpoint. Keep extra SGLang args empty unless
 # the caller explicitly wants to test a different serving mode.
@@ -137,7 +137,7 @@ require_path "${TEACHER_MODEL_PATH}" "teacher model"
 require_path "${PROBE_DATASET_PATH}" "probe dataset"
 require_path "${PROBE_TEACHER_SYSTEM_PROMPT_PATH}" "teacher system prompt"
 
-PYTHONPATH="${ROOT}" conda run -n kd python async_skd/test_mixedgen/dataset_to_probe_prompts.py \
+PYTHONPATH="${ROOT}" conda run -n kd python WebOSWorld/test_mixedgen/dataset_to_probe_prompts.py \
   --dataset "${PROBE_DATASET_PATH}" \
   --out "${PROBE_PROMPTS}" \
   --prompt-key "${PROBE_DATASET_PROMPT_KEY}" \
@@ -179,7 +179,7 @@ if [[ "${PROBE_DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-conda run --no-capture-output -n kd bash async_skd/test_mixedgen/launch_two_sglang_servers.sh
+conda run --no-capture-output -n kd bash WebOSWorld/test_mixedgen/launch_two_sglang_servers.sh
 
 if ! wait_for_port "${STUDENT_URL}" "student" "logs/live_mixedgen_student.pid"; then
   tail -80 logs/live_mixedgen_student_sglang.log >&2 || true
@@ -190,4 +190,4 @@ if ! wait_for_port "${TEACHER_URL}" "teacher" "logs/live_mixedgen_teacher.pid"; 
   exit 1
 fi
 
-async_skd/test_mixedgen/run_live_mixedgen_probe.sh
+WebOSWorld/test_mixedgen/run_live_mixedgen_probe.sh

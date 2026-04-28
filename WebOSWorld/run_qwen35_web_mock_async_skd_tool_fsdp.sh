@@ -41,7 +41,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.use_torch_compile=True \
-    reward.custom_reward_function.path=/home/sogang_nlpy/verl/async_skd/mock_server/reward_fn_mock_web_osgym.py \
+    reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/mock_server/reward_fn_mock_web_osgym.py \
     reward.custom_reward_function.name=compute_score_mock_web_osgym \
     distillation.enabled=True \
     distillation.n_gpus_per_node=4 \

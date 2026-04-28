@@ -8,7 +8,7 @@ cd "${ROOT}"
 
 STUDENT_URL="${STUDENT_URL:-http://127.0.0.1:31000}"
 TEACHER_URL="${TEACHER_URL:-http://127.0.0.1:31001}"
-PROMPTS="${PROBE_PROMPTS:-async_skd/test_mixedgen/prompts.jsonl}"
+PROMPTS="${PROBE_PROMPTS:-WebOSWorld/test_mixedgen/prompts.jsonl}"
 TS="$(date +%Y%m%d_%H%M%S)"
 PROBE_LOG="logs/live_mixedgen_probe_${TS}.jsonl"
 SUMMARY="logs/live_mixedgen_probe_${TS}_summary.json"
@@ -98,15 +98,15 @@ if [[ "${PROBE_STREAM:-0}" == "1" ]]; then
     STREAM_ARGS+=(--force-color)
   fi
 
-  PYTHONPATH="${ROOT}" conda run --no-capture-output -n kd python async_skd/test_mixedgen/stream_probe.py \
+  PYTHONPATH="${ROOT}" conda run --no-capture-output -n kd python WebOSWorld/test_mixedgen/stream_probe.py \
     "${STREAM_ARGS[@]}" &
   STREAM_PID=$!
 fi
 
-PYTHONPATH="${ROOT}" conda run -n kd python async_skd/test_mixedgen/live_mixedgen_probe.py \
+PYTHONPATH="${ROOT}" conda run -n kd python WebOSWorld/test_mixedgen/live_mixedgen_probe.py \
   "${PROBE_ARGS[@]}"
 
-PYTHONPATH="${ROOT}" conda run -n kd python async_skd/test_mixedgen/analyze_probe.py \
+PYTHONPATH="${ROOT}" conda run -n kd python WebOSWorld/test_mixedgen/analyze_probe.py \
   --probe-log "${PROBE_LOG}" \
   --tokenizer "${STUDENT_MODEL_PATH}" \
   --verify-top-k "${VERIFY_TOP_K:-5}" \

@@ -252,14 +252,14 @@ Loop integration:
 
 Mock server assets:
 
-- `async_skd/mock_server/web_osgym_mock_server.py`
-- `async_skd/mock_server/web_osgym_mock_client.py`
-- `async_skd/mock_server/create_mock_web_osgym_dataset.py`
-- `async_skd/mock_server/reward_fn_mock_web_osgym.py`
+- `WebOSWorld/mock_server/web_osgym_mock_server.py`
+- `WebOSWorld/mock_server/web_osgym_mock_client.py`
+- `WebOSWorld/mock_server/create_mock_web_osgym_dataset.py`
+- `WebOSWorld/mock_server/reward_fn_mock_web_osgym.py`
 
 Trainer entrypoint:
 
-- `async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh`
+- `WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh`
 
 Tool config:
 
@@ -275,7 +275,7 @@ Start the mock server:
 cd /home/sogang_nlpy/verl
 conda activate skd
 
-python async_skd/mock_server/web_osgym_mock_server.py \
+python WebOSWorld/mock_server/web_osgym_mock_server.py \
   --host 127.0.0.1 \
   --port 18000 \
   --log-path logs/mock_web_osgym_requests.jsonl
@@ -284,7 +284,7 @@ python async_skd/mock_server/web_osgym_mock_server.py \
 Run the mock client:
 
 ```bash
-python async_skd/mock_server/web_osgym_mock_client.py \
+python WebOSWorld/mock_server/web_osgym_mock_client.py \
   --base-url http://127.0.0.1:18000 \
   --session-id 777 \
   --task-id 12345
@@ -303,7 +303,7 @@ All events must keep the same `session_id` and `task_id`.
 Generate the mock dataset if needed:
 
 ```bash
-python async_skd/mock_server/create_mock_web_osgym_dataset.py \
+python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
   --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
   --num-samples 64
 ```
@@ -311,7 +311,7 @@ python async_skd/mock_server/create_mock_web_osgym_dataset.py \
 Run the mock server detached:
 
 ```bash
-nohup python async_skd/mock_server/web_osgym_mock_server.py \
+nohup python WebOSWorld/mock_server/web_osgym_mock_server.py \
   --host 127.0.0.1 \
   --port 18000 \
   --log-path logs/mock_web_osgym_requests.jsonl \
@@ -321,7 +321,7 @@ nohup python async_skd/mock_server/web_osgym_mock_server.py \
 Run the trainer:
 
 ```bash
-nohup bash async_skd/run_qwen35_web_mock_async_skd_tool_fsdp.sh \
+nohup bash WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh \
   > logs/web_mock_async_skd_train.log 2>&1 &
 
 tail -f logs/web_mock_async_skd_train.log
