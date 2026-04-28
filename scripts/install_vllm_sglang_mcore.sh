@@ -5,20 +5,26 @@ USE_SGLANG=${USE_SGLANG:-1}
 
 export MAX_JOBS=32
 
+# Qwen3.5 / VeOmni baseline used by examples/grpo_trainer/run_qwen3_5-35b-a3b_veomni.sh:
+#   - transformers==5.3.0
+#   - sglang==0.5.9
+#   - flash-linear-attention==0.4.1
+#   - veomni==0.1.9a1
+
 echo "0. install uv"
 pip install uv
 
 echo "1. install inference frameworks and pytorch they need"
 if [ $USE_SGLANG -eq 1 ]; then
-    uv pip install "sglang[all]==0.5.2" && uv pip install torch-memory-saver
+    uv pip install "sglang[all]==0.5.9" && uv pip install torch-memory-saver
 fi
 uv pip install "vllm==0.11.0"
 
 echo "2. install basic packages"
-uv pip install "transformers[hf_xet]>=4.51.0" accelerate datasets peft hf-transfer \
+uv pip install "transformers[hf_xet]==5.3.0" accelerate datasets peft hf-transfer \
     "numpy<2.0.0" "pyarrow>=15.0.0" pandas "tensordict>=0.8.0,<=0.10.0,!=0.9.0" torchdata \
     ray[default] codetiming hydra-core pylatexenc qwen-vl-utils wandb dill pybind11 liger-kernel mathruler \
-    pytest py-spy pre-commit ruff tensorboard 
+    pytest py-spy pre-commit ruff tensorboard flash-linear-attention==0.4.1 veomni==0.1.9a1
 
 echo "pyext is lack of maintainace and cannot work with python 3.12."
 echo "if you need it for prime code rewarding, please install using patched fork:"
@@ -54,5 +60,11 @@ if [ $USE_MEGATRON -eq 1 ]; then
     echo "6. Install cudnn python package (avoid being overridden)"
     uv pip install nvidia-cudnn-cu12==9.10.2.21
 fi
+
+echo "7. Pin CuPy for numpy<2.0 compatibility"
+# cupy-cuda12x 14.x requires numpy>=2.0, while this environment pins
+# numpy<2.0 for verl and related training dependencies. Keep numpy fixed and
+# install the newest CuPy 13.x wheel that supports Python 3.12 and CUDA 12.x.
+uv pip install --no-deps "cupy-cuda12x==13.6.0" "fastrlock==0.8.3"
 
 echo "Successfully installed all packages"
