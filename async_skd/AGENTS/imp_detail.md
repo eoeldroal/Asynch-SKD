@@ -254,6 +254,12 @@ tool runtime은 sample마다 새로 초기화하면 actor churn이 급격히 커
 
 tool backend는 global rate limiter가 없는 설정도 정상 처리하도록 수정되었다. 이를 통해 local sandbox execution 환경에서 불필요한 singleton rate-limiter failure chain을 피할 수 있다.
 
+### 4. Web / OS Gym protocol smoke는 mock server를 먼저 사용한다
+
+Web / OS Gym 계열 환경은 stateful remote environment이므로, 실제 WebGym/Omnibox stack을 바로 붙이면 environment readiness와 agent-loop wiring 문제가 섞인다. 현재는 [`async_skd/mock_server`](/home/sogang_nlpy/verl/async_skd/mock_server) 아래에 protocol-compatible mock server/client를 둔다.
+
+mock server의 책임은 `GET /health`, `POST /`, `op=start/action/reward`, client-owned integer `session_id`, base64 PNG observation, JSONL request logging으로 제한한다. 이 단계에서 확인하는 것은 모델 품질이 아니라 wire contract다. 즉 `start -> action -> action(DONE) -> reward`가 같은 `session_id`와 `task_id`로 기록되는지를 먼저 본다. 이후에만 `WebOsGymTool` / `web_skd_agent` / trainer 경로를 붙인다.
+
 ## Validation Protocol의 분리
 
 validation은 train-time teacher guidance를 그대로 재현하는 단계가 아니라, **student policy 자체를 평가하는 단계**로 정의한다. 현재 구현은 validation에서도 agent-loop 경로를 타지만, trainer validation entrypoint에서 `skd_agent`를 `tool_agent`로 바꿔 teacher verification 없이 student-only validation으로 처리한다. 따라서 train-time teacher-guided rollout과 동일하지 않다.

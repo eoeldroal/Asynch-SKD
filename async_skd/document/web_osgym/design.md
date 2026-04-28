@@ -6,7 +6,7 @@
 
 여기서 말하는 environment는 다음 특성을 가진다.
 
-- 외부 서버가 세션을 관리한다
+- 외부 서버가 client가 지정한 `session_id`를 기준으로 세션 상태를 관리한다
 - observation은 screenshot과 a11y tree를 포함한다
 - action은 `computer_13` 계열 low-level action schema를 따른다
 - 최종 reward는 environment가 계산해 응답한다
@@ -57,7 +57,7 @@
 
 세션을 열고 최초 observation을 가져온다.
 
-- 입력: `task_id`, `request_id`, 기타 시작 옵션
+- 입력: `task_id`, `session_id`, 기타 시작 옵션
 - 출력: 최초 screenshot, a11y tree
 
 ### 4.2 Action
@@ -133,6 +133,8 @@ environment interaction이 끝난 상태다.
 
 이 원칙 때문에 최초 `start` 응답은 단순 side-effect가 아니라,  
 **실질적인 initial observation**으로 취급되어야 한다.
+
+SKD 경로에서는 a11y/text observation을 teacher-only auxiliary channel로 취급할 수 있다. 단, environment가 screenshot을 반환하지 못하는 action failure 계열 응답에서는 text 자체가 복구에 필요한 환경 feedback이므로 student와 teacher가 모두 볼 수 있어야 한다.
 
 ## 7. Action 표현 원칙
 
@@ -228,6 +230,7 @@ loop는 일관성을 위해 동일한 종료 수순을 따라야 한다.
 
 따라서 다음 원칙이 필요하다.
 
+- `session_id`는 client/runtime이 생성하고 environment server는 이를 세션 키로 사용한다
 - 세션 시작은 한 trajectory당 한 번이어야 한다
 - action은 같은 세션 위에서 순차적으로 누적되어야 한다
 - 종료 후에는 reward를 회수하고 세션을 닫아야 한다
@@ -245,6 +248,7 @@ action failure 응답은 정책에게 중요한 observation일 수 있다.
 따라서 기본 원칙은:
 
 - action failure는 가능하면 **관측 가능한 환경 응답**으로 모델에 다시 보여준다
+- screenshot을 반환할 수 없는 failure 응답에서는 text가 실패 원인을 담는 shared observation이 된다
 - 단순히 예외를 던지고 trajectory를 끊는 방향은 기본값이 아니다
 
 즉 실패도 environment state의 일부로 취급한다.

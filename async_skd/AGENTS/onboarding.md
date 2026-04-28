@@ -21,6 +21,7 @@
 
 - `skd_agent` 기반 chunked generation + teacher verification
 - tool-aware multi-turn rollout (`code_interpreter`)
+- Web / OS Gym 계열 원격 환경 통합은 `web_skd_agent`와 `computer` tool 경로로 분리되어 있으며, 실서버를 바로 붙이기 전에는 `async_skd/mock_server`의 mock Web/OSGym server/client로 protocol을 먼저 확인한다
 - teacher-only system prompt 지원
 - bounded async SKD lookahead (`AsyncSkdAgentLoopManager`)
 - distillation `forward_kl_topk` with `topk=32`
@@ -61,6 +62,10 @@
 7. trainer 조립
    [`ray_trainer.py`](/home/sogang_nlpy/verl/verl/trainer/ppo/ray_trainer.py)
    actor/rollout/teacher resource pool 조립, validation, async rollout manager 생성, Ray worker group wiring이 여기 있다.
+
+8. Web / OS Gym mock protocol 확인
+   [`web_osgym_mock_server.py`](/home/sogang_nlpy/verl/async_skd/mock_server/web_osgym_mock_server.py), [`web_osgym_mock_client.py`](/home/sogang_nlpy/verl/async_skd/mock_server/web_osgym_mock_client.py)
+   실제 WebGym/Omnibox를 붙이기 전, `session_id`, `task_id`, `start/action/reward`, image base64, JSONL request logging이 protocol대로 동작하는지 확인하는 최소 환경이다.
 
 ## 현재 실험에서 중요한 입력/리소스
 
@@ -121,6 +126,12 @@
 - `trainer.resume_mode=disable`: 체크포인트 resume 비활성화 (fresh start)
 
 `PREFETCH_LIMIT=0`은 lookahead prefetch만 끈다. 이 경우에도 `AsyncSkdAgentLoopManager`의 sample-level current scheduling은 남으므로 기존 동기 SKD와 완전히 같다고 보면 안 된다. 동기 baseline은 동기 SKD 스크립트를 따로 사용한다.
+
+### Web / OS Gym mock server
+
+Web / OS Gym 경로는 실서버를 바로 붙이면 browser/Omnibox/Redis/외부 사이트 상태가 함께 섞인다. 먼저 [`async_skd/mock_server`](/home/sogang_nlpy/verl/async_skd/mock_server)의 server/client로 wire contract를 확인한다.
+
+확인 기준은 단순하다. `logs/mock_web_osgym_requests.jsonl`에 `start -> action -> action -> reward` 순서가 같은 `session_id`와 `task_id`로 기록되어야 한다. 구체 명령은 [`document/web_osgym/implementation_plan.md`](/home/sogang_nlpy/verl/async_skd/document/web_osgym/implementation_plan.md)를 본다.
 
 ## 구현에서 기억할 핵심 계약
 

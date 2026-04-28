@@ -82,8 +82,15 @@ tool call 로그가 보인다고 해서 sandbox execution이 실제로 성공했
 - `AgentLoopWorker`
 - `SGLangHttpServer`
 - `ExecutionWorker`
+- `web_osgym_mock_server.py`
 - `wandb`
 - `gpu_stats`
+
+### 4-1. Web / OS Gym은 mock protocol 확인을 먼저 한다
+
+WebGym/OSWorld 계열 실서버는 browser session, Omnibox, Redis, 외부 사이트 상태가 함께 움직인다. 따라서 agent-loop 연결 문제를 볼 때 실서버부터 붙이면 원인 분리가 어렵다.
+
+Web / OS Gym 경로를 건드렸다면 먼저 `async_skd/mock_server`의 mock server/client로 `session_id`, `task_id`, action list, `DONE` 이후 reward, JSONL 로그를 확인한다. mock protocol이 통과한 뒤에만 실제 WebGym/Omnibox stack 문제를 본다.
 
 ### 5. 포트 충돌은 레이어를 구분해서 본다
 
