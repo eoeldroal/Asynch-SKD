@@ -166,6 +166,64 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _missing_non_tensor_value(key: str) -> Any:
+    if key == "multi_modal_inputs":
+        return {}
+    return None
+
+
+def _align_non_tensor_keys_for_concat(data: list[DataProto]) -> list[DataProto]:
+    """Make DataProto.concat safe for async-SKD batches with optional metadata.
+
+    Async-SKD promoted samples can carry extra output metadata that the current
+    base rollout does not have, e.g. restored input fields such as agent_name or
+    multimodal postprocess metadata. DataProto.concat expects every item to have
+    the same non-tensor keys, so align the dictionaries here instead of relying
+    on whichever sample happens to be first.
+    """
+    if not data:
+        return data
+
+    all_keys = set()
+    for item in data:
+        all_keys.update(item.non_tensor_batch.keys())
+
+    for item in data:
+        batch_size = len(item)
+        for key in all_keys:
+            if key in item.non_tensor_batch:
+                continue
+            values = np.empty(batch_size, dtype=object)
+            values[:] = [_missing_non_tensor_value(key) for _ in range(batch_size)]
+            item.non_tensor_batch[key] = values
+    return data
+
+
+def _sync_output_non_tensor_with_input(input_batch: DataProto, output_batch: DataProto) -> DataProto:
+    """Keep duplicated input metadata identical before DataProto.union.
+
+    Rollout outputs may echo input non-tensor fields such as agent_name, uid, or
+    reward_model, while async-SKD promoted outputs can have a different optional
+    key set from the current base rollout. Those duplicated fields are input
+    identity/config metadata; the input batch is the canonical owner. If the
+    output batch needs padding for concat, copy overlapping metadata back from
+    the assembled input batch so DataProto.union only sees equal duplicates.
+    """
+    if len(input_batch) != len(output_batch):
+        raise ValueError(
+            "input/output batch size must match before syncing non-tensor metadata: "
+            f"{len(input_batch)} != {len(output_batch)}"
+        )
+
+    output_owned_keys = {"multi_modal_inputs", "__num_turns__"}
+    for key, value in input_batch.non_tensor_batch.items():
+        if key in output_owned_keys:
+            continue
+        if key in output_batch.non_tensor_batch:
+            output_batch.non_tensor_batch[key] = value.copy()
+    return output_batch
+
+
 def _assemble_async_skd_training_batch(
     base_input_batch: DataProto,
     base_output_batch: DataProto,
@@ -195,8 +253,9 @@ def _assemble_async_skd_training_batch(
     if not promoted_inputs:
         return base_input_batch, base_output_batch
 
-    merged_input = DataProto.concat([base_input_batch, *promoted_inputs])
-    merged_output = DataProto.concat([base_output_batch, *promoted_outputs])
+    merged_input = DataProto.concat(_align_non_tensor_keys_for_concat([base_input_batch, *promoted_inputs]))
+    merged_output = DataProto.concat(_align_non_tensor_keys_for_concat([base_output_batch, *promoted_outputs]))
+    merged_output = _sync_output_non_tensor_with_input(merged_input, merged_output)
     return merged_input, merged_output
 
 

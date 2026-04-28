@@ -99,3 +99,59 @@ def test_async_skd_training_batch_respects_promoted_cap_and_preserves_fifo_overf
     assert [batch.non_tensor_batch["uid"].tolist()[0] for batch in remaining_outputs] == [
         f"promoted-{i}" for i in range(48, 64)
     ]
+
+
+def test_async_skd_training_batch_aligns_output_non_tensor_keys_before_concat():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    promoted_input = _single_sample_batch("promoted-0", 0)
+    promoted_input.non_tensor_batch["agent_name"] = np.array(["web_skd_agent"], dtype=object)
+    promoted_output = _single_sample_batch("promoted-0", 10)
+    promoted_output.non_tensor_batch["agent_name"] = np.array(["web_skd_agent"], dtype=object)
+    promoted_output.non_tensor_batch["multi_modal_inputs"] = np.array([{"image_grid_thw": torch.tensor([[1, 2, 3]])}], dtype=object)
+    source._reserved_input_batches["promoted-0"] = promoted_input
+    source.record_promoted([_completed("promoted-0", promoted_output)])
+
+    base_input_batch = _base_batch(1000, 1)
+    base_output_batch = _base_batch(2000, 1)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=1,
+    )
+
+    assert len(merged_input) == 2
+    assert len(merged_output) == 2
+    assert merged_output.non_tensor_batch["agent_name"].tolist() == [None, "web_skd_agent"]
+    assert merged_output.non_tensor_batch["multi_modal_inputs"][0] == {}
+    assert "image_grid_thw" in merged_output.non_tensor_batch["multi_modal_inputs"][1]
+
+
+def test_async_skd_training_batch_keeps_union_metadata_consistent():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    promoted_input = _single_sample_batch("promoted-0", 0)
+    promoted_input.non_tensor_batch["agent_name"] = np.array(["web_skd_agent"], dtype=object)
+    promoted_output = _single_sample_batch("promoted-0", 0)
+    promoted_output.non_tensor_batch["agent_name"] = np.array(["web_skd_agent"], dtype=object)
+    source._reserved_input_batches["promoted-0"] = promoted_input
+    source.record_promoted([_completed("promoted-0", promoted_output)])
+
+    base_input_batch = _base_batch(1000, 1)
+    base_input_batch.non_tensor_batch["agent_name"] = np.array(["web_skd_agent"], dtype=object)
+    base_output_batch = _base_batch(1000, 1)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=1,
+    )
+
+    assert merged_input.non_tensor_batch["agent_name"].tolist() == ["web_skd_agent", "web_skd_agent"]
+    assert merged_output.non_tensor_batch["agent_name"].tolist() == ["web_skd_agent", "web_skd_agent"]
+    merged_input.union(merged_output)
