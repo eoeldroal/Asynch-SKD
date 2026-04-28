@@ -122,6 +122,36 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(agent_data.extra_fields["web_osgym_teacher_observation_text"].startswith("A11Y_TREE"))
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [7, 8, 9])
 
+    async def test_pending_discards_whole_start_bundle_when_tokenization_fails(self):
+        loop = _build_loop()
+
+        async def _failing_apply_chat_template(messages, **kwargs):
+            raise RuntimeError("tokenization failed")
+
+        loop.apply_chat_template = _failing_apply_chat_template
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345", "request_id": 101}}},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+
+        with self.assertRaisesRegex(RuntimeError, "tokenization failed"):
+            await WebSkdAgentLoop._handle_pending_state(loop, agent_data, {})
+
+        self.assertEqual(agent_data.messages, [{"role": "user", "content": "task"}])
+        self.assertEqual(agent_data.image_data, [])
+        self.assertEqual(agent_data.prompt_ids, [])
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
+
     async def test_processing_tools_keeps_error_text_for_student_but_not_a11y(self):
         loop = _build_loop()
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
@@ -175,6 +205,113 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.metrics["web_osgym/action_count"], 2)
         self.assertEqual(len(agent_data.extra_fields["teacher_ids_list"]), len(agent_data.response_mask))
         self.assertEqual(len(agent_data.extra_fields["teacher_logprobs_list"]), len(agent_data.response_mask))
+
+    async def test_processing_tools_requires_existing_server_prompt_stream(self):
+        loop = _build_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                },
+            )()
+        ]
+
+        with self.assertRaisesRegex(ValueError, "server_prompt_ids"):
+            await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+    async def test_processing_tools_requires_teacher_streams_before_committing_bundle(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _ImageFakeTool()}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                },
+            )()
+        ]
+        before_messages = deepcopy(agent_data.messages)
+        before_prompt_ids = list(agent_data.prompt_ids)
+
+        with self.assertRaisesRegex(ValueError, "teacher_server_prompt_ids"):
+            await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(agent_data.messages, before_messages)
+        self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
+        self.assertEqual(agent_data.response_mask, [])
+        self.assertEqual(agent_data.image_data, [])
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [1, 2, 3])
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3])
+        self.assertEqual(agent_data.extra_fields["web_osgym_teacher_messages"], [{"role": "user", "content": "task"}])
 
     async def test_processing_tools_discards_whole_observation_bundle_on_response_cutoff(self):
         loop = _build_loop()

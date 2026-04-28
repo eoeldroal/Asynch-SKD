@@ -1,5 +1,8 @@
+from collections.abc import Mapping
 from typing import Any, Optional
 from uuid import uuid4
+
+from pydantic import ValidationError
 
 from verl.experimental.agent_loop.web_osgym_protocol import WebOsGymAction, WebOsGymClient
 from verl.tools.base_tool import BaseTool
@@ -56,10 +59,22 @@ class WebOsGymTool(BaseTool):
         return instance_id, ToolResponse(**response_kwargs)
 
     def _parse_actions(self, parameters: dict[str, Any]) -> list[WebOsGymAction]:
+        if not isinstance(parameters, Mapping):
+            raise ValueError(f"computer tool arguments must be an object, got {type(parameters).__name__}")
+
         raw_actions = parameters.get("actions")
-        if not raw_actions:
+        if not isinstance(raw_actions, list) or not raw_actions:
             raise ValueError("computer tool requires a non-empty actions list")
-        actions = [WebOsGymAction(**raw_action) for raw_action in raw_actions]
+
+        actions = []
+        for index, raw_action in enumerate(raw_actions):
+            if not isinstance(raw_action, Mapping):
+                raise ValueError(
+                    f"computer tool actions[{index}] must be an object matching the action schema, "
+                    f"got {type(raw_action).__name__}"
+                )
+            actions.append(WebOsGymAction(**raw_action))
+
         terminal_actions = [action for action in actions if action.action_type in {"DONE", "FAIL"}]
         if terminal_actions and len(actions) != 1:
             raise ValueError("DONE/FAIL must be sent as a standalone action list")
@@ -68,7 +83,16 @@ class WebOsGymTool(BaseTool):
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float | None, dict]:
         del kwargs
         state = self._instance_dict[instance_id]
-        actions = self._parse_actions(parameters)
+        try:
+            actions = self._parse_actions(parameters)
+        except (TypeError, ValueError, ValidationError) as exc:
+            return ToolResponse(text=f"Invalid computer action payload: {exc}"), None, {
+                "terminated": False,
+                "termination_reason": None,
+                "action_count": 0,
+                "invalid_action": True,
+            }
+
         response = await self.client.action(
             request_id=state["request_id"],
             task_id=state["task_id"],

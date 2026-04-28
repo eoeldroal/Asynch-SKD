@@ -136,6 +136,48 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["actions"][0].action_type, "MOVE_TO")
         self.assertEqual(seen["actions"][1].action_type, "CLICK")
 
+    async def test_tool_execute_returns_observation_for_invalid_action_item(self):
+        class _FakeClient:
+            def __init__(self):
+                self.action_called = False
+
+            async def action(self, **kwargs):
+                self.action_called = True
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+
+        response, reward, metrics = await tool.execute("i1", {"actions": ["DONE"]})
+
+        self.assertIn("Invalid computer action payload", response.text)
+        self.assertIsNone(reward)
+        self.assertFalse(metrics["terminated"])
+        self.assertTrue(metrics["invalid_action"])
+        self.assertEqual(metrics["action_count"], 0)
+        self.assertFalse(tool.client.action_called)
+
+    async def test_tool_execute_returns_observation_for_non_object_arguments(self):
+        class _FakeClient:
+            def __init__(self):
+                self.action_called = False
+
+            async def action(self, **kwargs):
+                self.action_called = True
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+
+        response, reward, metrics = await tool.execute("i1", ["DONE"])
+
+        self.assertIn("computer tool arguments must be an object", response.text)
+        self.assertIsNone(reward)
+        self.assertFalse(metrics["terminated"])
+        self.assertTrue(metrics["invalid_action"])
+        self.assertEqual(metrics["action_count"], 0)
+        self.assertFalse(tool.client.action_called)
+
     async def test_tool_calc_reward_uses_existing_session_request_id(self):
         class _FakeClient:
             async def reward(self, **kwargs):

@@ -9,6 +9,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
+from verl.tools.schemas import ToolResponse
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.tokenizer import normalize_token_ids
 
@@ -44,6 +45,21 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 content.append({"type": "text", "text": tool_response_text})
             return {"role": "tool", "content": content}
         return {"role": "tool", "content": tool_response_text or ""}
+
+    def _require_prompt_stream(self, agent_data: AgentData, key: str) -> list[int]:
+        stream = agent_data.extra_fields.get(key)
+        if not isinstance(stream, list):
+            raise ValueError(f"WebSKD requires {key} to be initialized before committing tool observations")
+        return stream
+
+    @staticmethod
+    def _prospective_image_data(agent_data: AgentData, new_images: list[Any] | None) -> list[Any] | None:
+        image_data = list(agent_data.image_data) if agent_data.image_data is not None else None
+        if new_images:
+            if image_data is None:
+                image_data = []
+            image_data.extend(new_images)
+        return image_data
 
     async def _recompute_teacher_prompt_ids(self, agent_data: AgentData) -> list[int]:
         teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
@@ -104,30 +120,44 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         del sampling_params
         start_response = await self._start_web_osgym_session(agent_data, include_a11y=True)
         student_obs, teacher_obs = self._split_env_observation(start_response.text, start_response.image)
-        self._extend_image_data(agent_data, start_response.image)
+        next_image_data = self._prospective_image_data(agent_data, start_response.image)
 
         base_messages = deepcopy(agent_data.messages)
+        student_messages = deepcopy(base_messages)
         teacher_messages = deepcopy(base_messages)
 
         if student_obs or start_response.image:
-            agent_data.messages.append(self._build_tool_message(student_obs, start_response.image))
+            student_messages.append(self._build_tool_message(student_obs, start_response.image))
         if teacher_obs or start_response.image:
             teacher_messages.append(self._build_tool_message(teacher_obs, start_response.image))
 
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
-        agent_data.prompt_ids = await self.apply_chat_template(
-            agent_data.messages,
+        prompt_ids = await self.apply_chat_template(
+            student_messages,
             tools=schemas,
-            images=agent_data.image_data,
+            images=next_image_data,
             videos=agent_data.video_data,
         )
-        agent_data.extra_fields["server_prompt_ids"] = await self._recompute_server_prompt_ids(
-            agent_data, agent_data.messages
+        server_prompt_ids = await self._recompute_server_prompt_ids(
+            agent_data, student_messages
         )
+        teacher_template_messages = self._build_teacher_messages(deepcopy(teacher_messages))
+        teacher_prompt_ids = await self.apply_chat_template(
+            teacher_template_messages,
+            tools=schemas,
+            images=next_image_data,
+            videos=agent_data.video_data,
+        )
+        teacher_server_prompt_ids = await self._apply_server_chat_template(teacher_template_messages, tools=schemas)
+
+        agent_data.image_data = next_image_data
+        agent_data.messages = student_messages
+        agent_data.prompt_ids = prompt_ids
+        agent_data.extra_fields["server_prompt_ids"] = server_prompt_ids
         agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
-        agent_data.extra_fields["teacher_prompt_ids"] = await self._recompute_teacher_prompt_ids(agent_data)
-        agent_data.extra_fields["teacher_server_prompt_ids"] = await self._recompute_teacher_server_prompt_ids(agent_data)
+        agent_data.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
+        agent_data.extra_fields["teacher_server_prompt_ids"] = teacher_server_prompt_ids
         return AgentState.GENERATING
 
     def _restore_partial_state(self, partial_state):
@@ -138,12 +168,24 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         tool_call = agent_data.tool_calls[0]
-        tool_args = json.loads(tool_call.arguments)
         self._ensure_web_osgym_session(agent_data)
-        tool = self._get_active_tool(agent_data)
-        instance_id = agent_data.extra_fields["web_osgym_instance_id"]
-        tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
+        try:
+            tool_args = json.loads(tool_call.arguments)
+        except (json.JSONDecodeError, TypeError) as exc:
+            tool_response = ToolResponse(text=f"Invalid JSON in arguments for 'computer': {exc}")
+            result = {
+                "terminated": False,
+                "termination_reason": None,
+                "action_count": 0,
+                "invalid_action": True,
+            }
+        else:
+            tool = self._get_active_tool(agent_data)
+            instance_id = agent_data.extra_fields["web_osgym_instance_id"]
+            tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
         agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)
+        if result.get("invalid_action"):
+            agent_data.metrics["web_osgym/invalid_action"] = 1
 
         student_obs, teacher_obs = self._split_env_observation(tool_response.text, tool_response.image)
         image_data = tool_response.image if tool_response.image else None
@@ -190,6 +232,16 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_response_budget_exhausted")
             return AgentState.TERMINATED
 
+        server_prompt_ids = None
+        if student_message is not None:
+            server_prompt_ids = self._require_prompt_stream(agent_data, "server_prompt_ids")
+
+        teacher_prompt_ids = None
+        teacher_server_prompt_ids = None
+        if teacher_message is not None:
+            teacher_prompt_ids = self._require_prompt_stream(agent_data, "teacher_prompt_ids")
+            teacher_server_prompt_ids = self._require_prompt_stream(agent_data, "teacher_server_prompt_ids")
+
         if image_data:
             self._extend_image_data(agent_data, image_data)
 
@@ -198,8 +250,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             agent_data.messages.append(student_message)
             appended_len = len(response_ids)
             agent_data.prompt_ids += response_ids
-            agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids[:-appended_len]))
-            agent_data.extra_fields["server_prompt_ids"].extend(server_response_ids)
+            server_prompt_ids.extend(server_response_ids)
             agent_data.response_mask += [0] * appended_len
             if agent_data.response_logprobs:
                 agent_data.response_logprobs += [0.0] * appended_len
@@ -208,10 +259,8 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
         if teacher_message is not None:
             teacher_messages.append(teacher_message)
-            teacher_prompt_ids = agent_data.extra_fields.setdefault("teacher_prompt_ids", [])
-            agent_data.extra_fields.setdefault("teacher_server_prompt_ids", list(teacher_prompt_ids))
             teacher_prompt_ids.extend(teacher_response_ids)
-            agent_data.extra_fields["teacher_server_prompt_ids"].extend(teacher_server_response_ids)
+            teacher_server_prompt_ids.extend(teacher_server_response_ids)
         agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
 
