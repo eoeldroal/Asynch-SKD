@@ -112,6 +112,10 @@ class AsyncTeacherLLMServerManager:
             for teacher_key, server_manager in self.server_managers.items()
         }
 
+    def max_model_len_for_routing_key(self, routing_key: Optional[str] = None) -> Optional[int]:
+        teacher_key = self._resolve_teacher_key(routing_key)
+        return self.teacher_model_configs[teacher_key].inference.max_model_len
+
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
             # Single-teacher path: route everything to the one teacher regardless of the sample's key.

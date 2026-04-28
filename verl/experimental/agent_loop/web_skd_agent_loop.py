@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from copy import deepcopy
 from typing import Any
 from uuid import uuid4
@@ -115,6 +116,39 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         teacher_messages = self._build_teacher_messages(teacher_messages)
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         return await self._apply_server_chat_template(teacher_messages, tools=schemas)
+
+    async def _terminate_if_teacher_prefix_overflows(
+        self,
+        agent_data: AgentData,
+        *,
+        prefix_len: int,
+        stage: str,
+    ) -> bool:
+        """Terminate before committing a teacher prefix that cannot be verified further."""
+        teacher_routing_key = agent_data.extra_fields.get("teacher_routing_key")
+        teacher_overflow, teacher_max_model_len, teacher_required_len = self._teacher_future_verify_overflows(
+            prefix_len=prefix_len,
+            routing_key=teacher_routing_key,
+        )
+        if not teacher_overflow:
+            return False
+
+        termination_reason = "teacher_context_exhausted"
+        agent_data.extra_fields["skd_termination_reason"] = termination_reason
+        agent_data.extra_fields["skd_teacher_context_required_len"] = teacher_required_len
+        agent_data.extra_fields["skd_teacher_max_model_len"] = teacher_max_model_len
+        agent_data.extra_fields["skd_teacher_context_exhausted_stage"] = stage
+        warnings.warn(
+            "[WebSKD] terminating before committing teacher observation because teacher context would overflow: "
+            f"req={agent_data.request_id} "
+            f"stage={stage} "
+            f"prefix_len={prefix_len} "
+            f"required_len={teacher_required_len} "
+            f"max_model_len={teacher_max_model_len}",
+            stacklevel=1,
+        )
+        await self._finalize_with_web_osgym_reward(agent_data, termination_reason=termination_reason)
+        return True
 
     async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
         del sampling_params
@@ -241,6 +275,12 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         if teacher_message is not None:
             teacher_prompt_ids = self._require_prompt_stream(agent_data, "teacher_prompt_ids")
             teacher_server_prompt_ids = self._require_prompt_stream(agent_data, "teacher_server_prompt_ids")
+            if not result.get("terminated") and await self._terminate_if_teacher_prefix_overflows(
+                agent_data,
+                prefix_len=len(teacher_server_prompt_ids) + len(teacher_server_response_ids),
+                stage="tool_observation",
+            ):
+                return AgentState.TERMINATED
 
         if image_data:
             self._extend_image_data(agent_data, image_data)

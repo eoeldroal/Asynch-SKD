@@ -262,6 +262,61 @@ class SkdAgentLoop(ToolAgentLoop):
         teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(count)])
         teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(count)])
 
+    def _teacher_max_model_len(self, routing_key: Any = None) -> int | None:
+        """Return the configured teacher context limit when the manager exposes it."""
+        if self.teacher_server_manager is None:
+            return None
+        get_max_model_len = getattr(self.teacher_server_manager, "max_model_len_for_routing_key", None)
+        if get_max_model_len is not None:
+            max_model_len = get_max_model_len(routing_key)
+            return int(max_model_len) if max_model_len is not None else None
+
+        # Test and probe managers may not implement the formal accessor yet.
+        # Fall back to the same public config shape used by the production
+        # manager instead of assuming a specific concrete class.
+        teacher_model_configs = getattr(self.teacher_server_manager, "teacher_model_configs", None)
+        if not teacher_model_configs:
+            return None
+        if len(teacher_model_configs) == 1:
+            teacher_config = next(iter(teacher_model_configs.values()))
+        elif routing_key in teacher_model_configs:
+            teacher_config = teacher_model_configs[routing_key]
+        else:
+            return None
+        max_model_len = getattr(getattr(teacher_config, "inference", None), "max_model_len", None)
+        return int(max_model_len) if max_model_len is not None else None
+
+    def _teacher_request_overflows(
+        self,
+        *,
+        sequence_len: int,
+        routing_key: Any = None,
+    ) -> tuple[bool, int | None, int]:
+        """Check SGLang teacher request length before sending it.
+
+        The teacher logprob request still asks SGLang to generate one token
+        while returning prompt logprobs, so the server-side budget is
+        ``len(prompt_ids) + 1 <= max_model_len``.
+        """
+        required_len = sequence_len + 1
+        max_model_len = self._teacher_max_model_len(routing_key)
+        if max_model_len is None:
+            return False, None, required_len
+        return required_len > max_model_len, max_model_len, required_len
+
+    def _teacher_future_verify_overflows(
+        self,
+        *,
+        prefix_len: int,
+        routing_key: Any = None,
+        min_future_chunk_len: int = 1,
+    ) -> tuple[bool, int | None, int]:
+        """Check whether a committed teacher prefix leaves room for any next verified token."""
+        return self._teacher_request_overflows(
+            sequence_len=prefix_len + min_future_chunk_len,
+            routing_key=routing_key,
+        )
+
     @staticmethod
     def _current_multi_modal_data(agent_data: AgentData) -> dict[str, Any]:
         """Build current multimodal context for student/teacher rollout calls."""
@@ -747,6 +802,35 @@ class SkdAgentLoop(ToolAgentLoop):
                             teacher_routing_key=teacher_routing_key,
                         )
                     verify_sequence = teacher_server_prompt_ids + chunk
+                    teacher_overflow, teacher_max_model_len, teacher_required_len = self._teacher_request_overflows(
+                        sequence_len=len(verify_sequence),
+                        routing_key=teacher_routing_key,
+                    )
+                    if teacher_overflow:
+                        termination_reason = "teacher_context_exhausted"
+                        agent_data.extra_fields["skd_termination_reason"] = termination_reason
+                        agent_data.extra_fields["skd_teacher_context_required_len"] = teacher_required_len
+                        agent_data.extra_fields["skd_teacher_max_model_len"] = teacher_max_model_len
+                        _trace_async_skd(
+                            "loop.teacher_context_exhausted_before_verify",
+                            request_id=agent_data.request_id,
+                            teacher_replica_id=teacher_replica_id,
+                            teacher_routing_key=teacher_routing_key,
+                            teacher_server_prompt_len=len(teacher_server_prompt_ids),
+                            chunk_len=len(chunk),
+                            required_len=teacher_required_len,
+                            max_model_len=teacher_max_model_len,
+                        )
+                        warnings.warn(
+                            "[SKD] terminating before teacher verify because teacher context would overflow: "
+                            f"req={agent_data.request_id} "
+                            f"teacher_server_prompt_len={len(teacher_server_prompt_ids)} "
+                            f"chunk_len={len(chunk)} "
+                            f"required_len={teacher_required_len} "
+                            f"max_model_len={teacher_max_model_len}",
+                            stacklevel=1,
+                        )
+                        break
                     logprob_start_len = max(len(teacher_server_prompt_ids) - 1, 0)
                     expected_mm_prefix_surplus = max(len(teacher_prompt_ids) - len(teacher_server_prompt_ids), 0)
                     teacher_ids, teacher_logprobs = (
@@ -943,6 +1027,8 @@ class SkdAgentLoop(ToolAgentLoop):
 
         # Check termination conditions (same as ToolAgentLoop L253-259)
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        if termination_reason == "teacher_context_exhausted":
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED
