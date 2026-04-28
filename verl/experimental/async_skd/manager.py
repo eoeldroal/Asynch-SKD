@@ -23,6 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover - local test environments may no
             return {}
 
 from verl.experimental.async_skd.events import emit_async_skd_event
+from verl.experimental.async_skd.metadata import align_non_tensor_keys_for_concat
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
@@ -72,7 +73,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         return self._finalize_outputs(outputs)
 
     def _finalize_outputs(self, outputs: list[DataProto]) -> DataProto:
-        output = DataProto.concat(outputs)
+        output = DataProto.concat(align_non_tensor_keys_for_concat(outputs))
         metrics = [single.meta_info.pop("metrics") for single in outputs]
         timing = self._performance_metrics(metrics, output)
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
