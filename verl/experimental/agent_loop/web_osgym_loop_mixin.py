@@ -5,22 +5,40 @@ from uuid import uuid4
 
 
 class WebOsGymLoopMixin:
-    web_osgym_tool_name = "computer"
+    shared_tools_kwargs_key = "web_osgym"
+    legacy_bundled_tool_name = "computer"
 
-    def _get_active_tool(self, agent_data):
+    def _get_active_tool(self, agent_data, tool_name: str | None = None):
         active_tools = getattr(agent_data, "_active_tools", {})
-        return active_tools[self.web_osgym_tool_name]
+        if tool_name is not None and tool_name in active_tools:
+            return active_tools[tool_name]
+        if self.legacy_bundled_tool_name in active_tools:
+            return active_tools[self.legacy_bundled_tool_name]
+        if active_tools:
+            return next(iter(active_tools.values()))
+        raise KeyError(f"No active Web/OSGym tool is available for {tool_name or self.shared_tools_kwargs_key!r}")
 
     def _allocate_web_osgym_session_id(self) -> int:
         return uuid4().int % (2**31 - 1) or 1
 
     def _get_create_kwargs(self, agent_data) -> dict:
-        kwargs = agent_data.tools_kwargs.get(self.web_osgym_tool_name, {})
-        return deepcopy(kwargs.get("create_kwargs", {}))
+        tools_kwargs = agent_data.tools_kwargs or {}
+        preferred_keys = [self.shared_tools_kwargs_key, self.legacy_bundled_tool_name]
+        for key in preferred_keys:
+            kwargs = tools_kwargs.get(key)
+            if isinstance(kwargs, dict) and "create_kwargs" in kwargs:
+                return deepcopy(kwargs.get("create_kwargs") or {})
 
-    def _ensure_web_osgym_session(self, agent_data) -> None:
+        active_tools = getattr(agent_data, "_active_tools", {})
+        for key in active_tools:
+            kwargs = tools_kwargs.get(key)
+            if isinstance(kwargs, dict) and "create_kwargs" in kwargs:
+                return deepcopy(kwargs.get("create_kwargs") or {})
+        return {}
+
+    def _ensure_web_osgym_session(self, agent_data, tool_name: str | None = None) -> None:
         instance_id = agent_data.extra_fields["web_osgym_instance_id"]
-        tool = self._get_active_tool(agent_data)
+        tool = self._get_active_tool(agent_data, tool_name)
         instance_dict = getattr(tool, "_instance_dict", {})
         if instance_id in instance_dict:
             return
@@ -33,6 +51,8 @@ class WebOsGymLoopMixin:
             request_id=agent_data.extra_fields["web_osgym_session_id"],
             include_a11y=agent_data.extra_fields["web_osgym_include_a11y"],
             reward=agent_data.extra_fields.get("web_osgym_reward_score"),
+            cursor_x=agent_data.extra_fields.get("web_osgym_cursor_x"),
+            cursor_y=agent_data.extra_fields.get("web_osgym_cursor_y"),
         )
 
     async def _start_web_osgym_session(self, agent_data, *, include_a11y: bool):

@@ -1,0 +1,247 @@
+_web_osgym_config: &web_osgym_config
+  type: native
+  base_url: "http://127.0.0.1:18000"
+  timeout: 60.0
+  include_a11y: false
+
+tools:
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "MOVE_TO"
+        description: "Move the cursor to the specified position."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            x:
+              type: "integer"
+            y:
+              type: "integer"
+          required: ["x", "y"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "CLICK"
+        description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            button:
+              type: "string"
+              enum: ["left", "middle", "right"]
+            x:
+              type: "integer"
+            y:
+              type: "integer"
+            num_clicks:
+              type: "integer"
+              minimum: 1
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "MOUSE_DOWN"
+        description: "Press the left button if the button not specified, otherwise press the specified button."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            button:
+              type: "string"
+              enum: ["left", "middle", "right"]
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "MOUSE_UP"
+        description: "Release the left button if the button not specified, otherwise release the specified button."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            button:
+              type: "string"
+              enum: ["left", "middle", "right"]
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "RIGHT_CLICK"
+        description: "Right click at the current position if x and y are not specified, otherwise right click at the specified position."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            x:
+              type: "integer"
+            y:
+              type: "integer"
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "DOUBLE_CLICK"
+        description: "Double click at the current position if x and y are not specified, otherwise double click at the specified position."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            x:
+              type: "integer"
+            y:
+              type: "integer"
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "DRAG_TO"
+        description: "Drag the cursor to the specified position with the left button pressed."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            x:
+              type: "integer"
+            y:
+              type: "integer"
+          required: ["x", "y"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "SCROLL"
+        description: "Scroll the mouse wheel up/down, or left/right."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            dx:
+              type: "integer"
+            dy:
+              type: "integer"
+          required: ["dx", "dy"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "TYPING"
+        description: "Type the specified text."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            text:
+              type: "string"
+          required: ["text"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "PRESS"
+        description: "Press the specified single key and release it."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            key:
+              type: "string"
+          required: ["key"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "KEY_DOWN"
+        description: "Press the specified single key."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            key:
+              type: "string"
+          required: ["key"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "KEY_UP"
+        description: "Release the specified single key."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            key:
+              type: "string"
+          required: ["key"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "HOTKEY"
+        description: "Press the specified key combination."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            keys:
+              type: "array"
+              items:
+                type: "string"
+          required: ["keys"]
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "WAIT"
+        description: "Wait until the next action."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties: {}
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "FAIL"
+        description: "Decide the task cannot be performed."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties: {}
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "DONE"
+        description: "Decide the task is done."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties: {}
+          required: []

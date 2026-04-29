@@ -22,6 +22,26 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 18000
 DEFAULT_LOG_PATH = "logs/mock_web_osgym_requests.jsonl"
 
+ACTION_REQUIRED_FIELDS = {
+    "MOVE_TO": {"x", "y"},
+    "CLICK": {"button", "x", "y", "num_clicks"},
+    "DOUBLE_CLICK": {"x", "y"},
+    "SCROLL": {"dx", "dy"},
+    "TYPING": {"text"},
+    "PRESS": {"key"},
+    "KEY_DOWN": {"key"},
+    "KEY_UP": {"key"},
+    "HOTKEY": {"keys"},
+    "WAIT": set(),
+    "DONE": set(),
+    "FAIL": set(),
+}
+
+ACTION_ALLOWED_FIELDS = {
+    action_type: {"action_type", *required_fields}
+    for action_type, required_fields in ACTION_REQUIRED_FIELDS.items()
+}
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -37,6 +57,46 @@ def _make_png_b64(label: str, step: int) -> str:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def _validate_actions(actions: Any) -> list[dict[str, Any]]:
+    if not isinstance(actions, list) or not actions:
+        raise HTTPException(status_code=422, detail="actions must be a non-empty list")
+
+    validated_actions = []
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            raise HTTPException(status_code=422, detail=f"actions[{index}] must be an object")
+
+        action_type = action.get("action_type")
+        if action_type not in ACTION_REQUIRED_FIELDS:
+            raise HTTPException(status_code=422, detail=f"actions[{index}].action_type is unsupported: {action_type!r}")
+
+        action_keys = set(action)
+        missing = sorted(ACTION_REQUIRED_FIELDS[action_type] - action_keys)
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"actions[{index}] missing required field(s): {', '.join(missing)}",
+            )
+
+        extra = sorted(action_keys - ACTION_ALLOWED_FIELDS[action_type])
+        if extra:
+            raise HTTPException(
+                status_code=422,
+                detail=f"actions[{index}] has unsupported field(s) for {action_type}: {', '.join(extra)}",
+            )
+
+        if action_type == "CLICK" and action.get("button") != "left":
+            raise HTTPException(status_code=422, detail=f"actions[{index}].button must be 'left'")
+
+        validated_actions.append(action)
+
+    terminal = [action for action in validated_actions if action["action_type"] in {"DONE", "FAIL"}]
+    if terminal and len(validated_actions) != 1:
+        raise HTTPException(status_code=422, detail="DONE/FAIL must be sent as a standalone action list")
+
+    return validated_actions
 
 
 class MockWebOsGymState:
@@ -126,7 +186,7 @@ def create_app(log_path: str | Path) -> FastAPI:
 
         if op == "action":
             session = state._require_session(session_id, task_id)
-            actions = payload.get("actions") or []
+            actions = _validate_actions(payload.get("actions"))
             session["actions"].append(actions)
             session["step"] += 1
             terminal = len(actions) == 1 and actions[0].get("action_type") in {"DONE", "FAIL"}

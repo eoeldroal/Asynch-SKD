@@ -36,13 +36,9 @@ class _FakeTool:
         self._instance_dict[instance_id] = dict(kwargs)
 
 
-class _Loop(WebOsGymLoopMixin):
-    web_osgym_tool_name = "computer"
-
-
 class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
     async def test_start_session_stores_instance_id_and_observation(self):
-        loop = _Loop()
+        loop = WebOsGymLoopMixin()
         tool = _FakeTool()
         agent_data = AgentData(
             messages=[{"role": "user", "content": "task"}],
@@ -50,7 +46,7 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
             video_data=[],
             metrics={},
             request_id="loop-req",
-            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345"}}},
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
         )
         agent_data._active_tools = {"computer": tool}
         agent_data.extra_fields["web_osgym_session_id"] = 101
@@ -61,8 +57,26 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.extra_fields["web_osgym_session_id"], 101)
         self.assertEqual(response.text, "initial-observation")
 
+    async def test_start_session_reads_shared_web_osgym_create_kwargs(self):
+        loop = WebOsGymLoopMixin()
+        tool = _FakeTool()
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="loop-req",
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "shared-task"}}},
+        )
+        agent_data._active_tools = {"CLICK": tool}
+        agent_data.extra_fields["web_osgym_session_id"] = 101
+
+        await loop._start_web_osgym_session(agent_data, include_a11y=False)
+
+        self.assertEqual(tool.created[0]["task_id"], "shared-task")
+
     async def test_finalize_with_reward_stores_reward_once(self):
-        loop = _Loop()
+        loop = WebOsGymLoopMixin()
         tool = _FakeTool()
         agent_data = AgentData(
             messages=[],
@@ -95,7 +109,7 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tool.rewards), 1)
 
     def test_ensure_session_restores_missing_local_instance_state(self):
-        loop = _Loop()
+        loop = WebOsGymLoopMixin()
         tool = _FakeTool()
         agent_data = AgentData(
             messages=[],
@@ -112,6 +126,8 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                 "web_osgym_task_id": "12345",
                 "web_osgym_session_id": 101,
                 "web_osgym_include_a11y": True,
+                "web_osgym_cursor_x": 7,
+                "web_osgym_cursor_y": 8,
             }
         )
 
@@ -127,6 +143,8 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                         "request_id": 101,
                         "include_a11y": True,
                         "reward": None,
+                        "cursor_x": 7,
+                        "cursor_y": 8,
                     },
                 )
             ],

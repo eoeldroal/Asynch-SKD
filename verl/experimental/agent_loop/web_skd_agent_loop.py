@@ -202,11 +202,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         tool_call = agent_data.tool_calls[0]
-        self._ensure_web_osgym_session(agent_data)
+        self._ensure_web_osgym_session(agent_data, tool_call.name)
         try:
             tool_args = json.loads(tool_call.arguments)
         except (json.JSONDecodeError, TypeError) as exc:
-            tool_response = ToolResponse(text=f"Invalid JSON in arguments for 'computer': {exc}")
+            tool_response = ToolResponse(text=f"Invalid JSON in arguments for '{tool_call.name}': {exc}")
             result = {
                 "terminated": False,
                 "termination_reason": None,
@@ -214,7 +214,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 "invalid_action": True,
             }
         else:
-            tool = self._get_active_tool(agent_data)
+            tool = self._get_active_tool(agent_data, tool_call.name)
             instance_id = agent_data.extra_fields["web_osgym_instance_id"]
             tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
         agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)

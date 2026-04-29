@@ -24,26 +24,33 @@ tools:
     tool_schema:
       type: "function"
       function:
-        name: "computer"
-        description: "Apply one or more low-level computer actions."
+        name: "CLICK"
+        description: "Click at the current position if x and y are not specified, otherwise click at the specified position."
         parameters:
           type: "object"
+          additionalProperties: false
           properties:
-            actions:
-              type: "array"
-              items:
-                type: "object"
-                properties:
-                  action_type:
-                    type: "string"
-                  x:
-                    type: "integer"
-                  y:
-                    type: "integer"
-                  text:
-                    type: "string"
-                required: ["action_type"]
-          required: ["actions"]
+            x:
+              type: "integer"
+            y:
+              type: "integer"
+          required: []
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config:
+      type: native
+      base_url: "{base_url}"
+      timeout: 10.0
+      include_a11y: false
+    tool_schema:
+      type: "function"
+      function:
+        name: "DONE"
+        description: "Decide the task is done."
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties: {{}}
+          required: []
 """,
         encoding="utf-8",
     )
@@ -51,7 +58,7 @@ tools:
 
 def _make_loop(tool):
     loop = object.__new__(WebOsGymToolAgentLoop)
-    loop.tools = {"computer": tool}
+    loop.tools = {tool.name: tool}
     loop.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True)]
     loop.response_length = 128
     loop.max_assistant_turns = 4
@@ -73,9 +80,9 @@ def _agent_data(tool):
         video_data=[],
         metrics={},
         request_id="agent-request",
-        tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345"}}},
+        tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
     )
-    agent_data._active_tools = {"computer": tool}
+    agent_data._active_tools = {tool.name: tool}
     agent_data._active_tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True)]
     return agent_data
 
@@ -89,9 +96,24 @@ async def test_web_tool_agent_uses_one_session_for_start_action_and_reward(tmp_p
     try:
         config_path = tmp_path / "web_osgym_tool.yaml"
         _write_tool_config(config_path, server.base_url)
-        tool = initialize_tools_from_config(config_path)[0]
-        loop = _make_loop(tool)
-        agent_data = _agent_data(tool)
+        tools = initialize_tools_from_config(config_path)
+        tool_by_name = {tool.name: tool for tool in tools}
+        loop = object.__new__(WebOsGymToolAgentLoop)
+        loop.tools = tool_by_name
+        loop.tool_schemas = [tool.tool_schema.model_dump(exclude_unset=True, exclude_none=True) for tool in tools]
+        loop.response_length = 128
+        loop.max_assistant_turns = 4
+        loop.max_user_turns = 4
+        loop.processor = SimpleNamespace(image_processor=True)
+        loop.tokenizer = SimpleNamespace()
+
+        async def apply_chat_template(messages, **kwargs):
+            return list(range(1, len(str(messages)) % 11 + 3))
+
+        loop.apply_chat_template = apply_chat_template
+        agent_data = _agent_data(tool_by_name["CLICK"])
+        agent_data._active_tools = tool_by_name
+        agent_data._active_tool_schemas = loop.tool_schemas
 
         pending_state = await loop._handle_pending_state(agent_data, sampling_params={})
         assert pending_state == AgentState.GENERATING
@@ -99,13 +121,13 @@ async def test_web_tool_agent_uses_one_session_for_start_action_and_reward(tmp_p
         assert isinstance(session_id, int)
 
         agent_data.tool_calls = [
-            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"CLICK","x":1,"y":2}]}'),
+            FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
         ]
         action_state = await loop._handle_processing_tools_state(agent_data)
         assert action_state == AgentState.GENERATING
 
         agent_data.tool_calls = [
-            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
+            FunctionCall(name="DONE", arguments="{}"),
         ]
         terminal_state = await loop._handle_processing_tools_state(agent_data)
         assert terminal_state == AgentState.TERMINATED

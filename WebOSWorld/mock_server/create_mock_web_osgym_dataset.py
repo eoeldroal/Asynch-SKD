@@ -23,8 +23,10 @@ def _prompt(task_id: str) -> list[dict[str, str]]:
         {
             "role": "system",
             "content": (
-                "You are controlling a browser environment. Use the computer tool to interact with the page. "
-                "When the task is complete, call computer with DONE. If it cannot be completed, call computer with FAIL. "
+                "You are controlling a browser environment. Use the available action tools to interact with the page. "
+                "CLICK defaults to button='left' and num_clicks=1. CLICK and DOUBLE_CLICK may omit x/y "
+                "only after the cursor position is known; otherwise provide x/y or call MOVE_TO first. "
+                "When the task is complete, call DONE. If it cannot be completed, call FAIL. "
                 "Do not write Web/OSGym protocol JSON directly."
             ),
         },
@@ -42,7 +44,7 @@ DEFAULT_AGENT_NAME = "web_skd_agent"
 
 def _row(*, split: str, index: int, task_id_start: int, agent_name: str) -> dict[str, Any]:
     task_id = _task_id(task_id_start, index)
-    tools_kwargs = {"computer": {"create_kwargs": {"task_id": task_id}}}
+    tools_kwargs = {"web_osgym": {"create_kwargs": {"task_id": task_id}}}
     return {
         "data_source": "mock_web_osgym",
         "prompt": _prompt(task_id),

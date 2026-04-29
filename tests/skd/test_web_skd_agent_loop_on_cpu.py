@@ -53,6 +53,18 @@ class _ImageFakeTool(_FakeTool):
         }
 
 
+class _ActionFakeTool(_FakeTool):
+    name = "CLICK"
+
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters))
+        return ToolResponse(text="At failed_action_index 0, action Failed. Reason: target field was not focused"), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": 1,
+        }
+
+
 def _build_loop():
     loop = WebSkdAgentLoop.__new__(WebSkdAgentLoop)
     loop.tools = {"computer": _FakeTool()}
@@ -110,7 +122,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             video_data=[],
             metrics={},
             request_id="req-1",
-            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345", "request_id": 101}}},
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345", "request_id": 101}}},
         )
         agent_data._active_tools = loop.tools
         agent_data._active_tool_schemas = []
@@ -138,7 +150,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             video_data=[],
             metrics={},
             request_id="req-1",
-            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345", "request_id": 101}}},
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345", "request_id": 101}}},
         )
         agent_data._active_tools = loop.tools
         agent_data._active_tool_schemas = []
@@ -206,6 +218,58 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.metrics["web_osgym/action_count"], 2)
         self.assertEqual(len(agent_data.extra_fields["teacher_ids_list"]), len(agent_data.response_mask))
         self.assertEqual(len(agent_data.extra_fields["teacher_logprobs_list"]), len(agent_data.response_mask))
+
+    async def test_processing_tools_accepts_action_named_tool_call(self):
+        loop = _build_loop()
+        tool = _ActionFakeTool()
+        loop.tools = {"CLICK": tool}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 101,
+            "include_a11y": True,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            type("Call", (), {"name": "CLICK", "arguments": '{"x":1,"y":2}'})()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(tool.executed[0], ("instance-1", {"x": 1, "y": 2}))
+        self.assertEqual(agent_data.metrics["web_osgym/action_count"], 1)
 
     async def test_processing_tools_requires_existing_server_prompt_stream(self):
         loop = _build_loop()

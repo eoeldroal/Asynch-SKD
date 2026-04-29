@@ -24,7 +24,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
 
     The generic ``ToolAgentLoop`` creates and releases a tool instance for each
     tool call. Web/OSGym trajectories need the opposite lifecycle: one session
-    is created before the first model token, all computer actions are applied to
+    is created before the first model token, all Web/OSGym actions are applied to
     that same session, and the environment reward is fetched once at trajectory
     termination. This class keeps the normal ToolAgentLoop generation semantics
     while specializing only the Web/OSGym environment boundary.
@@ -136,12 +136,12 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             "termination_reason": None,
             "action_count": 0,
         }
-        if tool_call.name != self.web_osgym_tool_name or tool_call.name not in active_tools:
+        if tool_call.name not in active_tools:
             available = list(active_tools.keys())
             tool_response = ToolResponse(text=f"Unknown function '{tool_call.name}'. Available tools: {available}")
             result["invalid_action"] = True
         else:
-            self._ensure_web_osgym_session(agent_data)
+            self._ensure_web_osgym_session(agent_data, tool_call.name)
             try:
                 tool_args = json.loads(tool_call.arguments)
             except (json.JSONDecodeError, TypeError) as exc:
@@ -149,7 +149,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 result["invalid_action"] = True
             else:
                 with simple_timer("tool_calls", agent_data.metrics):
-                    tool = self._get_active_tool(agent_data)
+                    tool = self._get_active_tool(agent_data, tool_call.name)
                     instance_id = agent_data.extra_fields["web_osgym_instance_id"]
                     tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
 

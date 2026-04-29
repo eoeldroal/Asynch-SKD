@@ -84,9 +84,23 @@ def _agent_data(tool):
         video_data=[],
         metrics={},
         request_id="agent-request",
-        tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345"}}},
+        tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
     )
     agent_data._active_tools = {"computer": tool}
+    agent_data._active_tool_schemas = [tool.tool_schema.model_dump()]
+    return agent_data
+
+
+def _action_agent_data(tool, action_name="CLICK"):
+    agent_data = AgentData(
+        messages=[{"role": "user", "content": "task"}],
+        image_data=[],
+        video_data=[],
+        metrics={},
+        request_id="agent-request",
+        tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
+    )
+    agent_data._active_tools = {action_name: tool}
     agent_data._active_tool_schemas = [tool.tool_schema.model_dump()]
     return agent_data
 
@@ -187,6 +201,37 @@ async def test_processing_reuses_session_and_sets_reward_score_on_terminal_actio
     assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
     assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
     assert agent_data.response_mask and all(value == 0 for value in agent_data.response_mask)
+
+
+@pytest.mark.asyncio
+async def test_processing_accepts_action_named_tool_call():
+    loop = _make_loop()
+    tool = _FakeWebTool()
+    agent_data = _action_agent_data(tool, action_name="CLICK")
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_instance_id": "instance-1",
+            "web_osgym_task_id": "12345",
+            "web_osgym_session_id": 777,
+            "web_osgym_include_a11y": False,
+        }
+    )
+    tool._instance_dict["instance-1"] = {
+        "task_id": "12345",
+        "request_id": 777,
+        "include_a11y": False,
+        "reward": None,
+    }
+    agent_data.tool_calls = [
+        FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
+    ]
+
+    next_state = await loop._handle_processing_tools_state(agent_data)
+
+    assert next_state == AgentState.TERMINATED
+    assert tool.executed[0][0] == "instance-1"
+    assert tool.executed[0][1] == {"x": 1, "y": 2}
+    assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
 
 
 @pytest.mark.asyncio
