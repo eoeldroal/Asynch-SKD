@@ -50,14 +50,15 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
             video_data=[],
             metrics={},
             request_id="loop-req",
-            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345", "request_id": 101, "include_a11y": False}}},
+            tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345"}}},
         )
         agent_data._active_tools = {"computer": tool}
+        agent_data.extra_fields["web_osgym_session_id"] = 101
 
         response = await loop._start_web_osgym_session(agent_data, include_a11y=False)
 
         self.assertEqual(agent_data.extra_fields["web_osgym_instance_id"], "instance-1")
-        self.assertEqual(agent_data.extra_fields["web_osgym_request_id"], 101)
+        self.assertEqual(agent_data.extra_fields["web_osgym_session_id"], 101)
         self.assertEqual(response.text, "initial-observation")
 
     async def test_finalize_with_reward_stores_reward_once(self):
@@ -76,7 +77,7 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
             {
                 "web_osgym_instance_id": "instance-1",
                 "web_osgym_task_id": "12345",
-                "web_osgym_request_id": 101,
+                "web_osgym_session_id": 101,
                 "web_osgym_include_a11y": False,
             }
         )
@@ -109,7 +110,7 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
             {
                 "web_osgym_instance_id": "instance-1",
                 "web_osgym_task_id": "12345",
-                "web_osgym_request_id": 101,
+                "web_osgym_session_id": 101,
                 "web_osgym_include_a11y": True,
             }
         )

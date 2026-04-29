@@ -1,0 +1,184 @@
+from types import SimpleNamespace
+
+import pytest
+from PIL import Image
+
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.tool_parser import FunctionCall
+from verl.experimental.agent_loop.web_tool_agent_loop import WebOsGymToolAgentLoop
+from verl.tools.schemas import ToolResponse
+
+
+class _FakeWebTool:
+    name = "computer"
+
+    def __init__(self):
+        self.created = []
+        self.executed = []
+        self.released = []
+        self.rewards = []
+        self._instance_dict = {}
+        self.tool_schema = SimpleNamespace(model_dump=lambda **_: {"function": {"name": "computer"}})
+
+    async def create(self, *, task_id, request_id, include_a11y, **kwargs):
+        self.created.append(
+            {
+                "task_id": task_id,
+                "request_id": request_id,
+                "include_a11y": include_a11y,
+                **kwargs,
+            }
+        )
+        self._instance_dict["instance-1"] = {
+            "task_id": task_id,
+            "request_id": request_id,
+            "include_a11y": include_a11y,
+            "reward": None,
+        }
+        return "instance-1", ToolResponse(
+            text="A11Y_TREE:\nroot",
+            image=[Image.new("RGB", (2, 2), "blue")],
+        )
+
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters, kwargs))
+        return ToolResponse(text="done"), None, {
+            "terminated": True,
+            "termination_reason": "model_done",
+            "action_count": 1,
+        }
+
+    async def calc_reward(self, instance_id, **kwargs):
+        self.rewards.append((instance_id, kwargs))
+        return 1.0
+
+    async def release(self, instance_id):
+        self.released.append(instance_id)
+        self._instance_dict.pop(instance_id, None)
+
+
+def _make_loop():
+    loop = object.__new__(WebOsGymToolAgentLoop)
+    loop.tools = {}
+    loop.tool_schemas = []
+    loop.response_length = 64
+    loop.max_assistant_turns = 4
+    loop.max_user_turns = 4
+    loop.processor = SimpleNamespace(image_processor=True)
+    loop.tokenizer = SimpleNamespace()
+    loop.apply_chat_template_calls = []
+
+    async def apply_chat_template(messages, **kwargs):
+        loop.apply_chat_template_calls.append((messages, kwargs))
+        return list(range(10, 10 + len(str(messages)) % 7 + 2))
+
+    loop.apply_chat_template = apply_chat_template
+    return loop
+
+
+def _agent_data(tool):
+    agent_data = AgentData(
+        messages=[{"role": "user", "content": "task"}],
+        image_data=[],
+        video_data=[],
+        metrics={},
+        request_id="agent-request",
+        tools_kwargs={"computer": {"create_kwargs": {"task_id": "12345"}}},
+    )
+    agent_data._active_tools = {"computer": tool}
+    agent_data._active_tool_schemas = [tool.tool_schema.model_dump()]
+    return agent_data
+
+
+def test_web_tool_agent_keeps_tool_agent_layering():
+    assert issubclass(WebOsGymToolAgentLoop, ToolAgentLoop)
+    assert not issubclass(WebOsGymToolAgentLoop, SkdAgentLoop)
+
+
+@pytest.mark.asyncio
+async def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
+    loop = _make_loop()
+    tool = _FakeWebTool()
+    agent_data = _agent_data(tool)
+
+    next_state = await loop._handle_pending_state(agent_data, sampling_params={})
+
+    assert next_state == AgentState.GENERATING
+    assert tool.created[0]["task_id"] == "12345"
+    assert tool.created[0]["include_a11y"] is False
+    assert agent_data.extra_fields["web_osgym_instance_id"] == "instance-1"
+    assert agent_data.extra_fields["web_osgym_session_id"] == tool.created[0]["request_id"]
+    assert agent_data.image_data and len(agent_data.image_data) == 1
+
+    appended_message = agent_data.messages[-1]
+    assert appended_message["role"] == "tool"
+    assert appended_message["content"] == [{"type": "image"}]
+
+
+@pytest.mark.asyncio
+async def test_processing_reuses_session_and_sets_reward_score_on_terminal_action():
+    loop = _make_loop()
+    tool = _FakeWebTool()
+    agent_data = _agent_data(tool)
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_instance_id": "instance-1",
+            "web_osgym_task_id": "12345",
+            "web_osgym_session_id": 777,
+            "web_osgym_include_a11y": False,
+        }
+    )
+    tool._instance_dict["instance-1"] = {
+        "task_id": "12345",
+        "request_id": 777,
+        "include_a11y": False,
+        "reward": None,
+    }
+    agent_data.tool_calls = [
+        FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
+    ]
+
+    next_state = await loop._handle_processing_tools_state(agent_data)
+
+    assert next_state == AgentState.TERMINATED
+    assert tool.executed[0][0] == "instance-1"
+    assert tool.executed[0][1]["actions"][0]["action_type"] == "DONE"
+    assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+    assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+    assert agent_data.response_mask and all(value == 0 for value in agent_data.response_mask)
+
+
+@pytest.mark.asyncio
+async def test_tool_response_budget_exhaustion_fetches_reward_without_committing_observation():
+    loop = _make_loop()
+    loop.response_length = 2
+    tool = _FakeWebTool()
+    agent_data = _agent_data(tool)
+    agent_data.response_mask = [1]
+    agent_data.prompt_ids = [100]
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_instance_id": "instance-1",
+            "web_osgym_task_id": "12345",
+            "web_osgym_session_id": 777,
+            "web_osgym_include_a11y": False,
+        }
+    )
+    tool._instance_dict["instance-1"] = {
+        "task_id": "12345",
+        "request_id": 777,
+        "include_a11y": False,
+        "reward": None,
+    }
+    agent_data.tool_calls = [
+        FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
+    ]
+
+    next_state = await loop._handle_processing_tools_state(agent_data)
+
+    assert next_state == AgentState.TERMINATED
+    assert agent_data.prompt_ids == [100]
+    assert agent_data.response_mask == [1]
+    assert agent_data.extra_fields["web_osgym_termination_reason"] == "tool_response_budget_exhausted"
+    assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0

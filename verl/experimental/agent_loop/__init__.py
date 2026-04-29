@@ -24,9 +24,10 @@ from .diffusion_agent_loop import DiffusionAgentLoopWorker
 from .skd_agent_loop import SkdAgentLoop
 from .single_turn_agent_loop import SingleTurnAgentLoop
 from .tool_agent_loop import ToolAgentLoop
+from .web_tool_agent_loop import WebOsGymToolAgentLoop
 from .web_skd_agent_loop import WebSkdAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop, SkdAgentLoop, WebSkdAgentLoop]
+_ = [SingleTurnAgentLoop, ToolAgentLoop, SkdAgentLoop, WebSkdAgentLoop, WebOsGymToolAgentLoop]
 
 __all__ = [
     "AgentLoopBase",

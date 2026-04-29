@@ -249,6 +249,13 @@ Loop integration:
   - server prompt ids and teacher server prompt ids maintenance
   - teacher context guard before non-terminal observation commit
   - final environment reward propagation
+- `verl/experimental/agent_loop/web_tool_agent_loop.py`
+  - registered as `web_tool_agent`
+  - inherits from `ToolAgentLoop`, not `SkdAgentLoop`
+  - starts one Web/OSGym session before generation
+  - reuses that same session for every `computer` tool call in a trajectory
+  - fetches environment reward once at `DONE` / `FAIL` / budget / system-stop termination
+  - propagates reward through `AgentLoopOutput.reward_score`, allowing fully async RL postprocess to create `rm_scores`
 
 Mock server assets:
 
@@ -260,6 +267,7 @@ Mock server assets:
 Trainer entrypoint:
 
 - `WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh`
+- `WebOSWorld/run_qwen35_web_mock_fully_async_rl_tool_fsdp.sh`
 
 Tool config:
 
@@ -308,6 +316,15 @@ python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
   --num-samples 64
 ```
 
+For fully async RL, generate the same protocol dataset with `agent_name=web_tool_agent`:
+
+```bash
+python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
+  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
+  --num-samples 64 \
+  --agent-name web_tool_agent
+```
+
 Run the mock server detached:
 
 ```bash
@@ -327,6 +344,15 @@ nohup bash WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh \
 tail -f logs/web_mock_async_skd_train.log
 ```
 
+For fully async RL:
+
+```bash
+nohup bash WebOSWorld/run_qwen35_web_mock_fully_async_rl_tool_fsdp.sh \
+  > logs/web_mock_fully_async_rl_train.log 2>&1 &
+
+tail -f logs/web_mock_fully_async_rl_train.log
+```
+
 Default script shape:
 
 ```text
@@ -336,6 +362,16 @@ STUDENT_MAX_MODEL_LEN=3073
 TEACHER_MAX_MODEL_LEN=8073
 TOTAL_TRAINING_STEPS=4
 default_agent_loop=web_skd_agent
+```
+
+Fully async RL script shape:
+
+```text
+data.max_response_length=8192
+actor_rollout_ref.rollout.n=8
+actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=16
+default_agent_loop=web_tool_agent
+checkpoint_engine.update_weights_bucket_megabytes=4096
 ```
 
 ## 16. Current Milestone Interpretation
@@ -364,4 +400,4 @@ Operational note: with 64 mock rows and prefetch enabled, a 4-step run can exhau
 
 ## 17. One-line Summary
 
-Web / OS Gym integration은 `tool_agent`/`skd_agent` 위에 stateful remote environment session을 얹고, screenshot/a11y observation과 final environment reward를 기존 rollout/training path로 전달하는 구조다.
+Web / OS Gym integration은 `tool_agent`/`skd_agent` 위에 stateful remote environment session을 얹고, screenshot/a11y observation과 final environment reward를 기존 rollout/training path로 전달하는 구조다. SKD 경로는 `web_skd_agent`, 순수 fully async RL 경로는 `web_tool_agent`를 사용한다.

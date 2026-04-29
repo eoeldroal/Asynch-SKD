@@ -17,6 +17,22 @@ RayPPOTrainer
   -> actor update / distillation loss
 ```
 
+순수 fully async RL 경로는 별도 trainer를 사용한다.
+
+```text
+FullyAsyncTaskRunner
+  -> FullyAsyncTrainer
+    -> actor update
+    -> async checkpoint weight transfer
+  -> FullyAsyncRollouter
+    -> FullyAsyncAgentLoopManager
+      -> web_tool_agent
+        -> student SGLang generation
+        -> persistent Web/OSGym session actions
+        -> final environment reward
+  -> message queue
+```
+
 핵심 분리:
 
 - `skd_agent_loop.py`: SKD token semantics
@@ -24,6 +40,7 @@ RayPPOTrainer
 - `source.py`: training source / promoted / carryover ledger
 - `metadata.py`: DataProto metadata normalization
 - `teacher_manager.py`: teacher routing and SGLang request boundary
+- `web_tool_agent_loop.py`: fully async RL Web/OSGym session semantics without SKD
 
 ## 2. SKD token semantics
 
