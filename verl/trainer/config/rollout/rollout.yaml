@@ -222,6 +222,10 @@ agent:
   # Number of agent loop workers
   num_workers: 8
 
+  # Maximum number of in-flight sample tasks to allow per rollout GPU / replica.
+  # If null, fully async rollouter falls back to the historical default of 16.
+  max_concurrent_samples_per_gpu: null
+
   # default agent loop to use if `agent_name` not set in RL dataset
   default_agent_loop: single_turn_agent
 

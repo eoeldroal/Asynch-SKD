@@ -96,6 +96,7 @@ class CustomAsyncServerConfig(BaseConfig):
 @dataclass
 class AgentLoopConfig(BaseConfig):
     num_workers: int = 8
+    max_concurrent_samples_per_gpu: Optional[int] = None
     default_agent_loop: str = "single_turn_agent"
     agent_loop_config_path: Optional[str] = None
     custom_async_server: CustomAsyncServerConfig = field(default_factory=CustomAsyncServerConfig)
@@ -108,6 +109,10 @@ class AgentLoopConfig(BaseConfig):
     async_skd_prefetch_worker_target: int = 0
     async_skd_teacher_sticky_carryover: bool = True
     async_skd_max_promoted_per_step: int = 0
+
+    def __post_init__(self):
+        if self.max_concurrent_samples_per_gpu is not None and self.max_concurrent_samples_per_gpu <= 0:
+            raise ValueError("`max_concurrent_samples_per_gpu` must be a positive integer or null.")
 
 
 @dataclass
