@@ -89,8 +89,8 @@ bash WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh
 
 ```bash
 python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
-  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
-  --num-samples 64 \
+  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym_fully_async_rl \
+  --num-samples 256 \
   --agent-name web_tool_agent
 ```
 

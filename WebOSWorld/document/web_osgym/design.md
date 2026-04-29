@@ -313,15 +313,15 @@ Generate the mock dataset if needed:
 ```bash
 python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
   --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
-  --num-samples 64
+  --num-samples 256
 ```
 
 For fully async RL, generate the same protocol dataset with `agent_name=web_tool_agent`:
 
 ```bash
 python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
-  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
-  --num-samples 64 \
+  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym_fully_async_rl \
+  --num-samples 256 \
   --agent-name web_tool_agent
 ```
 
@@ -396,7 +396,7 @@ It does not claim:
 - long-horizon dataset coverage
 - policy convergence
 
-Operational note: with 64 mock rows and prefetch enabled, a 4-step run can exhaust the source before the final step. Increase dataset size or lower prefetch for longer runs.
+Operational note: older 64-row mock datasets can exhaust the source before the final step when prefetch is enabled. Use 256 rows or lower prefetch for longer runs.
 
 ## 17. One-line Summary
 

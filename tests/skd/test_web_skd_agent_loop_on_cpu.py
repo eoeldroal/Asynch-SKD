@@ -64,6 +64,7 @@ def _build_loop():
     loop.max_tool_response_length = 4096
     loop.tool_response_truncate_side = "left"
     loop.teacher_system_prompt = None
+    loop.teacher_server_manager = None
     loop.prompt_length = 64
     loop.tool_parser_name = "qwen3_coder"
     loop.processor = None

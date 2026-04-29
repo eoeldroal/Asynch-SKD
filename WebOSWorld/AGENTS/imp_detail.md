@@ -316,7 +316,7 @@ mock server는 real WebGym 전에 wire contract와 trainer integration을 검증
 ```bash
 python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
   --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
-  --num-samples 64
+  --num-samples 256
 ```
 
 row 계약:

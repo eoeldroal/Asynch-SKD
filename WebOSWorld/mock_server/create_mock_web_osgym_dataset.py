@@ -10,7 +10,7 @@ import pandas as pd
 
 
 DEFAULT_LOCAL_SAVE_DIR = "/home/sogang_nlpy/verl/data/mock_web_osgym"
-DEFAULT_NUM_SAMPLES = 64
+DEFAULT_NUM_SAMPLES = 256
 DEFAULT_TASK_ID_START = 12345
 
 

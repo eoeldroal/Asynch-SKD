@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from verl.experimental.agent_loop.web_osgym_protocol import WebOsGymAction, WebOsGymClient
 from verl.tools.base_tool import BaseTool
 from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
+from verl.utils.rollout_trace import rollout_trace_op
 
 
 class WebOsGymTool(BaseTool):
@@ -80,6 +81,7 @@ class WebOsGymTool(BaseTool):
             raise ValueError("DONE/FAIL must be sent as a standalone action list")
         return actions
 
+    @rollout_trace_op
     async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float | None, dict]:
         del kwargs
         state = self._instance_dict[instance_id]

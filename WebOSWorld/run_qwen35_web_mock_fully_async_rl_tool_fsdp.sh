@@ -13,6 +13,7 @@ cd /home/sogang_nlpy/verl
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
+MLFLOW_TRACKING_URI=/home/sogang_nlpy/verl/logs/mlruns_web_mock \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
     "data.train_files=['/home/sogang_nlpy/verl/data/mock_web_osgym_fully_async_rl/train.parquet']" \
@@ -73,6 +74,9 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
+    actor_rollout_ref.rollout.trace.token2text=True \
+    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \

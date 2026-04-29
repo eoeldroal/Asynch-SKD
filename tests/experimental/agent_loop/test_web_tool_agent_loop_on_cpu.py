@@ -96,6 +96,46 @@ def test_web_tool_agent_keeps_tool_agent_layering():
     assert not issubclass(WebOsGymToolAgentLoop, SkdAgentLoop)
 
 
+def test_generation_metadata_merge_keeps_zero_param_version_with_web_session_fields():
+    tool = _FakeWebTool()
+    agent_data = _agent_data(tool)
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_instance_id": "instance-1",
+            "web_osgym_task_id": "12345",
+            "web_osgym_session_id": 777,
+            "web_osgym_include_a11y": False,
+        }
+    )
+
+    ToolAgentLoop._merge_generation_extra_fields(
+        agent_data,
+        {
+            "global_steps": 0,
+            "min_global_steps": 0,
+            "max_global_steps": 0,
+        },
+    )
+
+    assert agent_data.extra_fields["web_osgym_session_id"] == 777
+    assert agent_data.extra_fields["global_steps"] == 0
+    assert agent_data.extra_fields["min_global_steps"] == 0
+    assert agent_data.extra_fields["max_global_steps"] == 0
+
+    ToolAgentLoop._merge_generation_extra_fields(
+        agent_data,
+        {
+            "global_steps": 3,
+            "min_global_steps": 3,
+            "max_global_steps": 3,
+        },
+    )
+
+    assert agent_data.extra_fields["global_steps"] == 3
+    assert agent_data.extra_fields["min_global_steps"] == 0
+    assert agent_data.extra_fields["max_global_steps"] == 3
+
+
 @pytest.mark.asyncio
 async def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
     loop = _make_loop()

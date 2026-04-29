@@ -106,6 +106,32 @@ class ToolAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
 
+    @staticmethod
+    def _merge_generation_extra_fields(agent_data: AgentData, output_extra_fields: dict[str, Any] | None) -> None:
+        if not output_extra_fields:
+            return
+        if not agent_data.extra_fields:
+            agent_data.extra_fields.update(output_extra_fields)
+            return
+
+        global_steps = output_extra_fields.get("global_steps")
+        if global_steps is not None:
+            agent_data.extra_fields["global_steps"] = global_steps
+
+        min_global_steps = output_extra_fields.get("min_global_steps")
+        if min_global_steps is not None:
+            current_min = agent_data.extra_fields.get("min_global_steps")
+            agent_data.extra_fields["min_global_steps"] = (
+                min_global_steps if current_min is None else min(current_min, min_global_steps)
+            )
+
+        max_global_steps = output_extra_fields.get("max_global_steps")
+        if max_global_steps is not None:
+            current_max = agent_data.extra_fields.get("max_global_steps")
+            agent_data.extra_fields["max_global_steps"] = (
+                max_global_steps if current_max is None else max(current_max, max_global_steps)
+            )
+
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
@@ -214,13 +240,7 @@ class ToolAgentLoop(AgentLoopBase):
         else:
             agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
 
-        if not agent_data.extra_fields:
-            agent_data.extra_fields.update(output.extra_fields)
-        else:
-            # Multi-round calls, only update the maximum max_global_steps.
-            max_global_steps = output.extra_fields.get("max_global_steps", None)
-            if max_global_steps:
-                agent_data.extra_fields["max_global_steps"] = max_global_steps
+        self._merge_generation_extra_fields(agent_data, output.extra_fields)
 
         agent_data.assistant_turns += 1
         agent_data.response_ids = output.token_ids
