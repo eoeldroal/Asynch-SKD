@@ -149,6 +149,38 @@ def test_index_select_tensor_dict_preserves_3d_nested_tensor_layout_with_equal_s
     tu.assert_tensordict_eq(selected, tu.get_tensordict({"position_ids": expected}))
 
 
+def test_index_select_tensor_dict_falls_back_for_3d_nested_tensor_unbind_failure(monkeypatch):
+    position_ids_rows = [
+        torch.arange(2).expand(4, 2),
+        (torch.arange(5) + 10).expand(4, 5),
+        (torch.arange(3) + 20).expand(4, 3),
+        (torch.arange(7) + 30).expand(4, 7),
+    ]
+    position_ids = torch.nested.as_nested_tensor(position_ids_rows, layout=torch.jagged)
+    data = tu.get_tensordict({"position_ids": position_ids})
+    indices = torch.tensor([3, 1, 3, 0])
+
+    original_unbind = torch.Tensor.unbind
+
+    def fail_unbind_for_position_ids(self, *args, **kwargs):
+        if self is position_ids:
+            raise RuntimeError("split_with_sizes expects split_sizes to sum exactly")
+        return original_unbind(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "unbind", fail_unbind_for_position_ids)
+
+    selected = tu.index_select_tensor_dict(data, indices)
+    expected = tu.nested_tensor_from_tensor_list(
+        [position_ids_rows[int(idx)] for idx in indices],
+        ragged_idx=2,
+    )
+
+    assert selected["position_ids"]._ragged_idx == 2
+    assert torch.equal(selected["position_ids"].values(), expected.values())
+    assert torch.equal(selected["position_ids"].offsets(), expected.offsets())
+    tu.assert_tensordict_eq(selected, tu.get_tensordict({"position_ids": expected}))
+
+
 def test_tensordict_with_images():
     # each sample contains a sequence with multiple images of different sizes
     vocab_size = 128

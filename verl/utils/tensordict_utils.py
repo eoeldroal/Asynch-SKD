@@ -500,9 +500,22 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
-                selected_tensors = [tensor_lst[idx] for idx in indices]
                 ragged_idx = getattr(tensor, "_ragged_idx", tensor.dim() - 1)
+                try:
+                    tensor_lst = tensor.unbind()  # for performance
+                    selected_tensors = [tensor_lst[idx] for idx in indices]
+                except RuntimeError as exc:
+                    if "split_with_sizes" not in str(exc) or ragged_idx != tensor.dim() - 1:
+                        raise
+
+                    # PyTorch unbind(dim=0) can fail for 3D jagged NestedTensors
+                    # such as mRoPE position_ids. Fall back to padded row selection
+                    # and restore the original ragged lengths from offsets.
+                    padded = tensor.to_padded_tensor(0)
+                    lengths = tensor.offsets().diff().tolist()
+                    selected_tensors = [
+                        padded[int(idx), ..., : lengths[int(idx)]] for idx in indices.tolist()
+                    ]
                 if ragged_idx == tensor.dim() - 1:
                     data_dict[key] = nested_tensor_from_tensor_list(selected_tensors, ragged_idx=ragged_idx)
                 else:
