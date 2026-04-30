@@ -3,33 +3,20 @@ set -xeuo pipefail
 
 cd /home/sogang_nlpy/verl
 
-DATA_MAX_PROMPT_LENGTH="${DATA_MAX_PROMPT_LENGTH:-2048}"
-DATA_MAX_RESPONSE_LENGTH="${DATA_MAX_RESPONSE_LENGTH:-1024}"
-STUDENT_MAX_MODEL_LEN="${STUDENT_MAX_MODEL_LEN:-3073}"
-STUDENT_MAX_NUM_BATCHED_TOKENS="${STUDENT_MAX_NUM_BATCHED_TOKENS:-${STUDENT_MAX_MODEL_LEN}}"
-TEACHER_MAX_MODEL_LEN="${TEACHER_MAX_MODEL_LEN:-8073}"
-TEACHER_MAX_NUM_BATCHED_TOKENS="${TEACHER_MAX_NUM_BATCHED_TOKENS:-${TEACHER_MAX_MODEL_LEN}}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
-PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
-ROLLOUT_AGENT_WORKERS="${ROLLOUT_AGENT_WORKERS:-4}"
-TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-4}"
-ASYNC_SKD_PREFETCH_LIMIT="${ASYNC_SKD_PREFETCH_LIMIT:-$(((TRAIN_BATCH_SIZE * 5 + 3) / 4))}"
-ASYNC_SKD_PREFETCH_WORKER_TARGET="${ASYNC_SKD_PREFETCH_WORKER_TARGET:-$(((TRAIN_BATCH_SIZE + ROLLOUT_AGENT_WORKERS - 1) / ROLLOUT_AGENT_WORKERS))}"
-ASYNC_SKD_MAX_PROMOTED_PER_STEP="${ASYNC_SKD_MAX_PROMOTED_PER_STEP:-$(((TRAIN_BATCH_SIZE * 3 + 3) / 4))}"
-
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
-VERL_SKD_DEBUG="${VERL_SKD_DEBUG:-2}" \
-VERL_ASYNC_SKD_TRACE="${VERL_ASYNC_SKD_TRACE:-${VERL_SKD_DEBUG:-2}}" \
+MLFLOW_TRACKING_URI=/home/sogang_nlpy/verl/logs/mlruns_web_mock_async_skd \
+VERL_SKD_DEBUG=2 \
+VERL_ASYNC_SKD_TRACE=2 \
 python3 -m verl.trainer.main_ppo \
     model_engine=veomni \
     "data.train_files=['/home/sogang_nlpy/verl/data/mock_web_osgym/train.parquet']" \
     "data.val_files=['/home/sogang_nlpy/verl/data/mock_web_osgym/val.parquet']" \
     data.return_raw_chat=True \
-    data.train_batch_size="${TRAIN_BATCH_SIZE}" \
-    data.max_prompt_length="${DATA_MAX_PROMPT_LENGTH}" \
-    data.max_response_length="${DATA_MAX_RESPONSE_LENGTH}" \
+    data.train_batch_size=16 \
+    data.max_prompt_length=2048 \
+    data.max_response_length=8192 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=64 \
     data.truncation=error \
@@ -51,8 +38,8 @@ python3 -m verl.trainer.main_ppo \
     distillation.teacher_models.teacher_model.inference.name=sglang \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.90 \
-    distillation.teacher_models.teacher_model.inference.max_model_len="${TEACHER_MAX_MODEL_LEN}" \
-    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens="${TEACHER_MAX_NUM_BATCHED_TOKENS}" \
+    distillation.teacher_models.teacher_model.inference.max_model_len=10241 \
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=10241 \
     distillation.teacher_models.teacher_model.inference.max_num_seqs=512 \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.sglang.attention_backend=triton \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.sglang.mm_attention_backend=triton_attn \
@@ -72,9 +59,12 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
     actor_rollout_ref.rollout.calculate_log_probs=False \
-    actor_rollout_ref.rollout.max_model_len="${STUDENT_MAX_MODEL_LEN}" \
-    actor_rollout_ref.rollout.max_num_batched_tokens="${STUDENT_MAX_NUM_BATCHED_TOKENS}" \
+    actor_rollout_ref.rollout.max_model_len=10241 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=10241 \
     actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
+    actor_rollout_ref.rollout.trace.token2text=True \
+    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=1 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=0.95 \
@@ -82,14 +72,14 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.mm_attention_backend=triton_attn \
     +actor_rollout_ref.rollout.repetition_penalty=1.0 \
-    actor_rollout_ref.rollout.agent.num_workers="${ROLLOUT_AGENT_WORKERS}" \
+    actor_rollout_ref.rollout.agent.num_workers=4 \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_skd_agent \
     +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager \
     +actor_rollout_ref.rollout.agent.async_skd_mode=lookahead \
     +actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover=True \
-    +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit="${ASYNC_SKD_PREFETCH_LIMIT}" \
-    +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target="${ASYNC_SKD_PREFETCH_WORKER_TARGET}" \
-    +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step="${ASYNC_SKD_MAX_PROMOTED_PER_STEP}" \
+    +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=20 \
+    +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=4 \
+    +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=12 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -98,10 +88,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=3 \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=3 \
-    actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288 \
@@ -111,7 +101,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=1 \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
-    'trainer.logger=["console","wandb"]' \
+    'trainer.logger=["console","wandb","mlflow"]' \
     trainer.project_name=verl_async_skd_qwen35_web_mock_tool_fsdp \
     trainer.experiment_name=qwen35_9b_to_27b_async_skd_web_mock_tool \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_web_mock_tool_fsdp/qwen35_9b_to_27b_async_skd_web_mock_tool \
@@ -122,6 +112,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
+    trainer.total_training_steps=4 \
     +trainer.use_legacy_worker_impl=disable \
     "$@"

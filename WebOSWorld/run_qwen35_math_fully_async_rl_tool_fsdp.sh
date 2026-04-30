@@ -12,6 +12,7 @@ cd /home/sogang_nlpy/verl
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
+MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-/home/sogang_nlpy/verl/logs/mlruns_math_fully_async_rl}" \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
     data.train_files=/home/sogang_nlpy/verl/data/nemotron_cascade_rl_math_multiturn_w_tool/train.parquet \
@@ -72,6 +73,9 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
+    actor_rollout_ref.rollout.trace.token2text=True \
+    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=1 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
@@ -89,7 +93,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/examples/grpo_trainer/reward_fn_math_verify.py \
     reward.custom_reward_function.name=compute_score_math_verify \
-    'trainer.logger=["console","wandb"]' \
+    'trainer.logger=["console","wandb","mlflow"]' \
     trainer.project_name=verl_fully_async_qwen35_math_tool_fsdp \
     trainer.experiment_name=qwen35_9b_fully_async_math_tool \
     trainer.val_before_train=False \

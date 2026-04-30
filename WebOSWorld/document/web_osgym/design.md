@@ -271,7 +271,7 @@ Trainer entrypoint:
 
 Tool config:
 
-- `examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
+- `WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
 
 ## 15. Current Verification Flow
 

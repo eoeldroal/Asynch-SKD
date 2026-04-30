@@ -6,6 +6,7 @@ cd /home/sogang_nlpy/verl
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
+MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-/home/sogang_nlpy/verl/logs/mlruns_math_async_skd}" \
 VERL_SKD_DEBUG=1 \
 python3 -m verl.trainer.main_ppo \
     model_engine=veomni \
@@ -60,6 +61,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_model_len=9217 \
     actor_rollout_ref.rollout.max_num_batched_tokens=9217 \
     actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.trace.backend=mlflow \
+    actor_rollout_ref.rollout.trace.token2text=True \
+    actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=1 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=0.95 \
@@ -94,7 +98,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=1 \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
-    'trainer.logger=["console","wandb"]' \
+    'trainer.logger=["console","wandb","mlflow"]' \
     trainer.project_name=verl_async_skd_qwen35_math_tool_fsdp \
     trainer.experiment_name=qwen35_9b_to_27b_async_skd_tool \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_math_tool_fsdp/qwen35_9b_to_27b_async_skd_tool \

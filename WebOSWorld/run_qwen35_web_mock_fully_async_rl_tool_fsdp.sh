@@ -13,7 +13,7 @@ cd /home/sogang_nlpy/verl
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
-MLFLOW_TRACKING_URI=/home/sogang_nlpy/verl/logs/mlruns_web_mock \
+MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-/home/sogang_nlpy/verl/logs/mlruns_web_mock_fully_async_rl}" \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
     "data.train_files=['/home/sogang_nlpy/verl/data/mock_web_osgym_fully_async_rl/train.parquet']" \
@@ -86,7 +86,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=4 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=4 \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=1024 \
-    actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml \
+    actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
@@ -94,7 +94,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/mock_server/reward_fn_mock_web_osgym.py \
     reward.custom_reward_function.name=compute_score_mock_web_osgym \
-    'trainer.logger=["console","wandb"]' \
+    'trainer.logger=["console","wandb","mlflow"]' \
     trainer.project_name=verl_fully_async_qwen35_web_mock_tool_fsdp \
     trainer.experiment_name=qwen35_9b_fully_async_web_mock_tool \
     trainer.val_before_train=False \

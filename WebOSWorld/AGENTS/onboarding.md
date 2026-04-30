@@ -75,7 +75,7 @@ bash WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh
 특징:
 
 - `default_agent_loop=web_skd_agent`
-- tool config: `examples/sglang_multiturn/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
+- tool config: `WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
 - mock server 기본 endpoint: `http://127.0.0.1:18000`
 - 기본 train batch 16, response length 1024
 - teacher max model len은 기본 8073으로 student보다 여유를 둔다.
