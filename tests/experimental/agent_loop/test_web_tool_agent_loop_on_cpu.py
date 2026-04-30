@@ -49,6 +49,14 @@ class _FakeWebTool:
             "action_count": 1,
         }
 
+    async def execute_action_bundle(self, instance_id, actions, **kwargs):
+        self.executed.append((instance_id, {"actions": actions}, kwargs))
+        return ToolResponse(text="done"), None, {
+            "terminated": True,
+            "termination_reason": "model_done",
+            "action_count": len(actions),
+        }
+
     async def calc_reward(self, instance_id, **kwargs):
         self.rewards.append((instance_id, kwargs))
         return 1.0
@@ -231,6 +239,44 @@ async def test_processing_accepts_action_named_tool_call():
     assert next_state == AgentState.TERMINATED
     assert tool.executed[0][0] == "instance-1"
     assert tool.executed[0][1] == {"x": 1, "y": 2}
+    assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+
+
+@pytest.mark.asyncio
+async def test_processing_bundles_multiple_action_named_tool_calls():
+    loop = _make_loop()
+    tool = _FakeWebTool()
+    agent_data = _action_agent_data(tool, action_name="CLICK")
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_instance_id": "instance-1",
+            "web_osgym_task_id": "12345",
+            "web_osgym_session_id": 777,
+            "web_osgym_include_a11y": False,
+        }
+    )
+    tool._instance_dict["instance-1"] = {
+        "task_id": "12345",
+        "request_id": 777,
+        "include_a11y": False,
+        "reward": None,
+    }
+    agent_data.tool_calls = [
+        FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
+        FunctionCall(name="CLICK", arguments='{"x":3,"y":4}'),
+    ]
+
+    next_state = await loop._handle_processing_tools_state(agent_data)
+
+    assert next_state == AgentState.TERMINATED
+    assert tool.executed[0][0] == "instance-1"
+    assert tool.executed[0][1] == {
+        "actions": [
+            {"action_type": "CLICK", "x": 1, "y": 2},
+            {"action_type": "CLICK", "x": 3, "y": 4},
+        ]
+    }
+    assert agent_data.metrics["web_osgym/action_count"] == 2
     assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
 
 

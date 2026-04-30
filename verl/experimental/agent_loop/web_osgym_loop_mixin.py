@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from copy import deepcopy
 from uuid import uuid4
+
+from verl.tools.schemas import ToolResponse
 
 
 class WebOsGymLoopMixin:
@@ -54,6 +58,83 @@ class WebOsGymLoopMixin:
             cursor_x=agent_data.extra_fields.get("web_osgym_cursor_x"),
             cursor_y=agent_data.extra_fields.get("web_osgym_cursor_y"),
         )
+
+    def _bundle_web_osgym_tool_calls(self, agent_data) -> tuple[dict | None, ToolResponse | None]:
+        active_tools = getattr(agent_data, "_active_tools", {})
+        actions = []
+
+        for tool_call in agent_data.tool_calls:
+            if tool_call.name not in active_tools:
+                available = list(active_tools.keys())
+                return None, ToolResponse(text=f"Unknown function '{tool_call.name}'. Available tools: {available}")
+
+            try:
+                tool_args = json.loads(tool_call.arguments)
+            except (json.JSONDecodeError, TypeError) as exc:
+                return None, ToolResponse(text=f"Invalid JSON in arguments for '{tool_call.name}': {exc}")
+
+            if not isinstance(tool_args, Mapping):
+                return None, ToolResponse(
+                    text=f"Invalid arguments for '{tool_call.name}': expected an object, got {type(tool_args).__name__}"
+                )
+
+            if tool_call.name == self.legacy_bundled_tool_name:
+                raw_actions = tool_args.get("actions")
+                if not isinstance(raw_actions, list):
+                    return None, ToolResponse(
+                        text=f"Invalid arguments for '{tool_call.name}': expected a non-empty actions list"
+                    )
+                actions.extend(raw_actions)
+            else:
+                # The model sees Computer 13 as action-named tools, while the
+                # Web/OSGym server still receives one ordered actions list.
+                actions.append({"action_type": tool_call.name, **tool_args})
+
+        return {"actions": actions}, None
+
+    async def _execute_web_osgym_tool_calls(self, agent_data):
+        tool_call = agent_data.tool_calls[0]
+        active_tools = getattr(agent_data, "_active_tools", {})
+        if tool_call.name not in active_tools:
+            available = list(active_tools.keys())
+            return ToolResponse(text=f"Unknown function '{tool_call.name}'. Available tools: {available}"), None, {
+                "terminated": False,
+                "termination_reason": None,
+                "action_count": 0,
+                "invalid_action": True,
+            }
+        self._ensure_web_osgym_session(agent_data, tool_call.name)
+
+        if len(agent_data.tool_calls) == 1:
+            try:
+                tool_args = json.loads(tool_call.arguments)
+            except (json.JSONDecodeError, TypeError) as exc:
+                return ToolResponse(text=f"Invalid JSON in arguments for '{tool_call.name}': {exc}"), None, {
+                    "terminated": False,
+                    "termination_reason": None,
+                    "action_count": 0,
+                    "invalid_action": True,
+                }
+
+            tool = self._get_active_tool(agent_data, tool_call.name)
+            instance_id = agent_data.extra_fields["web_osgym_instance_id"]
+            return await tool.execute(instance_id, tool_args, agent_data=agent_data)
+
+        bundled_args, error_response = self._bundle_web_osgym_tool_calls(agent_data)
+        if error_response is not None:
+            return error_response, None, {
+                "terminated": False,
+                "termination_reason": None,
+                "action_count": 0,
+                "invalid_action": True,
+            }
+
+        tool = self._get_active_tool(agent_data, tool_call.name)
+        instance_id = agent_data.extra_fields["web_osgym_instance_id"]
+        execute_bundle = getattr(tool, "execute_action_bundle", None)
+        if execute_bundle is not None:
+            return await execute_bundle(instance_id, bundled_args["actions"], agent_data=agent_data)
+        return await tool.execute(instance_id, bundled_args, agent_data=agent_data)
 
     async def _start_web_osgym_session(self, agent_data, *, include_a11y: bool):
         tool = self._get_active_tool(agent_data)

@@ -105,6 +105,33 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["request_id"], 101)
         self.assertEqual(seen["task_id"], "12345")
 
+    async def test_tool_execute_logs_final_server_payload_before_action_request(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+
+        with self.assertLogs("verl.tools.web_osgym_tool", level="INFO") as logs:
+            await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]})
+
+        log_text = "\n".join(logs.output)
+        self.assertIn("[WebOsGymTool][ServerPayload]", log_text)
+        self.assertIn("request_id=101", log_text)
+        self.assertIn("task_id='12345'", log_text)
+        self.assertIn("'action_type': 'CLICK'", log_text)
+        self.assertEqual(seen["request_id"], 101)
+
     async def test_action_named_tool_execute_wraps_arguments_as_single_action(self):
         seen = {}
 

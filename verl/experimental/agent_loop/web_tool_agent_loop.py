@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 from copy import deepcopy
@@ -10,7 +9,6 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
-from verl.tools.schemas import ToolResponse
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
 
@@ -128,30 +126,8 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         return AgentState.GENERATING
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
-        tool_call = agent_data.tool_calls[0]
-        active_tools = getattr(agent_data, "_active_tools", self.tools)
-
-        result: dict[str, Any] = {
-            "terminated": False,
-            "termination_reason": None,
-            "action_count": 0,
-        }
-        if tool_call.name not in active_tools:
-            available = list(active_tools.keys())
-            tool_response = ToolResponse(text=f"Unknown function '{tool_call.name}'. Available tools: {available}")
-            result["invalid_action"] = True
-        else:
-            self._ensure_web_osgym_session(agent_data, tool_call.name)
-            try:
-                tool_args = json.loads(tool_call.arguments)
-            except (json.JSONDecodeError, TypeError) as exc:
-                tool_response = ToolResponse(text=f"Invalid JSON in arguments for '{tool_call.name}': {exc}")
-                result["invalid_action"] = True
-            else:
-                with simple_timer("tool_calls", agent_data.metrics):
-                    tool = self._get_active_tool(agent_data, tool_call.name)
-                    instance_id = agent_data.extra_fields["web_osgym_instance_id"]
-                    tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
+        with simple_timer("tool_calls", agent_data.metrics):
+            tool_response, _, result = await self._execute_web_osgym_tool_calls(agent_data)
 
         agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)
         if result.get("invalid_action"):

@@ -3,7 +3,6 @@ from copy import deepcopy
 from unittest.mock import patch
 
 import verl.experimental.agent_loop.web_skd_agent_loop as web_skd_agent_loop_module
-
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
@@ -65,6 +64,14 @@ class _ActionFakeTool(_FakeTool):
             "terminated": False,
             "termination_reason": None,
             "action_count": 1,
+        }
+
+    async def execute_action_bundle(self, instance_id, actions, **kwargs):
+        self.executed.append((instance_id, {"actions": actions}))
+        return ToolResponse(text="At failed_action_index 0, action Failed. Reason: target field was not focused"), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": len(actions),
         }
 
 
@@ -410,6 +417,129 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, AgentState.GENERATING)
         self.assertEqual(tool.executed[0], ("instance-1", {"x": 1, "y": 2}))
         self.assertEqual(agent_data.metrics["web_osgym/action_count"], 1)
+
+    async def test_processing_tools_bundles_multiple_action_named_tool_calls(self):
+        loop = _build_loop()
+        tool = _ActionFakeTool()
+        loop.tools = {"CLICK": tool}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 101,
+            "include_a11y": True,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            type("Call", (), {"name": "CLICK", "arguments": '{"x":1,"y":2}'})(),
+            type("Call", (), {"name": "CLICK", "arguments": '{"x":3,"y":4}'})(),
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(
+            tool.executed[0],
+            (
+                "instance-1",
+                {
+                    "actions": [
+                        {"action_type": "CLICK", "x": 1, "y": 2},
+                        {"action_type": "CLICK", "x": 3, "y": 4},
+                    ]
+                },
+            ),
+        )
+        self.assertEqual(agent_data.metrics["web_osgym/action_count"], 2)
+
+    async def test_processing_tools_begin_trace_includes_tool_call_summary(self):
+        loop = _build_loop()
+        tool = _ActionFakeTool()
+        loop.tools = {"CLICK": tool}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-1",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 101,
+            "include_a11y": True,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            type("Call", (), {"name": "CLICK", "arguments": '{"x":1,"y":2}'})(),
+            type("Call", (), {"name": "CLICK", "arguments": '{"x":3,"y":4}'})(),
+        ]
+        trace_calls = []
+
+        def _capture_trace(event_name, **kwargs):
+            trace_calls.append((event_name, kwargs))
+
+        with patch.object(web_skd_agent_loop_module, "_trace_async_skd", side_effect=_capture_trace):
+            state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        begin_event = next(kwargs for event_name, kwargs in trace_calls if event_name == "web_skd.tool_processing_begin")
+        self.assertEqual(begin_event["tool_calls_len"], 2)
+        self.assertEqual(begin_event["tool_call_names"], ["CLICK", "CLICK"])
 
     async def test_processing_tools_requires_existing_server_prompt_stream(self):
         loop = _build_loop()

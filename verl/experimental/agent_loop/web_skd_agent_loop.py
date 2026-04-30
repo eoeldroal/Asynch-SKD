@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import time
 import warnings
 from copy import deepcopy
 from typing import Any
@@ -10,7 +10,6 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, _safe_len, _trace_async_skd
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
-from verl.tools.schemas import ToolResponse
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.tokenizer import normalize_token_ids
 
@@ -303,25 +302,34 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         return agent_data, next_state
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
-        tool_call = agent_data.tool_calls[0]
-        self._ensure_web_osgym_session(agent_data, tool_call.name)
-        try:
-            tool_args = json.loads(tool_call.arguments)
-        except (json.JSONDecodeError, TypeError) as exc:
-            tool_response = ToolResponse(text=f"Invalid JSON in arguments for '{tool_call.name}': {exc}")
-            result = {
-                "terminated": False,
-                "termination_reason": None,
-                "action_count": 0,
-                "invalid_action": True,
-            }
-        else:
-            tool = self._get_active_tool(agent_data, tool_call.name)
-            instance_id = agent_data.extra_fields["web_osgym_instance_id"]
-            tool_response, _, result = await tool.execute(instance_id, tool_args, agent_data=agent_data)
+        tool_call_names = [getattr(tool_call, "name", None) for tool_call in agent_data.tool_calls]
+        _trace_async_skd(
+            "web_skd.tool_processing_begin",
+            request_id=agent_data.request_id,
+            response_len=len(agent_data.response_mask),
+            image_count=_safe_len(agent_data.image_data),
+            user_turns=agent_data.user_turns,
+            assistant_turns=agent_data.assistant_turns,
+            tool_calls_len=len(agent_data.tool_calls),
+            tool_call_names=tool_call_names,
+        )
+        tool_t0 = time.monotonic()
+        tool_response, _, result = await self._execute_web_osgym_tool_calls(agent_data)
+        tool_ms = (time.monotonic() - tool_t0) * 1000
         agent_data.metrics["web_osgym/action_count"] = result.get("action_count", 0)
         if result.get("invalid_action"):
             agent_data.metrics["web_osgym/invalid_action"] = 1
+        _trace_async_skd(
+            "web_skd.tool_processing_tool_done",
+            request_id=agent_data.request_id,
+            elapsed_ms=round(tool_ms, 1),
+            action_count=result.get("action_count", 0),
+            invalid_action=result.get("invalid_action", False),
+            terminated=result.get("terminated", False),
+            termination_reason=result.get("termination_reason"),
+            response_text_len=len(tool_response.text or ""),
+            image_count=_safe_len(tool_response.image),
+        )
 
         student_obs, teacher_obs = self._split_env_observation(tool_response.text, tool_response.image)
         image_data = tool_response.image if tool_response.image else None
@@ -331,15 +339,29 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         server_response_ids: list[int] = []
         if student_obs or image_data:
             student_message = self._build_tool_message(student_obs, image_data)
+            student_template_t0 = time.monotonic()
             response_ids = await self.apply_chat_template(
                 [student_message],
                 images=image_data,
                 videos=None,
                 remove_system_prompt=True,
             )
+            student_template_ms = (time.monotonic() - student_template_t0) * 1000
+            student_server_t0 = time.monotonic()
             server_response_ids = await self._apply_server_chat_template(
                 [student_message],
                 remove_system_prompt=True,
+            )
+            student_server_ms = (time.monotonic() - student_server_t0) * 1000
+            _trace_async_skd(
+                "web_skd.tool_processing_student_template_done",
+                request_id=agent_data.request_id,
+                template_ms=round(student_template_ms, 1),
+                server_template_ms=round(student_server_ms, 1),
+                response_ids_len=len(response_ids),
+                server_response_ids_len=len(server_response_ids),
+                image_count=_safe_len(image_data),
+                text_len=len(student_obs or ""),
             )
 
         teacher_message = None
@@ -347,15 +369,29 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         teacher_server_response_ids: list[int] = []
         if teacher_obs or image_data:
             teacher_message = self._build_tool_message(teacher_obs, image_data)
+            teacher_template_t0 = time.monotonic()
             teacher_response_ids = await self.apply_chat_template(
                 [teacher_message],
                 images=image_data,
                 videos=None,
                 remove_system_prompt=True,
             )
+            teacher_template_ms = (time.monotonic() - teacher_template_t0) * 1000
+            teacher_server_t0 = time.monotonic()
             teacher_server_response_ids = await self._apply_server_chat_template(
                 [teacher_message],
                 remove_system_prompt=True,
+            )
+            teacher_server_ms = (time.monotonic() - teacher_server_t0) * 1000
+            _trace_async_skd(
+                "web_skd.tool_processing_teacher_template_done",
+                request_id=agent_data.request_id,
+                template_ms=round(teacher_template_ms, 1),
+                server_template_ms=round(teacher_server_ms, 1),
+                response_ids_len=len(teacher_response_ids),
+                server_response_ids_len=len(teacher_server_response_ids),
+                image_count=_safe_len(image_data),
+                text_len=len(teacher_obs or ""),
             )
 
         teacher_surplus_delta = 0
@@ -373,6 +409,13 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         # tensors whose image tokens were never admitted into the final
         # sequence.
         if response_ids and len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            _trace_async_skd(
+                "web_skd.tool_processing_budget_exhausted",
+                request_id=agent_data.request_id,
+                response_len=len(agent_data.response_mask),
+                appended_response_ids_len=len(response_ids),
+                response_limit=self.response_length,
+            )
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_response_budget_exhausted")
             return AgentState.TERMINATED
 
@@ -423,12 +466,31 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             self._increment_skd_prefix_stats(agent_data, env_units=1, tokens=appended_len)
 
         if result.get("terminated"):
+            _trace_async_skd(
+                "web_skd.tool_processing_terminated",
+                request_id=agent_data.request_id,
+                appended_len=appended_len,
+                response_len=len(agent_data.response_mask),
+                termination_reason=result.get("termination_reason") or "model_done",
+                image_count=_safe_len(agent_data.image_data),
+            )
             await self._finalize_with_web_osgym_reward(
                 agent_data,
                 termination_reason=result.get("termination_reason") or "model_done",
             )
             return AgentState.TERMINATED
 
+        _trace_async_skd(
+            "web_skd.tool_processing_commit_done",
+            request_id=agent_data.request_id,
+            appended_len=appended_len,
+            response_len=len(agent_data.response_mask),
+            prompt_len=len(agent_data.prompt_ids),
+            image_count=_safe_len(agent_data.image_data),
+            teacher_sglang_prefix_surplus=agent_data.extra_fields.get("teacher_sglang_prefix_surplus"),
+            terminated=result.get("terminated", False),
+            termination_reason=result.get("termination_reason"),
+        )
         return AgentState.GENERATING
 
     async def _handle_generating_state(
