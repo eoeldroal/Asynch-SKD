@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import time
 import zlib
 from typing import Any, Optional
 
@@ -53,6 +54,40 @@ from verl.workers.rollout.utils import get_max_position_embeddings, run_uvicorn
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+_ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+
+
+def _trace_async_skd(stage: str, **fields: Any) -> None:
+    if _ASYNC_SKD_TRACE <= 0:
+        return
+    parts = [f"{key}={value!r}" for key, value in fields.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
+
+
+def _safe_len(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 1
+
+
+def _count_compact_prompt_logprob_rows(meta_info: dict, num_prompt_logprobs: int) -> int:
+    if num_prompt_logprobs > 0:
+        return sum(1 for row in meta_info.get("input_top_logprobs") or [] if row is not None)
+
+    count = 0
+    for row in meta_info.get("input_token_logprobs") or []:
+        if row is None:
+            continue
+        logprob, _, _ = row
+        if logprob is not None:
+            count += 1
+    return count
+
 
 visible_devices_keyword = get_visible_devices_keyword()
 
@@ -532,6 +567,7 @@ class SGLangHttpServer:
         prompt_ids: torch.Tensor,
         sampling_params: dict[str, Any],
         request_id: str,
+        prompt_text: Optional[str] = None,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
@@ -575,16 +611,22 @@ class SGLangHttpServer:
         prompt_logprobs_expected_len = sampling_params.pop("prompt_logprobs_expected_len", None)
         if prompt_logprobs is not None:
             return_logprob = True
+        if prompt_text is not None and prompt_logprobs is not None:
+            raise ValueError("prompt_text is not supported for prompt_logprobs requests.")
+        request_input_kind = "text" if prompt_text is not None else "input_ids"
 
         request = {
             "rid": request_id,
-            "input_ids": prompt_ids,
             "sampling_params": sampling_params,
             "return_logprob": return_logprob,
             "image_data": image_data,
             # TODO: support video input for sglang
             # video_data=video_data,
         }
+        if prompt_text is not None:
+            request["text"] = prompt_text
+        else:
+            request["input_ids"] = prompt_ids
 
         if prompt_logprobs is not None:
             request["logprob_start_len"] = prompt_logprobs_start_len or 0
@@ -600,10 +642,94 @@ class SGLangHttpServer:
         if self.model_config.lora_rank > 0:
             generate_request.lora_path = SGLANG_LORA_NAME
 
+        is_skd_prompt_logprob = prompt_logprobs is not None
+        expected_delta_len = None
+        if prompt_logprobs_expected_len is not None:
+            expected_delta_len = int(prompt_logprobs_expected_len)
+        elif prompt_logprobs_start_len is not None:
+            expected_delta_len = len(prompt_ids) - prompt_logprobs_start_len - 1
+        if is_skd_prompt_logprob:
+            _trace_async_skd(
+                "sglang.generate_request_begin",
+                request_id=request_id,
+                request_input_kind=request_input_kind,
+                prompt_len=len(prompt_ids),
+                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
+                max_new_tokens=max_new_tokens,
+                return_logprob=return_logprob,
+                prompt_logprobs=prompt_logprobs,
+                logprob_start_len=prompt_logprobs_start_len,
+                expected_delta_len=expected_delta_len,
+                prompt_logprobs_expected_len=prompt_logprobs_expected_len,
+                expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                image_count=_safe_len(image_data),
+                video_count=_safe_len(video_data),
+                max_model_len=self.config.max_model_len,
+            )
+        else:
+            _trace_async_skd(
+                "sglang.generate_request_begin",
+                request_id=request_id,
+                request_input_kind=request_input_kind,
+                prompt_len=len(prompt_ids),
+                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
+                max_new_tokens=max_new_tokens,
+                return_logprob=return_logprob,
+                image_count=_safe_len(image_data),
+                video_count=_safe_len(video_data),
+                max_model_len=self.config.max_model_len,
+            )
+
+        generate_t0 = time.monotonic()
         output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        generate_ms = (time.monotonic() - generate_t0) * 1000
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
+        raw_compact_prompt_rows = None
+        if is_skd_prompt_logprob:
+            raw_compact_prompt_rows = _count_compact_prompt_logprob_rows(meta_info, int(prompt_logprobs or 0))
+            _trace_async_skd(
+                "sglang.generate_request_done",
+                request_id=request_id,
+                request_input_kind=request_input_kind,
+                elapsed_ms=round(generate_ms, 1),
+                prompt_len=len(prompt_ids),
+                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
+                output_ids_len=_safe_len(output.get("output_ids")),
+                finish_reason=finish_reason,
+                input_token_logprobs_len=_safe_len(meta_info.get("input_token_logprobs")),
+                input_top_logprobs_len=_safe_len(meta_info.get("input_top_logprobs")),
+                compact_prompt_rows=raw_compact_prompt_rows,
+                raw_compact_rows=raw_compact_prompt_rows,
+                logprob_start_len=prompt_logprobs_start_len,
+                expected_delta_len=expected_delta_len,
+                prompt_logprobs_expected_len=prompt_logprobs_expected_len,
+                expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                queue_time=meta_info.get("queue_time"),
+                prefill_launch_delay=meta_info.get("prefill_launch_delay"),
+                prefill_launch_latency=meta_info.get("prefill_launch_latency"),
+                inference_time=meta_info.get("inference_time"),
+                request_sent_to_scheduler_ts=meta_info.get("request_sent_to_scheduler_ts"),
+                response_sent_to_client_ts=meta_info.get("response_sent_to_client_ts"),
+            )
+        else:
+            _trace_async_skd(
+                "sglang.generate_request_done",
+                request_id=request_id,
+                request_input_kind=request_input_kind,
+                elapsed_ms=round(generate_ms, 1),
+                prompt_len=len(prompt_ids),
+                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
+                output_ids_len=_safe_len(output.get("output_ids")),
+                finish_reason=finish_reason,
+                queue_time=meta_info.get("queue_time"),
+                prefill_launch_delay=meta_info.get("prefill_launch_delay"),
+                prefill_launch_latency=meta_info.get("prefill_launch_latency"),
+                inference_time=meta_info.get("inference_time"),
+                request_sent_to_scheduler_ts=meta_info.get("request_sent_to_scheduler_ts"),
+                response_sent_to_client_ts=meta_info.get("response_sent_to_client_ts"),
+            )
         if return_logprob:
             token_ids = list(output.get("output_ids", []))
             output_token_logprobs = meta_info.get("output_token_logprobs") or []
@@ -642,6 +768,7 @@ class SGLangHttpServer:
 
         extra_fields = {"global_steps": self.global_steps}
         if prompt_logprobs is not None:
+            extract_t0 = time.monotonic()
             if prompt_logprobs_start_len is not None and prompt_logprobs_start_len > 0:
                 _extract_skd_delta_prompt_logprobs_sglang(
                     meta_info=meta_info,
@@ -659,6 +786,24 @@ class SGLangHttpServer:
                     sequence_length=len(prompt_ids),
                     result_dict=extra_fields,
                 )
+            extract_ms = (time.monotonic() - extract_t0) * 1000
+            extracted_rows = _safe_len(extra_fields.get("prompt_ids"))
+            first_row = extra_fields.get("prompt_ids", [[]])[0] if extracted_rows else []
+            trimmed_rows = None
+            if raw_compact_prompt_rows is not None:
+                trimmed_rows = max(raw_compact_prompt_rows - extracted_rows, 0)
+            _trace_async_skd(
+                "sglang.prompt_logprobs_extract_done",
+                request_id=request_id,
+                elapsed_ms=round(extract_ms, 1),
+                raw_compact_rows=raw_compact_prompt_rows,
+                extracted_rows=extracted_rows,
+                extracted_width=_safe_len(first_row),
+                trimmed_rows=trimmed_rows,
+                expected_delta_len=expected_delta_len,
+                prompt_logprobs_expected_len=prompt_logprobs_expected_len,
+                expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+            )
 
         return TokenOutput(
             token_ids=token_ids,

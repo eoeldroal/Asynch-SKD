@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, _safe_len, _trace_async_skd
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.tools.schemas import ToolResponse
@@ -63,6 +63,33 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         return image_data
 
     @staticmethod
+    def _first_mismatch_index(left: list[int], right: list[int]) -> int | None:
+        limit = min(len(left), len(right))
+        for idx in range(limit):
+            if left[idx] != right[idx]:
+                return idx
+        if len(left) != len(right):
+            return limit
+        return None
+
+    @staticmethod
+    def _token_window(tokens: list[int], center: int | None, *, radius: int = 8) -> list[int]:
+        if center is None:
+            return []
+        start = max(center - radius, 0)
+        end = min(center + radius + 1, len(tokens))
+        return list(tokens[start:end])
+
+    @staticmethod
+    def _encode_prompt_text_for_drift(tokenizer, prompt_text: str) -> list[int]:
+        if hasattr(tokenizer, "encode"):
+            return normalize_token_ids(tokenizer.encode(prompt_text, add_special_tokens=False))
+        encoded = tokenizer(prompt_text, add_special_tokens=False)
+        if isinstance(encoded, dict):
+            encoded = encoded["input_ids"]
+        return normalize_token_ids(encoded)
+
+    @staticmethod
     def _multimodal_prefix_surplus_delta(
         expanded_ids: list[int],
         server_ids: list[int],
@@ -78,6 +105,59 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         if not image_data:
             return 0
         return max(len(expanded_ids) - len(server_ids), 0)
+
+    async def _build_student_generate_prompt_text(
+        self,
+        agent_data: AgentData,
+        server_prompt_ids: list[int],
+    ) -> str | None:
+        if not agent_data.image_data:
+            return None
+
+        prompt_text = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.decode(
+                server_prompt_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            ),
+        )
+        roundtrip_ids = await self.loop.run_in_executor(
+            None,
+            lambda: self._encode_prompt_text_for_drift(self.tokenizer, prompt_text),
+        )
+        first_mismatch = self._first_mismatch_index(server_prompt_ids, roundtrip_ids)
+        roundtrip_match = first_mismatch is None
+
+        agent_data.extra_fields["student_generate_prompt_text_used"] = True
+        agent_data.extra_fields["student_generate_prompt_text_len"] = len(prompt_text)
+        agent_data.extra_fields["student_generate_roundtrip_match"] = roundtrip_match
+        agent_data.extra_fields["student_generate_roundtrip_prompt_len"] = len(server_prompt_ids)
+        agent_data.extra_fields["student_generate_roundtrip_len"] = len(roundtrip_ids)
+        agent_data.extra_fields["student_generate_roundtrip_first_mismatch"] = first_mismatch
+        agent_data.extra_fields["student_generate_roundtrip_prompt_window"] = self._token_window(
+            server_prompt_ids,
+            first_mismatch,
+        )
+        agent_data.extra_fields["student_generate_roundtrip_roundtrip_window"] = self._token_window(
+            roundtrip_ids,
+            first_mismatch,
+        )
+
+        _trace_async_skd(
+            "web_skd.student_prompt_text_view",
+            request_id=agent_data.request_id,
+            prompt_text_len=len(prompt_text),
+            server_prompt_len=len(server_prompt_ids),
+            roundtrip_len=len(roundtrip_ids),
+            roundtrip_match=roundtrip_match,
+            roundtrip_first_mismatch=first_mismatch,
+            roundtrip_prompt_len=len(server_prompt_ids),
+            roundtrip_prompt_window=agent_data.extra_fields["student_generate_roundtrip_prompt_window"],
+            roundtrip_roundtrip_window=agent_data.extra_fields["student_generate_roundtrip_roundtrip_window"],
+            image_count=_safe_len(agent_data.image_data),
+        )
+        return prompt_text
 
     async def _recompute_teacher_prompt_ids(self, agent_data: AgentData) -> list[int]:
         teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))

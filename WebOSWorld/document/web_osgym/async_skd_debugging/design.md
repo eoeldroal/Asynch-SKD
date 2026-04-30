@@ -4,6 +4,8 @@
 
 이 문서는 현재 `verl` 코드베이스에 구현된 async SKD 구조를 정리한다. 초기 아이디어 문서가 아니라, 현재 코드와 실행 스크립트가 따르는 source-of-truth 설계 문서다.
 
+관련 성능 RCA: [multimodal_pretokenized_stall.md](./multimodal_pretokenized_stall.md)
+
 핵심 질문은 네 가지다.
 
 1. SKD token semantics는 어디서 유지되는가

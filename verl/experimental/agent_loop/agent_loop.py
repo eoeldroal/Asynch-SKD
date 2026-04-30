@@ -32,6 +32,7 @@ from transformers import AutoProcessor, AutoTokenizer
 
 from verl.experimental.agent_loop.prometheus_utils import update_prometheus_config
 from verl.experimental.agent_loop.utils import resolve_config_path
+from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.teacher_loop import MultiTeacherModelManager
 from verl.protocol import DataProto
 from verl.single_controller.ray.base import RayResourcePool, RayWorkerGroup
@@ -224,6 +225,7 @@ class AsyncLLMServerManager:
         request_id,
         *,
         prompt_ids: list[int],
+        prompt_text: Optional[str] = None,
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
@@ -240,16 +242,54 @@ class AsyncLLMServerManager:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
         server_id, server = await self._acquire_server(request_id)
+        request_instance_id = uuid4().hex
+        emit_async_skd_event(
+            "replica_request_start",
+            replica_id=server_id,
+            role="student",
+            request_kind="student_generate",
+            request_instance_id=request_instance_id,
+            prompt_len=len(prompt_ids),
+            request_input_kind="text" if prompt_text is not None else "input_ids",
+            prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
+            image_count=len(image_data) if image_data is not None else 0,
+        )
         try:
             output: TokenOutput | DiffusionOutput = await server.generate.remote(
-                request_id=uuid4().hex,  # use new request_id for each turn
+                request_id=request_instance_id,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
+                prompt_text=prompt_text,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
                 **kwargs,
             )
+            if isinstance(output, TokenOutput):
+                output.extra_fields["rollout_server_id"] = server_id
+                output_tokens = len(output.token_ids)
+            else:
+                output_tokens = None
+            emit_async_skd_event(
+                "replica_request_finish",
+                replica_id=server_id,
+                role="student",
+                request_kind="student_generate",
+                request_instance_id=request_instance_id,
+                status="ok",
+                output_tokens=output_tokens,
+            )
             return output
+        except Exception as exc:
+            emit_async_skd_event(
+                "replica_request_finish",
+                replica_id=server_id,
+                role="student",
+                request_kind="student_generate",
+                request_instance_id=request_instance_id,
+                status="error",
+                error=repr(exc),
+            )
+            raise
         finally:
             self._release_server(server_id)
 

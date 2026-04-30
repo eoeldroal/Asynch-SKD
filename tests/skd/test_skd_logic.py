@@ -9,6 +9,7 @@ quickly on CPU.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import json
 from typing import Any
@@ -19,6 +20,7 @@ import torch
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, _build_teacher_logprob_range
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.experimental.async_skd.events import async_skd_event_context
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.workers.rollout.replica import TokenOutput
@@ -39,6 +41,28 @@ class FakeTokenizer:
     def decode(self, ids: list[int], skip_special_tokens: bool = True) -> str:
         del skip_special_tokens
         return " ".join(str(i) for i in ids)
+
+
+class FakeWebPromptTokenizer(FakeTokenizer):
+    def decode(
+        self,
+        ids: list[int],
+        *,
+        skip_special_tokens: bool = False,
+        clean_up_tokenization_spaces: bool = False,
+    ) -> str:
+        assert skip_special_tokens is False
+        assert clean_up_tokenization_spaces is False
+        return "decoded:" + ",".join(str(token_id) for token_id in ids)
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        assert add_special_tokens is False
+        if not text.startswith("decoded:"):
+            return []
+        suffix = text[len("decoded:") :]
+        if not suffix:
+            return []
+        return [int(part) for part in suffix.split(",")]
 
 
 class FakeHermesTokenizer:
@@ -75,8 +99,9 @@ class FakeStudentServer:
         sampling_params: dict[str, Any],
         image_data: Any = None,
         video_data: Any = None,
+        prompt_text: str | None = None,
     ) -> TokenOutput:
-        del image_data, video_data
+        del video_data
         assert self.call_count < len(self.chunks), (
             f"student chunks exhausted at call {self.call_count}; "
             f"prompt={prompt_ids}, request_id={request_id}"
@@ -88,6 +113,8 @@ class FakeStudentServer:
                 "prompt_ids": list(prompt_ids),
                 "prompt_len": len(prompt_ids),
                 "max_tokens": sampling_params.get("max_tokens"),
+                "prompt_text": prompt_text,
+                "image_data": image_data,
                 "chunk": chunk,
             }
         )
@@ -199,6 +226,35 @@ def make_skd_loop(
     loop.teacher_server_manager = FakeTeacherServer(teacher_topk_by_call, k=LOSS_TOP_K)
     loop.server_manager = FakeStudentServer(student_chunks)
     loop.tokenizer = FakeTokenizer()
+    loop.response_length = response_length
+    loop.skd_chunk_size = chunk_size
+    loop.skd_verify_top_k = VERIFY_TOP_K
+    loop.max_chunks_per_sample = max_chunks
+    loop.loss_top_k = LOSS_TOP_K
+    loop.teacher_key = "data_source"
+    loop.tools = {}
+    loop.tool_schemas = []
+    loop.tool_parser = FakeToolParser()
+    loop.interaction_config_file = None
+    loop.max_assistant_turns = None
+    loop.max_user_turns = None
+    loop.processor = None
+    return loop
+
+
+def make_web_skd_loop(
+    *,
+    student_chunks: list[list[int]],
+    teacher_topk_by_call: list[dict[int, list[int]]] | None = None,
+    chunk_size: int = 8,
+    max_chunks: int = 32,
+    response_length: int = 128,
+) -> WebSkdAgentLoop:
+    loop = WebSkdAgentLoop.__new__(WebSkdAgentLoop)
+    loop.teacher_server_manager = FakeTeacherServer(teacher_topk_by_call, k=LOSS_TOP_K)
+    loop.server_manager = FakeStudentServer(student_chunks)
+    loop.tokenizer = FakeWebPromptTokenizer()
+    loop.loop = asyncio.get_running_loop()
     loop.response_length = response_length
     loop.skd_chunk_size = chunk_size
     loop.skd_verify_top_k = VERIFY_TOP_K
@@ -1215,6 +1271,30 @@ async def test_skd_teacher_verification_receives_current_tool_images():
 
     assert next_state == AgentState.TERMINATED
     assert loop.teacher_server_manager.call_log[0]["multi_modal_data"] == {"images": [image]}
+
+
+@pytest.mark.asyncio
+async def test_web_skd_image_generation_uses_prompt_text_but_appends_suffix_to_server_prompt_ids():
+    loop = make_web_skd_loop(student_chunks=[[10, EOS]], chunk_size=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+
+    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    assert next_state == AgentState.TERMINATED
+    student_call = loop.server_manager.call_log[0]
+    assert student_call["prompt_ids"] == [1, 2, 3]
+    assert student_call["prompt_text"] == "decoded:1,2,3"
+    assert student_call["image_data"] == ["image-1"]
+    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3, 10, EOS]
+    assert agent_data.prompt_ids == [1, 2, 3, 10, EOS]
+    assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3, 10, EOS]
+    assert agent_data.extra_fields["student_generate_prompt_text_used"] is True
+    assert agent_data.extra_fields["student_generate_roundtrip_match"] is True
+    assert_skd_alignment(agent_data)
 
 
 @pytest.mark.asyncio

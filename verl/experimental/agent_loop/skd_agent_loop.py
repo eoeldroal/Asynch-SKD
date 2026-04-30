@@ -738,6 +738,14 @@ class SkdAgentLoop(ToolAgentLoop):
             self._increment_skd_prefix_stats(agent_data, env_units=1, tokens=appended_len)
         return next_state
 
+    async def _build_student_generate_prompt_text(
+        self,
+        agent_data: AgentData,
+        server_prompt_ids: list[int],
+    ) -> str | None:
+        del agent_data, server_prompt_ids
+        return None
+
     async def _handle_generating_state(
         self,
         agent_data: AgentData,
@@ -803,11 +811,43 @@ class SkdAgentLoop(ToolAgentLoop):
                 actual_chunk_size = min(self.skd_chunk_size, remaining_budget)
 
                 # 1. Student generates a chunk
+                next_chunk_idx = skd_metrics["chunk_count"] + 1
+                _trace_async_skd(
+                    "loop.student_generate_begin",
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    server_prompt_len=len(server_prompt_ids),
+                    response_len=len(agent_data.response_mask),
+                    max_tokens=actual_chunk_size,
+                    image_count=_safe_len(agent_data.image_data),
+                    video_count=_safe_len(agent_data.video_data),
+                )
+                student_prompt_text = await self._build_student_generate_prompt_text(
+                    agent_data,
+                    server_prompt_ids,
+                )
+                request_input_kind = "text" if student_prompt_text is not None else "input_ids"
+                _trace_async_skd(
+                    "loop.student_generate_request_view",
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    request_input_kind=request_input_kind,
+                    server_prompt_len=len(server_prompt_ids),
+                    prompt_text_len=len(student_prompt_text) if student_prompt_text is not None else 0,
+                    roundtrip_match=agent_data.extra_fields.get("student_generate_roundtrip_match"),
+                    roundtrip_prompt_len=agent_data.extra_fields.get("student_generate_roundtrip_prompt_len"),
+                    roundtrip_len=agent_data.extra_fields.get("student_generate_roundtrip_len"),
+                    roundtrip_first_mismatch=agent_data.extra_fields.get(
+                        "student_generate_roundtrip_first_mismatch"
+                    ),
+                    image_count=_safe_len(agent_data.image_data),
+                )
                 chunk_t0 = time.monotonic()
                 with simple_timer("skd_student_chunk", agent_data.metrics):
                     chunk_output = await self.server_manager.generate(
                         request_id=agent_data.request_id,
                         prompt_ids=server_prompt_ids,
+                        prompt_text=student_prompt_text,
                         sampling_params={**sampling_params, "max_tokens": actual_chunk_size},
                         image_data=agent_data.image_data,
                         video_data=agent_data.video_data,
@@ -816,6 +856,15 @@ class SkdAgentLoop(ToolAgentLoop):
                 chunk = chunk_output.token_ids
                 student_ms = (time.monotonic() - chunk_t0) * 1000
                 skd_metrics["student_gen_ms"] += student_ms
+                _trace_async_skd(
+                    "loop.student_generate_done",
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    elapsed_ms=round(student_ms, 1),
+                    output_len=len(chunk),
+                    stop_reason=chunk_output.stop_reason,
+                    server_prompt_len=len(server_prompt_ids),
+                )
 
                 if not chunk:
                     termination_reason = "empty_chunk"
@@ -902,6 +951,24 @@ class SkdAgentLoop(ToolAgentLoop):
                     )
                     logprob_start_len = teacher_logprob_range.sglang_logprob_start_len
                     expected_mm_prefix_surplus = teacher_logprob_range.teacher_sglang_prefix_surplus
+                    expected_suffix_len = teacher_logprob_range.expected_logprob_rows
+                    _trace_async_skd(
+                        "loop.teacher_compute_begin",
+                        request_id=agent_data.request_id,
+                        chunk_idx=next_chunk_idx,
+                        teacher_replica_id=teacher_replica_id,
+                        teacher_routing_key=teacher_routing_key,
+                        seq_len=len(verify_sequence),
+                        teacher_server_prompt_len=len(teacher_server_prompt_ids),
+                        logprob_start_len=logprob_start_len,
+                        expected_suffix_len=expected_suffix_len,
+                        expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                        server_logical_start_len=teacher_logprob_range.server_logical_start_len,
+                        sglang_logprob_start_len=teacher_logprob_range.sglang_logprob_start_len,
+                        expected_logprob_rows=teacher_logprob_range.expected_logprob_rows,
+                        teacher_sglang_prefix_surplus=teacher_logprob_range.teacher_sglang_prefix_surplus,
+                        image_count=_safe_len(self._current_multi_modal_data(agent_data).get("images")),
+                    )
                     teacher_ids, teacher_logprobs = (
                         await self.teacher_server_manager.compute_teacher_logprobs_single(
                             request_id=agent_data.request_id,
@@ -915,6 +982,20 @@ class SkdAgentLoop(ToolAgentLoop):
                     )
                 teacher_ms = (time.monotonic() - teacher_t0) * 1000
                 skd_metrics["teacher_verify_ms"] += teacher_ms
+                _trace_async_skd(
+                    "loop.teacher_compute_done",
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    elapsed_ms=round(teacher_ms, 1),
+                    teacher_rows=int(teacher_ids.shape[0]),
+                    teacher_width=int(teacher_ids.shape[1]) if teacher_ids.dim() > 1 else 1,
+                    expected_suffix_len=expected_suffix_len,
+                    expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                    teacher_sglang_prefix_surplus=teacher_logprob_range.teacher_sglang_prefix_surplus,
+                    server_logical_start_len=teacher_logprob_range.server_logical_start_len,
+                    sglang_logprob_start_len=teacher_logprob_range.sglang_logprob_start_len,
+                    expected_logprob_rows=teacher_logprob_range.expected_logprob_rows,
+                )
                 # In SGLang delta mode, teacher_ids / teacher_logprobs only cover the
                 # chunk suffix rows needed by SKD, aligned so local row k supervises
                 # chunk token k.
@@ -963,6 +1044,8 @@ class SkdAgentLoop(ToolAgentLoop):
                         f"teacher_prefix_len={len(teacher_prompt_ids)} "
                         f"teacher_server_prefix_len={len(teacher_server_prompt_ids)} "
                         f"teacher_mm_prefix_surplus={expected_mm_prefix_surplus} "
+                        f"teacher_server_start={teacher_logprob_range.server_logical_start_len} "
+                        f"teacher_sglang_start={teacher_logprob_range.sglang_logprob_start_len} "
                         f"teacher_suffix_len={len(chunk)} "
                         f"teacher_seq_len={len(verify_sequence)} "
                         f"chunk_len={len(chunk)} accepted={acc} rejected={1 if rejection_pos is not None else 0} "

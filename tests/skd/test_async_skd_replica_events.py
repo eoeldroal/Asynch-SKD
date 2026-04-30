@@ -37,9 +37,10 @@ class _FakeLoadBalancer:
 class _FakeServer:
     def __init__(self):
         self.generate = _RemoteMethod(self._generate)
+        self.calls: list[dict] = []
 
     async def _generate(self, **kwargs) -> TokenOutput:
-        del kwargs
+        self.calls.append(dict(kwargs))
         return TokenOutput(token_ids=[1, 2, 3], log_probs=None, stop_reason="length", extra_fields={})
 
 
@@ -80,4 +81,29 @@ async def test_async_llm_server_manager_emits_replica_request_events(tmp_path, m
     assert events[1]["status"] == "ok"
     assert events[1]["output_tokens"] == 3
     assert output.extra_fields["rollout_server_id"] == "student-replica-0"
+    assert load_balancer.released == ["student-replica-0"]
+
+
+@pytest.mark.asyncio
+async def test_async_llm_server_manager_passes_prompt_text_to_server():
+    load_balancer = _FakeLoadBalancer()
+    fake_server = _FakeServer()
+    manager = AsyncLLMServerManager(
+        config=OmegaConf.create({}),
+        servers=[("student-replica-0", fake_server)],
+        load_balancer_handle=load_balancer,
+    )
+
+    output = await manager.generate(
+        request_id="request-text-view",
+        prompt_ids=[10, 11, 12],
+        prompt_text="<|im_start|>user\n<image><|im_end|>\n<|im_start|>assistant\n",
+        sampling_params={"max_tokens": 1},
+        image_data=["image-1"],
+    )
+
+    assert output.token_ids == [1, 2, 3]
+    assert fake_server.calls[0]["prompt_ids"] == [10, 11, 12]
+    assert fake_server.calls[0]["prompt_text"] == "<|im_start|>user\n<image><|im_end|>\n<|im_start|>assistant\n"
+    assert fake_server.calls[0]["image_data"] == ["image-1"]
     assert load_balancer.released == ["student-replica-0"]
