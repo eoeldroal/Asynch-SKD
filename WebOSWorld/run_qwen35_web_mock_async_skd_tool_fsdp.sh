@@ -62,6 +62,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_model_len=10241 \
     actor_rollout_ref.rollout.max_num_batched_tokens=10241 \
     actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.skip_tokenizer_init=False \
     actor_rollout_ref.rollout.trace.backend=mlflow \
     actor_rollout_ref.rollout.trace.token2text=True \
     actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker=1 \
