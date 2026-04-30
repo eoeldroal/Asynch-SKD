@@ -134,6 +134,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("A11Y_TREE", str(agent_data.messages))
         self.assertTrue(agent_data.extra_fields["web_osgym_teacher_observation_text"].startswith("A11Y_TREE"))
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [7, 8, 9])
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 1)
 
     async def test_pending_discards_whole_start_bundle_when_tokenization_fails(self):
         loop = _build_loop()
@@ -214,10 +215,125 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
         self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 0)
         self.assertIn("failed_action_index", str(agent_data.messages[-1]["content"]))
         self.assertEqual(agent_data.metrics["web_osgym/action_count"], 2)
         self.assertEqual(len(agent_data.extra_fields["teacher_ids_list"]), len(agent_data.response_mask))
         self.assertEqual(len(agent_data.extra_fields["teacher_logprobs_list"]), len(agent_data.response_mask))
+
+    async def test_processing_tools_updates_teacher_sglang_prefix_surplus_for_image_observation(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _ImageFakeTool()}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            images = kwargs.get("images") or []
+            return [11, 12] + [90] * (3 * len(images))
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            return [21, 22]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-image-surplus",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                },
+            )()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 3)
+
+    async def test_processing_tools_does_not_count_teacher_only_text_gap_as_sglang_surplus(self):
+        loop = _build_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            return [11, 12, 13, 14]
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            return [21, 22]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-teacher-text-gap",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                },
+            )()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 0)
 
     async def test_processing_tools_accepts_action_named_tool_call(self):
         loop = _build_loop()

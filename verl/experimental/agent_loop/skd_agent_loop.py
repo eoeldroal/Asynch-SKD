@@ -25,6 +25,7 @@ eliminating the need for a separate teacher logprob computation in postprocessin
 """
 
 from copy import deepcopy
+from dataclasses import dataclass
 import inspect
 import logging
 import os
@@ -62,6 +63,68 @@ def _trace_async_skd(stage: str, **fields: Any) -> None:
     parts = [f"{key}={value!r}" for key, value in fields.items()]
     suffix = f" {' '.join(parts)}" if parts else ""
     print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
+
+
+def _safe_len(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 1
+
+
+@dataclass(frozen=True)
+class SkdTeacherLogprobRange:
+    """Named coordinate contract for teacher prompt-logprob delta requests."""
+
+    server_logical_start_len: int
+    sglang_logprob_start_len: int
+    expected_logprob_rows: int
+    teacher_sglang_prefix_surplus: int
+
+
+def _build_teacher_logprob_range(
+    *,
+    teacher_server_prompt_len: int,
+    teacher_sglang_prefix_surplus: int,
+    chunk_len: int,
+) -> SkdTeacherLogprobRange:
+    """Build the teacher range in logical and SGLang-expanded coordinates.
+
+    ``teacher_server_prompt_len`` is the real teacher prefix length sent through
+    SGLang's token-in multimodal API. It includes teacher-only system prompts,
+    a11y trees, and teacher-only tool-result text. ``teacher_sglang_prefix_surplus``
+    is only the cumulative multimodal expansion offset that SGLang applies
+    internally before interpreting ``logprob_start_len``.
+    """
+    if teacher_server_prompt_len <= 0:
+        raise ValueError(f"teacher_server_prompt_len must be positive, got {teacher_server_prompt_len}.")
+    if teacher_sglang_prefix_surplus < 0:
+        raise ValueError(
+            f"teacher_sglang_prefix_surplus must be non-negative, got {teacher_sglang_prefix_surplus}."
+        )
+    if chunk_len < 0:
+        raise ValueError(f"chunk_len must be non-negative, got {chunk_len}.")
+
+    server_logical_start_len = teacher_server_prompt_len - 1
+    sglang_logprob_start_len = server_logical_start_len + teacher_sglang_prefix_surplus
+    return SkdTeacherLogprobRange(
+        server_logical_start_len=server_logical_start_len,
+        sglang_logprob_start_len=sglang_logprob_start_len,
+        expected_logprob_rows=chunk_len,
+        teacher_sglang_prefix_surplus=teacher_sglang_prefix_surplus,
+    )
+
+
+def _teacher_sglang_prefix_surplus_from_fields(extra_fields: dict[str, Any]) -> int:
+    """Return the tracked teacher multimodal expansion surplus."""
+    tracked = extra_fields.get("teacher_sglang_prefix_surplus")
+    if tracked is not None:
+        return max(int(tracked), 0)
+    teacher_prompt_ids = extra_fields.get("teacher_prompt_ids", [])
+    teacher_server_prompt_ids = extra_fields.get("teacher_server_prompt_ids", [])
+    return max(_safe_len(teacher_prompt_ids) - _safe_len(teacher_server_prompt_ids), 0)
 
 
 @register("skd_agent")
@@ -831,14 +894,21 @@ class SkdAgentLoop(ToolAgentLoop):
                             stacklevel=1,
                         )
                         break
-                    logprob_start_len = max(len(teacher_server_prompt_ids) - 1, 0)
-                    expected_mm_prefix_surplus = max(len(teacher_prompt_ids) - len(teacher_server_prompt_ids), 0)
+                    teacher_sglang_prefix_surplus = _teacher_sglang_prefix_surplus_from_fields(agent_data.extra_fields)
+                    teacher_logprob_range = _build_teacher_logprob_range(
+                        teacher_server_prompt_len=len(teacher_server_prompt_ids),
+                        teacher_sglang_prefix_surplus=teacher_sglang_prefix_surplus,
+                        chunk_len=len(chunk),
+                    )
+                    logprob_start_len = teacher_logprob_range.sglang_logprob_start_len
+                    expected_mm_prefix_surplus = teacher_logprob_range.teacher_sglang_prefix_surplus
                     teacher_ids, teacher_logprobs = (
                         await self.teacher_server_manager.compute_teacher_logprobs_single(
                             request_id=agent_data.request_id,
                             sequence_ids=verify_sequence,
                             logprob_start_len=logprob_start_len,
                             expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                            expected_logprob_rows=teacher_logprob_range.expected_logprob_rows,
                             multi_modal_data=self._current_multi_modal_data(agent_data),
                             routing_key=teacher_routing_key,
                         )

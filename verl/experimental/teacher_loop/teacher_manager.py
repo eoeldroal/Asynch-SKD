@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -37,6 +38,15 @@ def _trace_async_skd(stage: str, **fields: Any) -> None:
     parts = [f"{key}={value!r}" for key, value in fields.items()]
     suffix = f" {' '.join(parts)}" if parts else ""
     print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
+
+
+def _safe_len(value: Any) -> int:
+    if value is None:
+        return 0
+    try:
+        return len(value)
+    except TypeError:
+        return 1
 
 
 def _get_teacher_sampling_params(
@@ -160,6 +170,7 @@ class AsyncTeacherLLMServerManager:
         request_id: Optional[str] = None,
         logprob_start_len: int = 0,
         expected_mm_prefix_surplus: Optional[int] = None,
+        expected_logprob_rows: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
@@ -177,29 +188,61 @@ class AsyncTeacherLLMServerManager:
             sampling_params["prompt_logprobs_start_len"] = logprob_start_len
         if expected_mm_prefix_surplus is not None:
             sampling_params["expected_mm_prefix_surplus"] = int(expected_mm_prefix_surplus)
+        if expected_logprob_rows is not None:
+            sampling_params["prompt_logprobs_expected_len"] = int(expected_logprob_rows)
 
         server_manager = self.server_managers[teacher_key]
+        effective_request_id = request_id or uuid4().hex
+        if expected_logprob_rows is not None:
+            expected_len = int(expected_logprob_rows)
+        elif logprob_start_len == 0:
+            expected_len = len(sequence_ids)
+        else:
+            expected_len = len(sequence_ids) - logprob_start_len - 1
         _trace_async_skd(
             "teacher.compute_logprobs_single",
             teacher_key=teacher_key,
             routing_key=routing_key,
-            request_id=request_id,
+            request_id=effective_request_id,
             seq_len=len(sequence_ids),
             logprob_start_len=logprob_start_len,
+            expected_len=expected_len,
             expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+            expected_logprob_rows=expected_logprob_rows,
+            image_count=_safe_len(multi_modal_data.get("images")),
+            video_count=_safe_len(multi_modal_data.get("videos")),
+            prompt_logprobs=sampling_params.get("prompt_logprobs"),
         )
+        generate_t0 = time.monotonic()
         teacher_output = await server_manager.generate(
-            request_id=request_id or uuid4().hex,
+            request_id=effective_request_id,
             prompt_ids=sequence_ids,
             sampling_params=sampling_params,
             image_data=multi_modal_data.get("images"),
             video_data=multi_modal_data.get("videos"),
         )
+        generate_ms = (time.monotonic() - generate_t0) * 1000
+        prompt_ids_rows = teacher_output.extra_fields.get("prompt_ids", [])
+        prompt_logprobs_rows = teacher_output.extra_fields.get("prompt_logprobs", [])
+        first_prompt_ids = prompt_ids_rows[0] if prompt_ids_rows else []
+        _trace_async_skd(
+            "teacher.generate_done",
+            teacher_key=teacher_key,
+            routing_key=routing_key,
+            request_id=effective_request_id,
+            elapsed_ms=round(generate_ms, 1),
+            returned_id_rows=_safe_len(prompt_ids_rows),
+            returned_logprob_rows=_safe_len(prompt_logprobs_rows),
+            returned_width=_safe_len(first_prompt_ids),
+            expected_len=expected_len,
+            expected_logprob_rows=expected_logprob_rows,
+        )
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.
+        tensor_t0 = time.monotonic()
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
-        expected_len = len(sequence_ids) if logprob_start_len == 0 else len(sequence_ids) - logprob_start_len - 1
+        tensor_ms = (time.monotonic() - tensor_t0) * 1000
         if expected_len < 0:
             raise ValueError(
                 f"Invalid teacher logprob_start_len={logprob_start_len} for seq_len={len(sequence_ids)}."
@@ -210,4 +253,13 @@ class AsyncTeacherLLMServerManager:
                 f"ids={teacher_ids.shape[0]}, logprobs={teacher_logprobs.shape[0]}, "
                 f"expected={expected_len}, seq_len={len(sequence_ids)}, start={logprob_start_len}."
             )
+        _trace_async_skd(
+            "teacher.tensorize_done",
+            teacher_key=teacher_key,
+            routing_key=routing_key,
+            request_id=effective_request_id,
+            elapsed_ms=round(tensor_ms, 1),
+            ids_shape=tuple(teacher_ids.shape),
+            logprobs_shape=tuple(teacher_logprobs.shape),
+        )
         return teacher_ids, teacher_logprobs

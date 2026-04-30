@@ -62,6 +62,23 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             image_data.extend(new_images)
         return image_data
 
+    @staticmethod
+    def _multimodal_prefix_surplus_delta(
+        expanded_ids: list[int],
+        server_ids: list[int],
+        image_data: list[Any] | None,
+    ) -> int:
+        """Return only the multimodal expansion gap for a committed observation.
+
+        Teacher-only text can make the teacher prefix longer than the student
+        prefix, but it is still real SGLang input and must not be treated as a
+        coordinate surplus. Only observations that actually carry images can
+        increase the SGLang-expanded coordinate offset.
+        """
+        if not image_data:
+            return 0
+        return max(len(expanded_ids) - len(server_ids), 0)
+
     async def _recompute_teacher_prompt_ids(self, agent_data: AgentData) -> list[int]:
         teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
         teacher_messages = self._build_teacher_messages(teacher_messages)
@@ -192,6 +209,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
         agent_data.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
         agent_data.extra_fields["teacher_server_prompt_ids"] = teacher_server_prompt_ids
+        agent_data.extra_fields["teacher_sglang_prefix_surplus"] = self._multimodal_prefix_surplus_delta(
+            teacher_prompt_ids,
+            teacher_server_prompt_ids,
+            next_image_data,
+        )
         return AgentState.GENERATING
 
     def _restore_partial_state(self, partial_state):
@@ -256,6 +278,14 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 remove_system_prompt=True,
             )
 
+        teacher_surplus_delta = 0
+        if teacher_message is not None:
+            teacher_surplus_delta = self._multimodal_prefix_surplus_delta(
+                teacher_response_ids,
+                teacher_server_response_ids,
+                image_data,
+            )
+
         # Treat the environment observation as one atomic bundle. The local
         # prompt ids, server prompt ids, teacher prompt ids, teacher messages,
         # response mask, and image_data must either all advance together or all
@@ -301,6 +331,9 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             teacher_messages.append(teacher_message)
             teacher_prompt_ids.extend(teacher_response_ids)
             teacher_server_prompt_ids.extend(teacher_server_response_ids)
+            agent_data.extra_fields["teacher_sglang_prefix_surplus"] = (
+                int(agent_data.extra_fields.get("teacher_sglang_prefix_surplus", 0)) + teacher_surplus_delta
+            )
         agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
 

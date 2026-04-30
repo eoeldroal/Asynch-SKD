@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, _build_teacher_logprob_range
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.async_skd.events import async_skd_event_context
 from verl.experimental.async_skd.state import SkdPartialState
@@ -122,11 +122,16 @@ class FakeTeacherServer:
         request_id: str | None = None,
         sequence_ids: list[int],
         logprob_start_len: int = 0,
+        expected_mm_prefix_surplus: int | None = None,
+        expected_logprob_rows: int | None = None,
         multi_modal_data: dict[str, Any] | None = None,
         routing_key: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         prefix_len = logprob_start_len + 1 if logprob_start_len > 0 else 0
-        chunk = list(sequence_ids[prefix_len:])
+        if expected_logprob_rows is None:
+            chunk = list(sequence_ids[prefix_len:])
+        else:
+            chunk = list(sequence_ids[-int(expected_logprob_rows) :])
         overrides = self.topk_by_call[self.call_count] if self.call_count < len(self.topk_by_call) else {}
         rows: list[list[int]] = []
         logprobs: list[list[float]] = []
@@ -141,6 +146,8 @@ class FakeTeacherServer:
                 "request_id": request_id,
                 "sequence_ids": list(sequence_ids),
                 "logprob_start_len": logprob_start_len,
+                "expected_mm_prefix_surplus": expected_mm_prefix_surplus,
+                "expected_logprob_rows": expected_logprob_rows,
                 "prefix_len": prefix_len,
                 "chunk": chunk,
                 "rows": rows,
@@ -587,6 +594,108 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
     assert restored_agent_data.extra_fields["skd_committed_gen_chunks"] == 2
     assert restored_agent_data.extra_fields["skd_committed_prefix_tokens"] == 4
     assert_skd_alignment(restored_agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_request_counts_teacher_only_text_as_server_prefix_not_surplus():
+    loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    teacher_prefix = [1, 2, 3, 101, 102, 103]
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = list(teacher_prefix)
+    agent_data.extra_fields["teacher_prompt_ids"] = list(teacher_prefix)
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 2},
+        ignore_termination=False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert state == AgentState.GENERATING
+    teacher_call = loop.teacher_server_manager.call_log[0]
+    assert teacher_call["sequence_ids"] == teacher_prefix + [10, 11]
+    assert teacher_call["logprob_start_len"] == len(teacher_prefix) - 1
+    assert teacher_call["expected_mm_prefix_surplus"] == 0
+    assert teacher_call["expected_logprob_rows"] == 2
+    assert teacher_call["chunk"] == [10, 11]
+    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_request_uses_tracked_multimodal_surplus_for_sglang_start():
+    loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3] + [900] * 959
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 959
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 2},
+        ignore_termination=False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert state == AgentState.GENERATING
+    teacher_call = loop.teacher_server_manager.call_log[0]
+    assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
+    assert teacher_call["logprob_start_len"] == 961
+    assert teacher_call["expected_mm_prefix_surplus"] == 959
+    assert teacher_call["expected_logprob_rows"] == 2
+    assert teacher_call["chunk"] == [10, 11]
+    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_request_prefers_tracked_surplus_over_prompt_length_gap():
+    loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3] + [900] * 100
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 7
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 2},
+        ignore_termination=False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert state == AgentState.GENERATING
+    teacher_call = loop.teacher_server_manager.call_log[0]
+    assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
+    assert teacher_call["logprob_start_len"] == 9
+    assert teacher_call["expected_mm_prefix_surplus"] == 7
+    assert teacher_call["expected_logprob_rows"] == 2
+    assert teacher_call["chunk"] == [10, 11]
+
+
+def test_build_teacher_logprob_range_multimodal_scalar_shifts_start():
+    result = _build_teacher_logprob_range(
+        teacher_server_prompt_len=128,
+        teacher_sglang_prefix_surplus=1918,
+        chunk_len=64,
+    )
+
+    assert result.server_logical_start_len == 127
+    assert result.sglang_logprob_start_len == 2045
+    assert result.expected_logprob_rows == 64
+    assert result.teacher_sglang_prefix_surplus == 1918
+
+
+def test_build_teacher_logprob_range_rejects_negative_surplus():
+    with pytest.raises(ValueError, match="teacher_sglang_prefix_surplus must be non-negative"):
+        _build_teacher_logprob_range(
+            teacher_server_prompt_len=128,
+            teacher_sglang_prefix_surplus=-1,
+            chunk_len=64,
+        )
 
 
 @pytest.mark.asyncio

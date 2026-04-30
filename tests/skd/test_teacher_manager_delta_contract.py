@@ -59,22 +59,30 @@ def _install_import_stubs() -> None:
     ray_module.actor = types.SimpleNamespace(ActorHandle=object)
     sys.modules.setdefault("ray", ray_module)
 
-    verl_module = sys.modules.setdefault("verl", types.ModuleType("verl"))
+    verl_module = types.ModuleType("verl")
     verl_module.__path__ = []
-    experimental_module = sys.modules.setdefault("verl.experimental", types.ModuleType("verl.experimental"))
+    sys.modules["verl"] = verl_module
+    experimental_module = types.ModuleType("verl.experimental")
     experimental_module.__path__ = []
+    sys.modules["verl.experimental"] = experimental_module
     agent_loop_module = types.ModuleType("verl.experimental.agent_loop")
     agent_loop_module.AsyncLLMServerManager = _FakeAsyncLLMServerManager
     sys.modules["verl.experimental.agent_loop"] = agent_loop_module
 
-    utils_module = sys.modules.setdefault("verl.utils", types.ModuleType("verl.utils"))
+    utils_module = types.ModuleType("verl.utils")
     utils_module.__path__ = []
+    sys.modules["verl.utils"] = utils_module
     config_module = types.ModuleType("verl.utils.config")
     config_module.omega_conf_to_dataclass = lambda value: value
     sys.modules["verl.utils.config"] = config_module
 
-    workers_module = sys.modules.setdefault("verl.workers", types.ModuleType("verl.workers"))
+    omegaconf_module = types.ModuleType("omegaconf")
+    omegaconf_module.DictConfig = _PlaceholderConfig
+    sys.modules.setdefault("omegaconf", omegaconf_module)
+
+    workers_module = types.ModuleType("verl.workers")
     workers_module.__path__ = []
+    sys.modules["verl.workers"] = workers_module
     config_types_module = types.ModuleType("verl.workers.config")
     config_types_module.DistillationConfig = _PlaceholderConfig
     config_types_module.DistillationLossConfig = _PlaceholderConfig
@@ -83,13 +91,33 @@ def _install_import_stubs() -> None:
 
 
 def _load_teacher_manager():
+    stubbed_module_names = [
+        "ray",
+        "verl",
+        "verl.experimental",
+        "verl.experimental.agent_loop",
+        "verl.utils",
+        "verl.utils.config",
+        "omegaconf",
+        "verl.workers",
+        "verl.workers.config",
+    ]
+    missing = object()
+    saved_modules = {name: sys.modules.get(name, missing) for name in stubbed_module_names}
     _install_import_stubs()
     module_path = Path(__file__).resolve().parents[2] / "verl" / "experimental" / "teacher_loop" / "teacher_manager.py"
     spec = importlib.util.spec_from_file_location("teacher_manager_under_test", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        for name, saved_module in saved_modules.items():
+            if saved_module is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = saved_module
     return module
 
 
@@ -203,6 +231,46 @@ def test_compute_teacher_logprobs_single_accepts_request_id_and_delta_start_len_
         "image_data": ["image"],
         "video_data": ["video"],
     }
+
+
+def test_compute_teacher_logprobs_single_forwards_explicit_expected_rows(monkeypatch):
+    expected_ids = [[41, 42], [51, 52], [61, 62]]
+    expected_logprobs = [[-0.1, -0.2], [-0.3, -0.4], [-0.5, -0.6]]
+    manager, fake_server, _ = _make_manager(monkeypatch, _fake_output(expected_ids, expected_logprobs))
+
+    teacher_ids, teacher_logprobs = asyncio.run(
+        manager.compute_teacher_logprobs_single(
+            sequence_ids=[1, 2, 3, 4, 5],
+            request_id="req-expanded-start",
+            logprob_start_len=960,
+            expected_logprob_rows=3,
+            expected_mm_prefix_surplus=958,
+            multi_modal_data={"images": ["image"]},
+        )
+    )
+
+    assert teacher_ids.shape[0] == 3
+    assert teacher_logprobs.shape[0] == 3
+    fake_generate_call = fake_server.generate.calls[0]
+    assert fake_generate_call["sampling_params"]["prompt_logprobs_start_len"] == 960
+    assert fake_generate_call["sampling_params"]["prompt_logprobs_expected_len"] == 3
+    assert fake_generate_call["sampling_params"]["expected_mm_prefix_surplus"] == 958
+
+
+def test_compute_teacher_logprobs_single_rejects_wrong_explicit_expected_length(monkeypatch):
+    manager, _, _ = _make_manager(monkeypatch, _fake_output([[41, 42]], [[-0.1, -0.2]]))
+
+    with pytest.raises(ValueError, match="Unexpected teacher logprob length"):
+        asyncio.run(
+            manager.compute_teacher_logprobs_single(
+                sequence_ids=[1, 2, 3, 4, 5],
+                request_id="req-expanded-start",
+                logprob_start_len=960,
+                expected_logprob_rows=2,
+                expected_mm_prefix_surplus=958,
+                multi_modal_data={"images": ["image"]},
+            )
+        )
 
 
 def test_compute_teacher_logprobs_single_rejects_delta_mode_for_non_sglang_teacher(monkeypatch):

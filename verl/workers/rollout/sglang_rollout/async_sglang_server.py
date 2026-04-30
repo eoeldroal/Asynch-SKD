@@ -114,6 +114,7 @@ def _extract_skd_delta_prompt_logprobs_sglang(
     result_dict: dict[str, list],
     prompt_logprobs_start_len: int,
     expected_mm_prefix_surplus: Optional[int] = None,
+    expected_logprob_rows: Optional[int] = None,
 ) -> None:
     """Extract SKD suffix rows from SGLang compact prompt-logprob delta output."""
     if prompt_logprobs_start_len <= 0:
@@ -150,7 +151,10 @@ def _extract_skd_delta_prompt_logprobs_sglang(
             prompt_ids_ls.append(ids)
             prompt_logprobs_ls.append(logprobs)
 
-    expected_len = sequence_length - prompt_logprobs_start_len - 1
+    if expected_logprob_rows is not None:
+        expected_len = int(expected_logprob_rows)
+    else:
+        expected_len = sequence_length - prompt_logprobs_start_len - 1
     if expected_len < 0:
         raise ValueError(
             f"Invalid SGLang SKD delta prompt_logprobs range: sequence_length={sequence_length}, "
@@ -172,7 +176,7 @@ def _extract_skd_delta_prompt_logprobs_sglang(
         logger.info(
             "Trimming %s leading SGLang SKD delta prompt_logprobs rows "
             "(returned=%s, expected_suffix=%s, sequence_length=%s, prompt_logprobs_start_len=%s, "
-            "expected_mm_prefix_surplus=%s). "
+            "expected_mm_prefix_surplus=%s, expected_logprob_rows=%s). "
             "This is expected for multimodal prompts whose image tokens are expanded inside SGLang.",
             trimmed_rows,
             returned_len,
@@ -180,6 +184,7 @@ def _extract_skd_delta_prompt_logprobs_sglang(
             sequence_length,
             prompt_logprobs_start_len,
             expected_mm_prefix_surplus,
+            expected_logprob_rows,
         )
         prompt_ids_ls = prompt_ids_ls[trimmed_rows:]
         prompt_logprobs_ls = prompt_logprobs_ls[trimmed_rows:]
@@ -187,7 +192,8 @@ def _extract_skd_delta_prompt_logprobs_sglang(
         raise ValueError(
             f"SGLang SKD delta prompt_logprobs length ({returned_len}) is shorter than expected suffix "
             f"length ({expected_len}) for sequence_length={sequence_length}, "
-            f"prompt_logprobs_start_len={prompt_logprobs_start_len}. "
+            f"prompt_logprobs_start_len={prompt_logprobs_start_len}, "
+            f"expected_logprob_rows={expected_logprob_rows}. "
             "This cannot be repaired by multimodal prefix trimming."
         )
 
@@ -566,6 +572,7 @@ class SGLangHttpServer:
         prompt_logprobs = sampling_params.pop("prompt_logprobs", None)
         prompt_logprobs_start_len = sampling_params.pop("prompt_logprobs_start_len", None)
         expected_mm_prefix_surplus = sampling_params.pop("expected_mm_prefix_surplus", None)
+        prompt_logprobs_expected_len = sampling_params.pop("prompt_logprobs_expected_len", None)
         if prompt_logprobs is not None:
             return_logprob = True
 
@@ -643,6 +650,7 @@ class SGLangHttpServer:
                     result_dict=extra_fields,
                     prompt_logprobs_start_len=prompt_logprobs_start_len,
                     expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                    expected_logprob_rows=prompt_logprobs_expected_len,
                 )
             else:
                 _extract_prompt_logprobs_sglang(
