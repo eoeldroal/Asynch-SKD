@@ -732,6 +732,61 @@ async def test_skd_teacher_request_prefers_tracked_surplus_over_prompt_length_ga
     assert teacher_call["chunk"] == [10, 11]
 
 
+@pytest.mark.asyncio
+async def test_skd_text_only_teacher_gap_is_not_treated_as_sglang_surplus():
+    loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3] + [900] * 17
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 2},
+        ignore_termination=False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert state == AgentState.GENERATING
+    teacher_call = loop.teacher_server_manager.call_log[0]
+    assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
+    assert teacher_call["logprob_start_len"] == 2
+    assert teacher_call["expected_mm_prefix_surplus"] == 0
+    assert teacher_call["expected_logprob_rows"] == 2
+
+
+@pytest.mark.asyncio
+async def test_skd_multimodal_teacher_requires_explicit_sglang_surplus():
+    loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3] + [900] * 17
+
+    with pytest.raises(ValueError, match="teacher_sglang_prefix_surplus is required"):
+        await loop._handle_generating_state(
+            agent_data,
+            {"max_tokens": 2},
+            ignore_termination=False,
+            stop_after_skd_chunk=True,
+        )
+
+
+def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3, 70, 71])
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+
+    loop._append_student_prompt_delta_to_teacher_stream(agent_data, prev_prompt_len=3)
+
+    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3, 70, 71]
+    assert agent_data.extra_fields["teacher_prompt_ids"] == [1, 2, 3, 70, 71]
+    assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3, 70, 71]
+
+
 def test_build_teacher_logprob_range_multimodal_scalar_shifts_start():
     result = _build_teacher_logprob_range(
         teacher_server_prompt_len=128,
@@ -1266,6 +1321,7 @@ async def test_skd_teacher_verification_receives_current_tool_images():
     loop = make_skd_loop(student_chunks=[[10, EOS]])
     agent_data = make_agent_data([1, 2, 3])
     agent_data.image_data = [image]
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
 
     next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
 
@@ -1281,6 +1337,7 @@ async def test_web_skd_image_generation_uses_prompt_text_but_appends_suffix_to_s
     agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
 
     next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
 

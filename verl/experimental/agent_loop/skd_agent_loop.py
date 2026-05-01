@@ -117,14 +117,14 @@ def _build_teacher_logprob_range(
     )
 
 
-def _teacher_sglang_prefix_surplus_from_fields(extra_fields: dict[str, Any]) -> int:
-    """Return the tracked teacher multimodal expansion surplus."""
+def _teacher_sglang_prefix_surplus_from_fields(extra_fields: dict[str, Any], *, has_multimodal: bool) -> int:
+    """Return the explicitly tracked teacher multimodal expansion surplus."""
     tracked = extra_fields.get("teacher_sglang_prefix_surplus")
     if tracked is not None:
         return max(int(tracked), 0)
-    teacher_prompt_ids = extra_fields.get("teacher_prompt_ids", [])
-    teacher_server_prompt_ids = extra_fields.get("teacher_server_prompt_ids", [])
-    return max(_safe_len(teacher_prompt_ids) - _safe_len(teacher_server_prompt_ids), 0)
+    if has_multimodal:
+        raise ValueError("teacher_sglang_prefix_surplus is required for multimodal teacher verification.")
+    return 0
 
 
 @register("skd_agent")
@@ -305,12 +305,21 @@ class SkdAgentLoop(ToolAgentLoop):
             await self._release_teacher_sticky_session(agent_data.request_id)
 
     def _append_student_prompt_delta_to_teacher_stream(self, agent_data: AgentData, prev_prompt_len: int) -> None:
-        teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
-        if teacher_prompt_ids is None:
-            return
         prompt_delta = agent_data.prompt_ids[prev_prompt_len:]
-        if prompt_delta:
+        if not prompt_delta:
+            return
+
+        teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
+        if teacher_prompt_ids is not None:
             teacher_prompt_ids.extend(prompt_delta)
+
+        server_prompt_ids = agent_data.extra_fields.get("server_prompt_ids")
+        if server_prompt_ids is not None:
+            server_prompt_ids.extend(prompt_delta)
+
+        teacher_server_prompt_ids = agent_data.extra_fields.get("teacher_server_prompt_ids")
+        if teacher_server_prompt_ids is not None:
+            teacher_server_prompt_ids.extend(prompt_delta)
 
     def _append_dummy_teacher_rows(self, agent_data: AgentData, count: int) -> None:
         """Keep SKD teacher targets aligned with response_mask for tool/user spans."""
@@ -943,7 +952,14 @@ class SkdAgentLoop(ToolAgentLoop):
                             stacklevel=1,
                         )
                         break
-                    teacher_sglang_prefix_surplus = _teacher_sglang_prefix_surplus_from_fields(agent_data.extra_fields)
+                    multi_modal_data = self._current_multi_modal_data(agent_data)
+                    has_teacher_multimodal = bool(
+                        _safe_len(multi_modal_data.get("images")) or _safe_len(multi_modal_data.get("videos"))
+                    )
+                    teacher_sglang_prefix_surplus = _teacher_sglang_prefix_surplus_from_fields(
+                        agent_data.extra_fields,
+                        has_multimodal=has_teacher_multimodal,
+                    )
                     teacher_logprob_range = _build_teacher_logprob_range(
                         teacher_server_prompt_len=len(teacher_server_prompt_ids),
                         teacher_sglang_prefix_surplus=teacher_sglang_prefix_surplus,
