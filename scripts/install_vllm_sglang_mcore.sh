@@ -95,7 +95,12 @@ uv pip install opencv-fixer && \
 
 if [ "$USE_MEGATRON" -eq 1 ]; then
     echo "6. Install cudnn python package (avoid being overridden)"
-    uv pip install nvidia-cudnn-cu12==9.10.2.21
+    # Qwen3.5 multimodal actor runs on torch 2.9.1 regressed badly with
+    # nvidia-cudnn-cu12 9.10.2.21 in our B200 WebGym SKD setup. Keep the
+    # shared env on the same torch line, but raise cuDNN to the first 9.15+
+    # build that cleared the Conv3d/bf16 vision-path stall in local replay and
+    # live RL runs.
+    uv pip install nvidia-cudnn-cu12==9.15.1.9
 fi
 
 echo "7. Pin CuPy for numpy<2.0 compatibility"

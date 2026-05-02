@@ -3,6 +3,10 @@ set -xeuo pipefail
 
 cd /home/sogang_nlpy/verl
 
+# Known-good actor profile for the Qwen3.5 WebGym SKD setup.
+# The decisive stall fix was upgrading cuDNN from 9.10.2 to 9.15.1.9 in the
+# cloned training env; the settings below are the matched runtime profile that
+# was validated after the actor-side multimodal forward stall cleared.
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 VERL_ASYNC_SKD_SLOW_LOOP_MS=10 \
@@ -59,7 +63,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.60 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.max_model_len=18433 \
     actor_rollout_ref.rollout.max_num_batched_tokens=18433 \
@@ -90,14 +94,13 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288 \
-    actor_rollout_ref.actor.veomni.param_offload=False \
-    actor_rollout_ref.actor.veomni.optimizer_offload=False \
+    actor_rollout_ref.actor.veomni.param_offload=True \
+    actor_rollout_ref.actor.veomni.optimizer_offload=True \
     actor_rollout_ref.actor.veomni.enable_full_shard=True \
-    actor_rollout_ref.actor.veomni.ulysses_parallel_size=1 \
+    actor_rollout_ref.actor.veomni.ulysses_parallel_size=2 \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
     'trainer.logger=["console","wandb"]' \

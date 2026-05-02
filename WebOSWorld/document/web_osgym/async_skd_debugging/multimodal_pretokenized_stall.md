@@ -249,7 +249,81 @@ first_response_ready:     ~49374.2ms
 - detokenizer/IPC 반환도 첫 token 이후에는 수 ms 수준이다.
 - 긴 구간은 model runner prefill launch / first token 이전 구간이다.
 
-## 6. What This Is Not
+## 6. Addendum: Actor-Side Multimodal Forward Stall
+
+The pretokenized student-generate stall above was not the last major blocker.
+After the ids-only runtime cleanup and the windowed-training parser fixes, a
+second and much lower-level stall remained in actor updates.
+
+### Observed Symptom
+
+In the WebGym Async SKD actor path, `self.module()` inside the VeOmni training
+worker became the dominant wall time by a huge margin.
+
+Representative logs before the fix:
+
+- local `input_ids_shape` commonly in the `14k-19k` range
+- local `pixel_values_shape` commonly in the `23k-34k` range
+- `veomni.forward_step_module_forward_done` often at `90s-170s`
+
+This persisted even after:
+
+- sparse visual observation parsing was fixed
+- fresh/carryover window identity was fixed
+- Ulysses sequence parallelism was enabled
+
+Enabling `ulysses_parallel_size=2` alone did not solve the stall. It reduced
+local sequence length, but dynamic packing immediately used the extra budget to
+pack heavier multimodal microbatches, and actor forward remained extremely
+slow.
+
+### Root-Cause Hypothesis
+
+The decisive clue was that the Qwen vision path enters through a `Conv3d`
+patch-embedding layer under bf16/autocast, while the environment was pinned to:
+
+- `torch==2.9.1+cu128`
+- `nvidia-cudnn-cu12==9.10.2.21`
+
+This matched public PyTorch regression reports around `Conv3d + bf16/AMP` on
+the 2.9 line closely enough to justify a single-variable environment test.
+
+### Final Fix
+
+Keep the rest of the shared stack on the torch 2.9.1 line, but raise cuDNN in
+the cloned RL environment:
+
+```text
+nvidia-cudnn-cu12: 9.10.2.21 -> 9.15.1.9
+```
+
+This was validated in a cloned env (`skd-cudnn`) rather than by mutating the
+original shared env first.
+
+### Outcome
+
+After the cuDNN upgrade, the same actor path changed from:
+
+- `module_forward_ms ~= 90s-170s`
+
+to:
+
+- `module_forward_ms ~= 0.4s-4.8s`
+
+in live RL runs, with the run continuing past multiple logical steps and actor
+updates.
+
+### Practical Conclusion
+
+For this WebGym Async SKD Qwen3.5 setup on B200:
+
+1. parser/alignment bugs and actor-kernel stalls were separate problems
+2. fixing the parser was necessary, but not sufficient
+3. the decisive actor-stall fix was the cuDNN move to `9.15.1.9`
+4. Ulysses and actor packing settings still matter, but they were not the
+   final root cause of the extreme `self.module()` stall
+
+## 7. What This Is Not
 
 ### 모델 GPU 로딩 문제가 아니다
 
@@ -293,7 +367,7 @@ SGLang trace에서 `mm_process_done`이 수십 ms 수준이다.
 
 Teacher prompt-logprob path는 별도 주의가 필요하지만, 현재 17/34/51s stall의 직접 원인은 student `input_ids + image_data` generate path다.
 
-## 7. Root Cause Hypothesis
+## 8. Root Cause Hypothesis
 
 현재 가장 강한 가설:
 
@@ -314,7 +388,7 @@ GenerateReqInput(text=rendered_chat_prompt, image_data=images)
 
 따라서 문제는 "multimodal 자체"가 아니라 "multimodal + pretokenized input_ids generate path"다.
 
-## 8. Fix Direction
+## 9. Fix Direction
 
 ### Principle
 
@@ -433,7 +507,7 @@ A <- A + accepted_or_corrected_suffix(S)
 
 이 방식에서 남는 위험은 behavior-policy prefix drift다. 이는 fallback stall보다 작은 위험으로 보고, 실제 drift 통계를 근거로 후속 개선을 결정한다.
 
-## 9. Risks
+## 10. Risks
 
 ### Risk 1. Text path tokenization drift
 
@@ -484,7 +558,7 @@ server_prompt_ids <- A + accepted_or_corrected_suffix(S)
 
 `B`로 canonical state를 교체하면 이전 chunk의 teacher rows, response mask, accepted/rejected 기록이 밀릴 수 있다.
 
-## 10. Validation Plan
+## 11. Validation Plan
 
 ### Unit / CPU-level
 
@@ -532,7 +606,7 @@ generate TTFT는 17/34/51s 패턴이 사라짐
 - teacher row alignment test가 깨지지 않는지
 - actor update까지 도달하는지
 
-## 11. Artifacts
+## 12. Artifacts
 
 실험 스크립트:
 
@@ -563,7 +637,7 @@ native_image + real WebGym:
   turn 3 TTFT ~= 0.48s
 ```
 
-## 12. Decision
+## 13. Decision
 
 다음 구현은 WebSKD image-bearing student generation에서 SGLang native multimodal path를 사용하도록 바꾸는 것을 1순위로 한다.
 
@@ -577,7 +651,7 @@ native_image + real WebGym:
 
 단, 이 변경은 serving request representation만 바꾸는 것이다. SKD correctness를 담당하는 token streams, teacher streams, response masks, teacher rows, atomic commit contract는 유지한다.
 
-## 13. Updated Stall Anatomy After Native Text Reroute
+## 14. Updated Stall Anatomy After Native Text Reroute
 
 이 문서의 앞부분은 "왜 student `input_ids + image_data` path를 native `text + image_data`로 우회해야 하는가"를 설명한다. 그 결론은 여전히 맞다.
 
@@ -778,7 +852,7 @@ student pretokenized multimodal path는 분명히 잘못된 경로였고 native 
 
 정확히 갈라진다.
 
-## 14. Lower-level Instrumentation Update
+## 15. Lower-level Instrumentation Update
 
 이후 SGLang manager 레벨보다 한 단계 더 낮은 위치에 계측을 추가했다.
 
