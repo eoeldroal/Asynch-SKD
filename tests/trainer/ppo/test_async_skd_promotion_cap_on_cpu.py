@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from tensordict import TensorDict
 
 from verl.experimental.async_skd.data_source import AsyncSkdDataSource
 from verl.experimental.async_skd.state import AsyncSkdSample
 from verl.protocol import DataProto
 from verl.trainer.ppo.ray_trainer import _assemble_async_skd_training_batch
+from verl.utils.tensordict_utils import chunk_tensordict
 
 
 class _UidFactory:
@@ -27,23 +29,42 @@ class _EmptyIterator:
         raise StopIteration
 
 
-def _single_sample_batch(uid: str, value: int) -> DataProto:
-    seq_len = 4
+def _single_sample_batch(uid: str, value: int, prompt_width: int = 2, *, with_teacher: bool = False) -> DataProto:
+    response_width = 2
+    seq_len = prompt_width + response_width
+    prompts = torch.arange(100 + value, 100 + value + prompt_width, dtype=torch.long).unsqueeze(0)
+    responses = torch.tensor([[value, value + 1]], dtype=torch.long)
+    tensors = {
+        "prompts": prompts,
+        "responses": responses,
+        "input_ids": torch.cat([prompts, responses], dim=1),
+        "attention_mask": torch.ones(1, seq_len, dtype=torch.long),
+        "position_ids": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
+        "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
+    }
+    if with_teacher:
+        tensors["teacher_ids"] = torch.arange(seq_len * 2, dtype=torch.long).view(1, seq_len, 2)
+        tensors["teacher_logprobs"] = -torch.arange(seq_len * 2, dtype=torch.float32).view(1, seq_len, 2)
     return DataProto.from_dict(
-        tensors={
-            "prompts": torch.tensor([[100 + value, 200 + value]], dtype=torch.long),
-            "responses": torch.tensor([[value, value + 1]], dtype=torch.long),
-            "input_ids": torch.tensor([[100 + value, 200 + value, value, value + 1]], dtype=torch.long),
-            "attention_mask": torch.ones(1, seq_len, dtype=torch.long),
-            "position_ids": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
-            "response_mask": torch.tensor([[1, 1]], dtype=torch.long),
-        },
+        tensors=tensors,
         non_tensors={
             "uid": np.array([uid], dtype=object),
             "input_pos": np.array([value], dtype=object),
         },
         meta_info={"metrics": [{}]},
     )
+
+
+def _windowed_output_batch(uid: str, values: list[int]) -> DataProto:
+    batch = DataProto.concat([_single_sample_batch(uid, value) for value in values])
+    batch.meta_info["metrics"] = [{} for _ in values]
+    batch.meta_info["metrics"][0].update(
+        {
+            "window/num_samples": float(len(values)),
+            "window/avg_images": 1.0,
+        }
+    )
+    return batch
 
 
 def _completed(sample_id: str, batch: DataProto) -> AsyncSkdSample:
@@ -155,3 +176,152 @@ def test_async_skd_training_batch_keeps_union_metadata_consistent():
     assert merged_input.non_tensor_batch["agent_name"].tolist() == ["web_skd_agent", "web_skd_agent"]
     assert merged_output.non_tensor_batch["agent_name"].tolist() == ["web_skd_agent", "web_skd_agent"]
     merged_input.union(merged_output)
+
+
+def test_async_skd_training_batch_expands_promoted_input_to_windowed_output_rows():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    promoted_input = _single_sample_batch("promoted-0", 0)
+    promoted_output = _windowed_output_batch("promoted-0", [10, 11, 12])
+    source._reserved_input_batches["promoted-0"] = promoted_input
+    source.record_promoted([_completed("promoted-0", promoted_output)])
+
+    base_input_batch = _single_sample_batch("base-0", 1000)
+    base_output_batch = _windowed_output_batch("base-0", [2000, 2001])
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=1,
+    )
+
+    assert len(merged_input) == 5
+    assert len(merged_output) == 5
+    assert merged_input.non_tensor_batch["uid"].tolist() == [
+        "base-0",
+        "base-0",
+        "promoted-0",
+        "promoted-0",
+        "promoted-0",
+    ]
+    assert merged_output.non_tensor_batch["uid"].tolist() == [
+        "base-0",
+        "base-0",
+        "promoted-0",
+        "promoted-0",
+        "promoted-0",
+    ]
+    assert "window_metrics" not in merged_output.meta_info
+    assert merged_output.meta_info["metrics"]["window/num_samples"] == [2.0, 3.0]
+    assert source.promoted_count() == 0
+
+
+def test_async_skd_training_batch_aligns_prompt_width_before_promoted_concat():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    promoted_input = _single_sample_batch("promoted-0", 0, prompt_width=2, with_teacher=True)
+    promoted_output = _single_sample_batch("promoted-0", 10, prompt_width=5, with_teacher=True)
+    source._reserved_input_batches["promoted-0"] = promoted_input
+    source.record_promoted([_completed("promoted-0", promoted_output)])
+
+    base_input_batch = _single_sample_batch("base-0", 1000, prompt_width=2, with_teacher=True)
+    base_output_batch = _single_sample_batch("base-0", 2000, prompt_width=2, with_teacher=True)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=1,
+        pad_token_id=99,
+    )
+
+    assert merged_input.batch["prompts"].shape == (2, 5)
+    assert merged_output.batch["prompts"].shape == (2, 5)
+    assert merged_output.batch["input_ids"].shape == (2, 7)
+    assert merged_output.batch["attention_mask"][0, :3].tolist() == [0, 0, 0]
+    assert merged_output.batch["input_ids"][0, :3].tolist() == [99, 99, 99]
+    assert merged_output.batch["teacher_ids"].shape == (2, 7, 2)
+    assert merged_output.batch["teacher_ids"][0, :3].eq(99).all()
+    assert merged_output.batch["teacher_logprobs"][0, :3].eq(0.0).all()
+    merged_input.union(merged_output)
+
+
+def test_async_skd_training_batch_expands_input_to_windowed_output_rows():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    base_input_batch = _single_sample_batch("base-0", 1000)
+    base_output_batch = DataProto.concat(
+        [
+            _single_sample_batch("base-0", 1000),
+            _single_sample_batch("base-0", 1000),
+        ]
+    )
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=0,
+    )
+
+    assert len(merged_input) == 2
+    assert len(merged_output) == 2
+    assert merged_input.non_tensor_batch["uid"].tolist() == ["base-0", "base-0"]
+    assert merged_output.non_tensor_batch["uid"].tolist() == ["base-0", "base-0"]
+
+
+def test_async_skd_training_batch_uses_windowed_prompts_before_union():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    base_input_batch = DataProto(
+        batch=TensorDict({"prompts": torch.tensor([[1, 2]])}, batch_size=1),
+        non_tensor_batch={"uid": np.array(["base-0"], dtype=object)},
+        meta_info={},
+    )
+    base_output_batch = _windowed_output_batch("base-0", [2000, 2001])
+    base_output_batch.batch["prompts"] = torch.tensor([[0, 3], [4, 5]], dtype=torch.long)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=0,
+    )
+
+    assert merged_input.batch["prompts"].equal(merged_output.batch["prompts"])
+    merged_input.union(merged_output)
+
+
+def test_async_skd_training_batch_pads_windowed_rows_to_required_multiple():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    base_input_batch = DataProto(
+        batch=TensorDict({"dummy_tensor": torch.tensor([[0]], dtype=torch.uint8)}, batch_size=1),
+        non_tensor_batch={"uid": np.array(["base-0"], dtype=object)},
+        meta_info={},
+    )
+    base_output_batch = _windowed_output_batch("base-0", [2000, 2001, 2002])
+    base_output_batch.batch["teacher_ids"] = torch.arange(3 * 4 * 2, dtype=torch.long).view(3, 4, 2)
+    base_output_batch.batch["teacher_logprobs"] = -torch.arange(3 * 4 * 2, dtype=torch.float32).view(3, 4, 2)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=4,
+        max_promoted_count=0,
+    )
+
+    assert len(merged_input) == 4
+    assert len(merged_output) == 4
+    assert merged_output.non_tensor_batch["uid"][-1].startswith("async_skd_pad_")
+    assert merged_output.batch["response_mask"][-1].sum().item() == 0
+    assert merged_output.batch["teacher_ids"][-1].equal(merged_output.batch["teacher_ids"][-2])
+    assert merged_output.batch["teacher_logprobs"][-1].equal(merged_output.batch["teacher_logprobs"][-2])
+    training_batch = merged_input.union(merged_output)
+    chunk_tensordict(training_batch.to_tensordict(), chunks=4)

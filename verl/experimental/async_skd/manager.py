@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import time
 from typing import Any
 
@@ -28,6 +29,17 @@ from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.protocol import DataProto
 from verl.utils.ray_utils import auto_await
+
+_ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+
+
+def _trace_async_skd(stage: str, **fields: Any) -> None:
+    if _ASYNC_SKD_TRACE <= 0:
+        return
+    fields = {"pid": os.getpid(), "mono_ns": time.monotonic_ns(), **fields}
+    parts = [f"{key}={value!r}" for key, value in fields.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
 
 
 class AsyncSkdAgentLoopManager(AgentLoopManager):
@@ -76,6 +88,24 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         output = DataProto.concat(align_non_tensor_keys_for_concat(outputs))
         metrics = [single.meta_info.pop("metrics") for single in outputs]
         timing = self._performance_metrics(metrics, output)
+        for key in {
+            "window/num_samples",
+            "window/avg_target_tokens",
+            "window/max_target_tokens",
+            "window/avg_images",
+            "window/max_images",
+            "window/avg_recent_steps",
+            "window/skipped_old_steps",
+        }:
+            values = [metric[key] for chunk in metrics for metric in chunk if key in metric]
+            if not values:
+                continue
+            if key.endswith("/num_samples") or key.endswith("_count") or key.endswith("error_count"):
+                timing[key] = float(np.sum(values))
+            elif "/max_" in key:
+                timing[key] = float(np.max(values))
+            else:
+                timing[key] = float(np.mean(values))
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
         extra_metrics = getattr(self, "_async_skd_last_step_metrics", None)
         if extra_metrics:
@@ -401,6 +431,12 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         fresh_prompts: DataProto | None,
         carryover_partials: list[SkdPartialState],
     ) -> DataProto:
+        _trace_async_skd(
+            "async_skd_manager.generate_with_carryover_begin",
+            fresh_count=len(fresh_prompts) if fresh_prompts is not None else 0,
+            carryover_count=len(carryover_partials),
+        )
+        total_t0 = time.monotonic()
         rollout_n = self._rollout_n()
         if rollout_n != 1:
             raise ValueError(f"Async SKD carryover currently requires rollout.n == 1, got {rollout_n}")
@@ -411,15 +447,33 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         if fresh_prompts is not None and len(fresh_prompts) == 0:
             fresh_prompts = None
 
+        inner_t0 = time.monotonic()
         outputs = await self._generate_sequences_with_carryover(fresh_prompts, carryover_partials)
+        inner_ms = (time.monotonic() - inner_t0) * 1000
 
-        return self._finalize_outputs(outputs)
+        finalize_t0 = time.monotonic()
+        finalized = self._finalize_outputs(outputs)
+        finalize_ms = (time.monotonic() - finalize_t0) * 1000
+        _trace_async_skd(
+            "async_skd_manager.generate_with_carryover_done",
+            total_ms=round((time.monotonic() - total_t0) * 1000, 1),
+            inner_ms=round(inner_ms, 1),
+            finalize_ms=round(finalize_ms, 1),
+            output_count=len(outputs),
+            finalized_batch_len=len(finalized),
+        )
+        return finalized
 
     async def _generate_sequences_with_carryover(
         self,
         fresh_prompts: DataProto | None,
         carryover_partials: list[SkdPartialState],
     ) -> list[DataProto]:
+        _trace_async_skd(
+            "async_skd_manager.plan_with_carryover_begin",
+            fresh_count=len(fresh_prompts) if fresh_prompts is not None else 0,
+            carryover_count=len(carryover_partials),
+        )
         fresh_count = len(fresh_prompts) if fresh_prompts is not None else 0
         current_items: list[tuple[str, int, Any]] = []
         carryover_partial_by_sample_id = {partial.sample_id: partial for partial in carryover_partials}
@@ -464,6 +518,15 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             fresh_sample_ids=fresh_sample_ids,
             carryover_partials=carryover_partials,
             fresh_payloads_by_sample_id=fresh_payloads_by_sample_id,
+        )
+        _trace_async_skd(
+            "async_skd_manager.plan_with_carryover_done",
+            current_count=len(current_items),
+            fresh_count=fresh_count,
+            carryover_count=len(carryover_partials),
+            logical_step=logical_step,
+            prefetch_limit=prefetch_limit,
+            assigned_teachers=len(current_teacher_replica_by_sample_id),
         )
 
         def teacher_replica_id_for_item(kind: str, order: int, payload: Any) -> str | None:
@@ -544,6 +607,14 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         if not self.agent_loop_workers:
             raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
 
+        _trace_async_skd(
+            "async_skd_manager.lookahead_begin",
+            current_count=len(current_items),
+            logical_step=logical_step,
+            prefetch_limit=prefetch_limit,
+            worker_count=len(self.agent_loop_workers),
+        )
+        lookahead_total_t0 = time.monotonic()
         current_count = len(current_items)
         current_completed: list[DataProto | None] = [None] * current_count
         promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
@@ -623,6 +694,19 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             else:
                 raise ValueError(f"Unsupported async SKD current work kind: {kind!r}")
             active_after = note_launch(worker_idx)
+            _trace_async_skd(
+                "async_skd_manager.launch_current",
+                logical_step=logical_step,
+                sample_id=sample_id,
+                kind=kind,
+                order=order,
+                worker_idx=worker_idx,
+                source_type=source_type,
+                active_after=active_after,
+                worker_capacity=worker_capacity,
+                teacher_replica_id=teacher_replica_id,
+                teacher_routing_key=teacher_routing_key,
+            )
             current_active[task] = {
                 "order": order,
                 "worker_idx": worker_idx,
@@ -682,6 +766,18 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 )
             )
             active_after = note_launch(worker_idx)
+            _trace_async_skd(
+                "async_skd_manager.launch_lookahead_batch",
+                logical_step=logical_step,
+                sample_id=sample_id,
+                admission_order=admission_order,
+                worker_idx=worker_idx,
+                active_after=active_after,
+                worker_capacity=worker_capacity,
+                prefetch_worker_target=prefetch_worker_target,
+                teacher_replica_id=teacher_replica_id,
+                teacher_routing_key=teacher_routing_key,
+            )
             lookahead_active[task] = {
                 "order": admission_order,
                 "worker_idx": worker_idx,
@@ -768,6 +864,18 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 )
             )
             active_after = note_launch(worker_idx)
+            _trace_async_skd(
+                "async_skd_manager.launch_lookahead_partial",
+                logical_step=logical_step,
+                sample_id=partial_state.sample_id,
+                admission_order=admission_order,
+                worker_idx=worker_idx,
+                active_after=active_after,
+                worker_capacity=worker_capacity,
+                prefetch_worker_target=prefetch_worker_target,
+                teacher_replica_id=teacher_replica_id,
+                teacher_routing_key=teacher_routing_key,
+            )
             lookahead_active[task] = {
                 "order": admission_order,
                 "worker_idx": worker_idx,
@@ -811,9 +919,27 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             launch_current(kind, order, payload)
 
         while current_active or lookahead_active:
+            _trace_async_skd(
+                "async_skd_manager.wait_begin",
+                logical_step=logical_step,
+                current_active=len(current_active),
+                lookahead_active=len(lookahead_active),
+                lookahead_started_count=lookahead_started_count,
+                drain_requested=drain_requested,
+            )
+            wait_t0 = time.monotonic()
             done, _ = await asyncio.wait(
                 set(current_active.keys()) | set(lookahead_active.keys()),
                 return_when=asyncio.FIRST_COMPLETED,
+            )
+            wait_ms = (time.monotonic() - wait_t0) * 1000
+            _trace_async_skd(
+                "async_skd_manager.wait_done",
+                logical_step=logical_step,
+                elapsed_ms=round(wait_ms, 1),
+                done_count=len(done),
+                current_active=len(current_active),
+                lookahead_active=len(lookahead_active),
             )
 
             for task in done:
@@ -822,7 +948,25 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     order = int(meta["order"])
                     worker_idx = int(meta["worker_idx"])
                     active_after = note_finish(worker_idx)
+                    _trace_async_skd(
+                        "async_skd_manager.current_task_await_begin",
+                        logical_step=logical_step,
+                        sample_id=meta["sample_id"],
+                        order=order,
+                        worker_idx=worker_idx,
+                        source_type=meta["source_type"],
+                    )
+                    task_t0 = time.monotonic()
                     result = await task
+                    _trace_async_skd(
+                        "async_skd_manager.current_task_await_done",
+                        logical_step=logical_step,
+                        sample_id=meta["sample_id"],
+                        order=order,
+                        worker_idx=worker_idx,
+                        elapsed_ms=round((time.monotonic() - task_t0) * 1000, 1),
+                        result_type=type(result).__name__,
+                    )
                     if isinstance(result, AsyncSkdSample):
                         result.validate()
                         current_completed[order] = result.require_completed()
@@ -875,7 +1019,25 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     admission_order = int(meta["order"])
                     worker_idx = int(meta["worker_idx"])
                     active_after = note_finish(worker_idx)
+                    _trace_async_skd(
+                        "async_skd_manager.lookahead_task_await_begin",
+                        logical_step=logical_step,
+                        sample_id=meta["sample_id"],
+                        order=admission_order,
+                        worker_idx=worker_idx,
+                        source_type=meta["source_type"],
+                    )
+                    task_t0 = time.monotonic()
                     sample: AsyncSkdSample = await task
+                    _trace_async_skd(
+                        "async_skd_manager.lookahead_task_await_done",
+                        logical_step=logical_step,
+                        sample_id=meta["sample_id"],
+                        order=admission_order,
+                        worker_idx=worker_idx,
+                        elapsed_ms=round((time.monotonic() - task_t0) * 1000, 1),
+                        sample_kind=sample.kind,
+                    )
                     sample.validate()
                     duration_ms = (time.time() - float(meta["launch_ts"])) * 1000
                     emit_async_skd_event(
@@ -954,6 +1116,20 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             "async_skd/lookahead_carryover_rate": lookahead_carryover_count / lookahead_denominator,
         }
         self._async_skd_last_step_metrics.update(getattr(self, "_teacher_replica_last_plan_stats", {}))
+        _trace_async_skd(
+            "async_skd_manager.lookahead_done",
+            logical_step=logical_step,
+            total_ms=round((time.monotonic() - lookahead_total_t0) * 1000, 1),
+            current_count=current_count,
+            prefetch_limit=prefetch_limit,
+            lookahead_started_count=lookahead_started_count,
+            lookahead_promoted_count=lookahead_promoted_count,
+            lookahead_carryover_count=lookahead_carryover_count,
+            lookahead_continued_partial_count=lookahead_continued_partial_count,
+            worker_capacity=worker_capacity,
+            prefetch_worker_target=prefetch_worker_target,
+            worker_active_max=worker_active_max,
+        )
         print(
             "[ASYNC_SKD] rollout "
             f"prefetch_limit={prefetch_limit} started={lookahead_started_count} "

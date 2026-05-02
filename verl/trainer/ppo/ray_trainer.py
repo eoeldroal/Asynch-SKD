@@ -175,17 +175,139 @@ def _assemble_async_skd_training_batch(
     validate: bool = False,
     required_multiple: int | None = None,
     max_promoted_count: int | None = None,
+    pad_token_id: int = 0,
 ) -> tuple[DataProto, DataProto]:
     """Append promoted async-SKD rollout pairs to the current training batch."""
     if validate or async_skd_data_source is None:
         return base_input_batch, base_output_batch
 
+    def _left_pad_dim(tensor: torch.Tensor, dim: int, pad_size: int, value: int | float) -> torch.Tensor:
+        if pad_size <= 0:
+            return tensor
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        pad = torch.full(
+            pad_shape,
+            value,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        return torch.cat([pad, tensor], dim=dim)
+
+    def _pad_batch_prompt_width(batch: DataProto, target_prompt_width: int) -> DataProto:
+        if batch.batch is None or "prompts" not in batch.batch:
+            return batch
+        prompt_width = int(batch.batch["prompts"].size(1))
+        pad_size = target_prompt_width - prompt_width
+        if pad_size <= 0:
+            return batch
+
+        batch.batch["prompts"] = _left_pad_dim(batch.batch["prompts"], 1, pad_size, pad_token_id)
+        if "responses" not in batch.batch:
+            return batch
+
+        response_width = int(batch.batch["responses"].size(1))
+        old_seq_width = prompt_width + response_width
+        for key, value in (("input_ids", pad_token_id), ("attention_mask", 0)):
+            if key in batch.batch:
+                tensor = batch.batch[key]
+                if int(tensor.size(1)) != old_seq_width:
+                    raise ValueError(
+                        f"Cannot align async-SKD batch key {key!r}: "
+                        f"width={tensor.size(1)} expected={old_seq_width}"
+                    )
+                batch.batch[key] = _left_pad_dim(tensor, 1, pad_size, value)
+        if "position_ids" in batch.batch:
+            tensor = batch.batch["position_ids"]
+            if int(tensor.size(-1)) != old_seq_width:
+                raise ValueError(
+                    "Cannot align async-SKD batch key 'position_ids': "
+                    f"width={tensor.size(-1)} expected={old_seq_width}"
+                )
+            batch.batch["position_ids"] = _left_pad_dim(tensor, tensor.dim() - 1, pad_size, 0)
+        for key, value in (("teacher_ids", pad_token_id), ("teacher_logprobs", 0.0)):
+            if key in batch.batch:
+                tensor = batch.batch[key]
+                if int(tensor.size(1)) != old_seq_width:
+                    raise ValueError(
+                        f"Cannot align async-SKD batch key {key!r}: "
+                        f"width={tensor.size(1)} expected={old_seq_width}"
+                    )
+                batch.batch[key] = _left_pad_dim(tensor, 1, pad_size, value)
+        return batch
+
+    def _align_pairs_for_concat(
+        input_batches: list[DataProto], output_batches: list[DataProto]
+    ) -> tuple[list[DataProto], list[DataProto]]:
+        target_prompt_width = max(int(batch.batch["prompts"].size(1)) for batch in output_batches)
+        output_batches = [_pad_batch_prompt_width(batch, target_prompt_width) for batch in output_batches]
+        input_batches = [_pad_batch_prompt_width(batch, target_prompt_width) for batch in input_batches]
+        return input_batches, output_batches
+
+    def _expand_input_to_output(input_batch: DataProto, output_batch: DataProto) -> DataProto:
+        if len(input_batch) == len(output_batch):
+            return input_batch
+        for key in ("uid", "index", "input_pos"):
+            if key not in input_batch.non_tensor_batch or key not in output_batch.non_tensor_batch:
+                continue
+            lookup = {str(value): idx for idx, value in enumerate(input_batch.non_tensor_batch[key].tolist())}
+            try:
+                indices = [lookup[str(value)] for value in output_batch.non_tensor_batch[key].tolist()]
+            except KeyError:
+                continue
+            return input_batch.select_idxs(indices)
+        raise ValueError(
+            "Cannot expand async-SKD input batch to match windowed output batch; "
+            f"input_len={len(input_batch)}, output_len={len(output_batch)}. "
+            f"input_keys={sorted(input_batch.non_tensor_batch.keys())}, "
+            f"output_keys={sorted(output_batch.non_tensor_batch.keys())}. "
+            "Expected shared non_tensor_batch key 'uid', 'index', or 'input_pos'."
+        )
+
+    def _sync_input_prompt_with_output(input_batch: DataProto, output_batch: DataProto) -> DataProto:
+        if input_batch.batch is not None and output_batch.batch is not None:
+            for key in output_batch.batch.keys():
+                if key in input_batch.batch:
+                    input_batch.batch[key] = output_batch.batch[key]
+        return input_batch
+
+    def _pad_pair_to_required_multiple(
+        input_batch: DataProto, output_batch: DataProto, multiple: int | None
+    ) -> tuple[DataProto, DataProto]:
+        if multiple is None or multiple <= 1:
+            return input_batch, output_batch
+        remainder = len(output_batch) % multiple
+        if remainder == 0:
+            return input_batch, output_batch
+
+        pad_size = multiple - remainder
+        input_padding = input_batch.select_idxs([len(input_batch) - 1]).repeat(pad_size)
+        output_padding = output_batch.select_idxs([len(output_batch) - 1]).repeat(pad_size)
+        input_padding.meta_info = {}
+        output_padding.meta_info = {}
+
+        pad_uids = np.array([f"async_skd_pad_{uuid.uuid4().hex}_{idx}" for idx in range(pad_size)], dtype=object)
+        for padding in (input_padding, output_padding):
+            if "uid" in padding.non_tensor_batch:
+                padding.non_tensor_batch["uid"] = pad_uids.copy()
+            if "index" in padding.non_tensor_batch:
+                padding.non_tensor_batch["index"] = np.array([-1] * pad_size, dtype=object)
+
+        for key in ("response_mask", "rm_scores"):
+            if key in output_padding.batch:
+                output_padding.batch[key].zero_()
+
+        input_batch = DataProto.concat([input_batch, input_padding])
+        output_batch = DataProto.concat([output_batch, output_padding])
+        return _sync_input_prompt_with_output(input_batch, output_batch), output_batch
+
+    base_input_batch = _expand_input_to_output(base_input_batch, base_output_batch)
+    base_input_batch = _sync_input_prompt_with_output(base_input_batch, base_output_batch)
+
     promoted_available = async_skd_data_source.promoted_count()
     take_count = promoted_available
     if max_promoted_count is not None and max_promoted_count > 0:
         take_count = min(take_count, int(max_promoted_count))
-    if required_multiple is not None and required_multiple > 1:
-        take_count -= (len(base_input_batch) + take_count) % required_multiple
 
     promoted_inputs, promoted_outputs = async_skd_data_source.pop_promoted_pairs(max_count=take_count)
     if len(promoted_inputs) != len(promoted_outputs):
@@ -195,11 +317,24 @@ def _assemble_async_skd_training_batch(
         )
     if not promoted_inputs:
         base_output_batch = sync_output_non_tensor_with_input(base_input_batch, base_output_batch)
+        base_input_batch, base_output_batch = _pad_pair_to_required_multiple(
+            base_input_batch, base_output_batch, required_multiple
+        )
         return base_input_batch, base_output_batch
 
-    merged_input = DataProto.concat(align_non_tensor_keys_for_concat([base_input_batch, *promoted_inputs]))
-    merged_output = DataProto.concat(align_non_tensor_keys_for_concat([base_output_batch, *promoted_outputs]))
+    promoted_inputs = [
+        _sync_input_prompt_with_output(_expand_input_to_output(input_batch, output_batch), output_batch)
+        for input_batch, output_batch in zip(promoted_inputs, promoted_outputs, strict=True)
+    ]
+    input_batches, output_batches = _align_pairs_for_concat(
+        [base_input_batch, *promoted_inputs],
+        [base_output_batch, *promoted_outputs],
+    )
+    merged_output = DataProto.concat(align_non_tensor_keys_for_concat(output_batches))
+    merged_input = DataProto.concat(align_non_tensor_keys_for_concat(input_batches))
+    merged_input = _sync_input_prompt_with_output(merged_input, merged_output)
     merged_output = sync_output_non_tensor_with_input(merged_input, merged_output)
+    merged_input, merged_output = _pad_pair_to_required_multiple(merged_input, merged_output, required_multiple)
     return merged_input, merged_output
 
 
@@ -1388,8 +1523,11 @@ class RayPPOTrainer:
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
         if self._uses_async_skd_lookahead_training():
+            global_batch_size = int((batch_td["response_mask"].sum(dim=-1) > 0).sum().item())
+            if global_batch_size <= 0:
+                raise ValueError("Async SKD actor update has no non-padding training rows.")
             batch_controls = {
-                "global_batch_size": int(batch_td.batch_size[0]),
+                "global_batch_size": global_batch_size,
                 "num_mini_batch": 1,
             }
         else:
@@ -1585,6 +1723,7 @@ class RayPPOTrainer:
                             validate=False,
                             required_multiple=dp_size,
                             max_promoted_count=max_promoted_count,
+                            pad_token_id=self.tokenizer.pad_token_id,
                         )
                     batch = batch.union(gen_batch_output)
 

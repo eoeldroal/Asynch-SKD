@@ -242,6 +242,9 @@ class SkdConfig(BaseConfig):
     verify_top_k: int = 25
     max_chunks_per_sample: int = 60
     teacher_system_prompt_path: Optional[str] = None
+    windowed_training_enabled: bool = False
+    window_history_n: int = 5
+    window_max_images_per_sample: Optional[int] = 6
 
 
 @dataclass

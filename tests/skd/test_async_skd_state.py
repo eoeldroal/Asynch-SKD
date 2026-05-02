@@ -27,6 +27,22 @@ def make_single_batch() -> DataProto:
     )
 
 
+def make_windowed_batch(num_rows: int = 3) -> DataProto:
+    return DataProto.from_dict(
+        non_tensors={
+            "uid": np.array(["sample-windowed"] * num_rows, dtype=object),
+            "index": np.array(list(range(num_rows)), dtype=object),
+            "rollout_birth_version": np.array([7] * num_rows, dtype=object),
+            "rollout_min_version": np.array([7] * num_rows, dtype=object),
+            "rollout_max_version": np.array([8] * num_rows, dtype=object),
+            "skd_committed_gen_chunks": np.array([2] * num_rows, dtype=object),
+            "skd_committed_env_units": np.array([1] * num_rows, dtype=object),
+            "skd_committed_prefix_tokens": np.array([128] * num_rows, dtype=object),
+        },
+        meta_info={"metrics": [{"generate_sequences": 1.0, "tool_calls": 2.0} for _ in range(num_rows)]},
+    )
+
+
 def make_partial() -> SkdPartialState:
     return SkdPartialState(
         sample_id="sample-partial",
@@ -70,6 +86,28 @@ def test_async_skd_sample_from_completed_copies_metadata_and_requires_completed(
 
     with pytest.raises(ValueError, match="not partial"):
         sample.require_partial()
+
+
+def test_async_skd_sample_from_completed_accepts_windowed_rows_from_one_trajectory():
+    batch = make_windowed_batch(num_rows=3)
+    sample = AsyncSkdSample.from_completed(
+        sample_id="sample-windowed",
+        logical_step=4,
+        source_type="lookahead",
+        batch=batch,
+        train_consume_version=8,
+    )
+
+    assert sample.require_completed() is batch
+    assert len(sample.require_completed()) == 3
+    assert sample.rollout_birth_version == 7
+    assert sample.rollout_min_version == 7
+    assert sample.rollout_max_version == 8
+    assert sample.train_consume_version == 8
+    assert sample.committed_gen_chunks == 2
+    assert sample.committed_env_units == 1
+    assert sample.committed_prefix_tokens == 128
+    assert sample.metrics == {"generate_sequences": 1.0, "tool_calls": 2.0}
 
 
 def test_async_skd_sample_from_partial_copies_metadata_and_requires_partial():
@@ -116,12 +154,17 @@ def test_async_skd_sample_rejects_invalid_completed_payload_combinations():
             partial_state=partial,
         ).validate()
 
-    with pytest.raises(ValueError, match="single-sample DataProto"):
+    with pytest.raises(ValueError, match="trajectory-level non_tensor_batch\\['rollout_birth_version'\\] to be uniform"):
         AsyncSkdSample.from_completed(
             sample_id="bad-batch",
             logical_step=0,
             source_type="base_current",
-            batch=DataProto.from_dict(non_tensors={"index": np.array([0, 1], dtype=object)}),
+            batch=DataProto.from_dict(
+                non_tensors={
+                    "index": np.array([0, 1], dtype=object),
+                    "rollout_birth_version": np.array([7, 8], dtype=object),
+                }
+            ),
         )
 
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 from verl.protocol import DataProto
 
 
@@ -27,13 +29,26 @@ ASYNC_SKD_SAMPLE_SOURCE_TYPES: frozenset[str] = frozenset(
 )
 
 
-def _single_non_tensor_value(batch: DataProto, key: str) -> Any:
+def _non_tensor_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+        return bool(np.array_equal(np.asarray(left, dtype=object), np.asarray(right, dtype=object)))
+    return left == right
+
+
+def _trajectory_non_tensor_value(batch: DataProto, key: str) -> Any:
+    """Return one trajectory-level value, allowing repeated window rows."""
     if key not in batch.non_tensor_batch:
         return None
     values = batch.non_tensor_batch[key]
-    if len(values) != 1:
-        raise ValueError(f"Expected single-sample non_tensor_batch[{key!r}], got shape={values.shape}")
-    return values[0]
+    if len(values) == 0:
+        raise ValueError(f"Expected non-empty non_tensor_batch[{key!r}]")
+    first = values[0]
+    for value in values[1:]:
+        if not _non_tensor_values_equal(value, first):
+            raise ValueError(
+                f"Expected trajectory-level non_tensor_batch[{key!r}] to be uniform, got shape={values.shape}"
+            )
+    return first
 
 
 def _optional_int(value: Any) -> int | None:
@@ -99,7 +114,7 @@ class AsyncSkdSample:
     """Single queue/scheduler envelope for completed and partial SKD samples.
 
     The payload is intentionally a strict union:
-    - ``kind == "completed"`` carries a single-sample ``DataProto``.
+    - ``kind == "completed"`` carries one completed trajectory's training ``DataProto``.
     - ``kind == "partial"`` carries a resumable ``SkdPartialState``.
 
     Callers must use ``require_completed()`` or ``require_partial()`` instead
@@ -138,9 +153,9 @@ class AsyncSkdSample:
         drop_reason: str | None = None,
         metrics: dict[str, Any] | None = None,
     ) -> "AsyncSkdSample":
-        """Build a completed-sample envelope from a single-sample DataProto."""
+        """Build a completed-trajectory envelope from one or more training rows."""
         batch_metrics = batch.meta_info.get("metrics")
-        if metrics is None and isinstance(batch_metrics, list) and len(batch_metrics) == 1:
+        if metrics is None and isinstance(batch_metrics, list) and batch_metrics:
             metrics = dict(batch_metrics[0])
 
         sample = cls(
@@ -150,13 +165,13 @@ class AsyncSkdSample:
             logical_step=logical_step,
             batch=batch,
             partial_state=None,
-            rollout_birth_version=_optional_int(_single_non_tensor_value(batch, "rollout_birth_version")),
-            rollout_min_version=_optional_int(_single_non_tensor_value(batch, "rollout_min_version")),
-            rollout_max_version=_optional_int(_single_non_tensor_value(batch, "rollout_max_version")),
+            rollout_birth_version=_optional_int(_trajectory_non_tensor_value(batch, "rollout_birth_version")),
+            rollout_min_version=_optional_int(_trajectory_non_tensor_value(batch, "rollout_min_version")),
+            rollout_max_version=_optional_int(_trajectory_non_tensor_value(batch, "rollout_max_version")),
             train_consume_version=train_consume_version,
-            committed_gen_chunks=int(_single_non_tensor_value(batch, "skd_committed_gen_chunks") or 0),
-            committed_env_units=int(_single_non_tensor_value(batch, "skd_committed_env_units") or 0),
-            committed_prefix_tokens=int(_single_non_tensor_value(batch, "skd_committed_prefix_tokens") or 0),
+            committed_gen_chunks=int(_trajectory_non_tensor_value(batch, "skd_committed_gen_chunks") or 0),
+            committed_env_units=int(_trajectory_non_tensor_value(batch, "skd_committed_env_units") or 0),
+            committed_prefix_tokens=int(_trajectory_non_tensor_value(batch, "skd_committed_prefix_tokens") or 0),
             drop_reason=drop_reason,
             metrics=metrics or {},
         )
@@ -215,8 +230,18 @@ class AsyncSkdSample:
                 raise ValueError("Completed AsyncSkdSample requires batch")
             if self.partial_state is not None:
                 raise ValueError("Completed AsyncSkdSample must not carry partial_state")
-            if len(self.batch) != 1:
-                raise ValueError(f"Completed AsyncSkdSample requires single-sample DataProto, got {len(self.batch)}")
+            if len(self.batch) < 1:
+                raise ValueError(f"Completed AsyncSkdSample requires non-empty DataProto, got {len(self.batch)}")
+            for key in (
+                "uid",
+                "rollout_birth_version",
+                "rollout_min_version",
+                "rollout_max_version",
+                "skd_committed_gen_chunks",
+                "skd_committed_env_units",
+                "skd_committed_prefix_tokens",
+            ):
+                _trajectory_non_tensor_value(self.batch, key)
             return
 
         if self.batch is not None:

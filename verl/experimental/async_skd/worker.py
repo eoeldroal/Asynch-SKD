@@ -16,6 +16,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.async_skd.events import async_skd_event_context
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
+from verl.experimental.async_skd.windowed_training import WindowedSkdConfig, build_windowed_agent_loop_outputs
 from verl.protocol import DataProto
 
 if TYPE_CHECKING:
@@ -94,6 +95,68 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
 
     def _strip_internal_async_skd_extra_fields(self, output: AgentLoopOutput) -> None:
         output.extra_fields.pop(_ASYNC_SKD_INPUT_NON_TENSOR_BATCH, None)
+
+    def _windowed_skd_config(self) -> WindowedSkdConfig:
+        skd_config = getattr(getattr(self, "distillation_config", None), "skd", None)
+        if skd_config is None:
+            return WindowedSkdConfig()
+        return WindowedSkdConfig(
+            enabled=bool(getattr(skd_config, "windowed_training_enabled", False)),
+            history_n=int(getattr(skd_config, "window_history_n", 5)),
+            max_images_per_sample=getattr(skd_config, "window_max_images_per_sample", 6),
+        )
+
+    @staticmethod
+    def _repeat_input_non_tensor_batch(input_non_tensor_batch: dict[str, np.ndarray], count: int) -> dict[str, np.ndarray]:
+        if count == 1:
+            return {key: value[:1].copy() for key, value in input_non_tensor_batch.items()}
+        repeated: dict[str, np.ndarray] = {}
+        for key, value in input_non_tensor_batch.items():
+            arr = np.empty(count, dtype=object)
+            first = value[0] if len(value) else None
+            arr[:] = [deepcopy(first) for _ in range(count)]
+            repeated[key] = arr
+        return repeated
+
+    async def _postprocess_completed_skd_output(
+        self,
+        output: AgentLoopOutput,
+        *,
+        validate: bool,
+        input_non_tensor_batch: dict[str, np.ndarray],
+    ) -> DataProto:
+        self._strip_internal_async_skd_extra_fields(output)
+        windowed_outputs, window_metrics = build_windowed_agent_loop_outputs(
+            output,
+            config=self._windowed_skd_config(),
+            tokenizer=self.tokenizer,
+        )
+        prompt_length_override = max(
+            int(self.rollout_config.prompt_length),
+            max((len(windowed_output.prompt_ids) for windowed_output in windowed_outputs), default=0),
+        )
+        postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
+        internal_outputs = [
+            await self._agent_loop_postprocess(
+                windowed_output,
+                validate,
+                **postprocess_kwargs,
+                _prompt_length_override=prompt_length_override,
+            )
+            for windowed_output in windowed_outputs
+        ]
+        repeated_input_batch = self._repeat_input_non_tensor_batch(input_non_tensor_batch, len(internal_outputs))
+        completed_batch = self._postprocess(
+            internal_outputs,
+            input_non_tensor_batch=repeated_input_batch,
+            validate=validate,
+        )
+        for key in ("uid", "index", "input_pos"):
+            if key in repeated_input_batch:
+                completed_batch.non_tensor_batch[key] = repeated_input_batch[key].copy()
+        if window_metrics:
+            completed_batch.meta_info["metrics"][0].update(window_metrics)
+        return completed_batch
 
     async def generate_sequence_single(
         self,
@@ -225,21 +288,17 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         if not isinstance(result, AgentLoopOutput):
             raise TypeError(f"Unexpected SKD boundary result type: {type(result).__name__}")
 
-        self._strip_internal_async_skd_extra_fields(result)
-        postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
-        internal_output = await self._agent_loop_postprocess(result, validate, **postprocess_kwargs)
-        completed_batch = self._postprocess(
-            [internal_output],
-            input_non_tensor_batch=input_non_tensor_batch,
+        completed_batch = await self._postprocess_completed_skd_output(
+            result,
             validate=validate,
+            input_non_tensor_batch=input_non_tensor_batch,
         )
         _trace_async_skd(
             "worker.generate_until_boundary.completed",
             sample_id=sample_id,
             logical_step=logical_step,
             source_type=source_type,
-            teacher_replica_id=internal_output.extra_fields.get("teacher_replica_id"),
-            teacher_routing_key=internal_output.extra_fields.get("teacher_routing_key"),
+            output_batch_size=len(completed_batch),
         )
         return AsyncSkdSample.from_completed(
             sample_id=sample_id,
@@ -293,13 +352,10 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
                 sampling_params,
                 partial_state=partial_state,
             )
-        self._strip_internal_async_skd_extra_fields(result)
-        postprocess_kwargs = self._single_kwargs(DataProto.from_dict(non_tensors=input_non_tensor_batch))
-        internal_output = await self._agent_loop_postprocess(result, False, **postprocess_kwargs)
-        completed_batch = self._postprocess(
-            [internal_output],
-            input_non_tensor_batch=input_non_tensor_batch,
+        completed_batch = await self._postprocess_completed_skd_output(
+            result,
             validate=False,
+            input_non_tensor_batch=input_non_tensor_batch,
         )
         _trace_async_skd(
             "worker.generate_from_partial.completed",
@@ -307,9 +363,7 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             logical_step=partial_state.logical_step,
             source_type=source_type,
             parent_request_id=partial_state.request_id,
-            current_request_id=internal_output.extra_fields.get("request_id"),
-            teacher_replica_id=internal_output.extra_fields.get("teacher_replica_id"),
-            teacher_routing_key=internal_output.extra_fields.get("teacher_routing_key"),
+            output_batch_size=len(completed_batch),
         )
         return AsyncSkdSample.from_completed(
             sample_id=partial_state.sample_id,

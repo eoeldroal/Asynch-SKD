@@ -6,6 +6,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl.trainer.distillation.losses import distillation_ppo_loss
+from verl.trainer.distillation.losses import compute_distillation_loss_range
 from verl.trainer.ppo.core_algos import AdvantageEstimator
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 
@@ -42,6 +43,16 @@ def test_distillation_ppo_loss_skips_ppo_path_for_supervised_distillation(monkey
     assert torch.equal(policy_loss, distill_loss)
     assert "distillation/mock" in policy_metrics
     assert "distillation/loss" in policy_metrics
+
+
+def test_distillation_loss_range_handles_padding_only_rows():
+    metrics = compute_distillation_loss_range(
+        distillation_losses=torch.ones(1, 4),
+        response_mask=torch.zeros(1, 4, dtype=torch.bool),
+    )
+
+    assert metrics["distillation/loss_min"].aggregate() == 0.0
+    assert metrics["distillation/loss_max"].aggregate() == 0.0
 
 
 class _AsyncSkdManagerStub:

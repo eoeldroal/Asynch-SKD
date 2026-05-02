@@ -122,6 +122,12 @@ def compute_distillation_loss_range(
         distillation_losses_response = distillation_losses[response_mask.bool().to_padded_tensor(False)]
     else:
         distillation_losses_response = distillation_losses[response_mask.bool()]
+    if distillation_losses_response.numel() == 0:
+        zero = distillation_losses.new_tensor(0.0)
+        return {
+            "distillation/loss_min": Metric(AggregationType.MIN, zero),
+            "distillation/loss_max": Metric(AggregationType.MAX, zero),
+        }
     return {
         "distillation/loss_min": Metric(AggregationType.MIN, distillation_losses_response.min()),
         "distillation/loss_max": Metric(AggregationType.MAX, distillation_losses_response.max()),
@@ -330,6 +336,17 @@ def compute_forward_kl_topk(
     # Log amount of mass in the top-k log probabilities for both student and teacher.
     student_mass = student_mass[response_mask_bool]
     teacher_mass = teacher_mass[response_mask_bool]
+    if student_mass.numel() == 0:
+        zero = distillation_losses.new_tensor(0.0)
+        distillation_metrics = {
+            "distillation/student_mass": 0.0,
+            "distillation/student_mass_min": Metric(AggregationType.MIN, zero),
+            "distillation/student_mass_max": Metric(AggregationType.MAX, zero),
+            "distillation/teacher_mass": 0.0,
+            "distillation/teacher_mass_min": Metric(AggregationType.MIN, zero),
+            "distillation/teacher_mass_max": Metric(AggregationType.MAX, zero),
+        }
+        return distillation_losses.clamp_min(0.0), distillation_metrics
     distillation_metrics = {
         "distillation/student_mass": student_mass.mean().item(),
         "distillation/student_mass_min": Metric(AggregationType.MIN, student_mass.min()),
