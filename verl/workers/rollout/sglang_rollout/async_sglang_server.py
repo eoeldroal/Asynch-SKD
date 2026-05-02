@@ -61,6 +61,7 @@ _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEB
 def _trace_async_skd(stage: str, **fields: Any) -> None:
     if _ASYNC_SKD_TRACE <= 0:
         return
+    fields = {"pid": os.getpid(), "mono_ns": time.monotonic_ns(), **fields}
     parts = [f"{key}={value!r}" for key, value in fields.items()]
     suffix = f" {' '.join(parts)}" if parts else ""
     print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
@@ -567,12 +568,21 @@ class SGLangHttpServer:
         prompt_ids: torch.Tensor,
         sampling_params: dict[str, Any],
         request_id: str,
-        prompt_text: Optional[str] = None,
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         # TODO(@wuxibin): switch to `/generate` http endpoint once multi-modal support ready.
+        _trace_async_skd(
+            "sglang.generate_entry",
+            request_id=request_id,
+            prompt_len=len(prompt_ids),
+            request_input_kind="input_ids",
+            image_count=_safe_len(image_data),
+            video_count=_safe_len(video_data),
+            sampling_keys=sorted(sampling_params.keys()),
+            max_model_len=self.config.max_model_len,
+        )
         max_possible_tokens = self.config.max_model_len - len(prompt_ids) - 1
 
         if max_possible_tokens < 0:
@@ -611,10 +621,9 @@ class SGLangHttpServer:
         prompt_logprobs_expected_len = sampling_params.pop("prompt_logprobs_expected_len", None)
         if prompt_logprobs is not None:
             return_logprob = True
-        if prompt_text is not None and prompt_logprobs is not None:
-            raise ValueError("prompt_text is not supported for prompt_logprobs requests.")
-        request_input_kind = "text" if prompt_text is not None else "input_ids"
+        request_input_kind = "input_ids"
 
+        request_build_t0 = time.monotonic()
         request = {
             "rid": request_id,
             "sampling_params": sampling_params,
@@ -622,11 +631,8 @@ class SGLangHttpServer:
             "image_data": image_data,
             # TODO: support video input for sglang
             # video_data=video_data,
+            "input_ids": prompt_ids,
         }
-        if prompt_text is not None:
-            request["text"] = prompt_text
-        else:
-            request["input_ids"] = prompt_ids
 
         if prompt_logprobs is not None:
             request["logprob_start_len"] = prompt_logprobs_start_len or 0
@@ -636,7 +642,31 @@ class SGLangHttpServer:
         if self.config.enable_rollout_routing_replay:
             request.update({"return_routed_experts": True})
 
+        request_build_ms = (time.monotonic() - request_build_t0) * 1000
+        _trace_async_skd(
+            "sglang.request_dict_done",
+            request_id=request_id,
+            elapsed_ms=round(request_build_ms, 1),
+            request_input_kind=request_input_kind,
+            request_keys=sorted(request.keys()),
+            prompt_len=len(prompt_ids),
+            image_count=_safe_len(image_data),
+            return_logprob=return_logprob,
+            prompt_logprobs=prompt_logprobs,
+            logprob_start_len=prompt_logprobs_start_len,
+            top_logprobs_num=request.get("top_logprobs_num"),
+        )
+        reqinput_t0 = time.monotonic()
         generate_request = GenerateReqInput(**request)
+        reqinput_ms = (time.monotonic() - reqinput_t0) * 1000
+        _trace_async_skd(
+            "sglang.generate_reqinput_done",
+            request_id=request_id,
+            elapsed_ms=round(reqinput_ms, 1),
+            request_input_kind=request_input_kind,
+            prompt_len=len(prompt_ids),
+            image_count=_safe_len(image_data),
+        )
 
         # Add lora request
         if self.model_config.lora_rank > 0:
@@ -654,7 +684,6 @@ class SGLangHttpServer:
                 request_id=request_id,
                 request_input_kind=request_input_kind,
                 prompt_len=len(prompt_ids),
-                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
                 max_new_tokens=max_new_tokens,
                 return_logprob=return_logprob,
                 prompt_logprobs=prompt_logprobs,
@@ -672,7 +701,6 @@ class SGLangHttpServer:
                 request_id=request_id,
                 request_input_kind=request_input_kind,
                 prompt_len=len(prompt_ids),
-                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
                 max_new_tokens=max_new_tokens,
                 return_logprob=return_logprob,
                 image_count=_safe_len(image_data),
@@ -680,22 +708,107 @@ class SGLangHttpServer:
                 max_model_len=self.config.max_model_len,
             )
 
+        iterator_t0 = time.monotonic()
+        generate_iterator = self.tokenizer_manager.generate_request(generate_request, None)
+        iterator_ms = (time.monotonic() - iterator_t0) * 1000
+        _trace_async_skd(
+            "sglang.tokenizer_generate_iterator_ready",
+            request_id=request_id,
+            elapsed_ms=round(iterator_ms, 1),
+            request_input_kind=request_input_kind,
+        )
+        _trace_async_skd(
+            "sglang.tokenizer_generate_await_begin",
+            request_id=request_id,
+            request_input_kind=request_input_kind,
+            prompt_len=len(prompt_ids),
+            image_count=_safe_len(image_data),
+            return_logprob=return_logprob,
+            prompt_logprobs=prompt_logprobs,
+            logprob_start_len=prompt_logprobs_start_len,
+        )
         generate_t0 = time.monotonic()
-        output = await self.tokenizer_manager.generate_request(generate_request, None).__anext__()
+        try:
+            awaitable = generate_iterator.__anext__()
+            if _ASYNC_SKD_TRACE >= 2:
+                generate_task = asyncio.create_task(awaitable)
+                heartbeat_idx = 0
+                while not generate_task.done():
+                    try:
+                        output = await asyncio.wait_for(asyncio.shield(generate_task), timeout=5.0)
+                        break
+                    except asyncio.TimeoutError:
+                        heartbeat_idx += 1
+                        _trace_async_skd(
+                            "sglang.tokenizer_generate_await_waiting",
+                            request_id=request_id,
+                            request_input_kind=request_input_kind,
+                            elapsed_ms=round((time.monotonic() - generate_t0) * 1000, 1),
+                            heartbeat_idx=heartbeat_idx,
+                            prompt_len=len(prompt_ids),
+                            image_count=_safe_len(image_data),
+                            return_logprob=return_logprob,
+                            prompt_logprobs=prompt_logprobs,
+                            logprob_start_len=prompt_logprobs_start_len,
+                        )
+                else:
+                    output = generate_task.result()
+            else:
+                output = await awaitable
+        except Exception as exc:
+            generate_ms = (time.monotonic() - generate_t0) * 1000
+            _trace_async_skd(
+                "sglang.tokenizer_generate_await_error",
+                request_id=request_id,
+                elapsed_ms=round(generate_ms, 1),
+                request_input_kind=request_input_kind,
+                error_type=type(exc).__name__,
+                error=repr(exc),
+            )
+            raise
         generate_ms = (time.monotonic() - generate_t0) * 1000
+        _trace_async_skd(
+            "sglang.tokenizer_generate_await_done",
+            request_id=request_id,
+            request_input_kind=request_input_kind,
+            elapsed_ms=round(generate_ms, 1),
+            output_keys=sorted(output.keys()),
+        )
+        meta_parse_t0 = time.monotonic()
         meta_info = output.get("meta_info", {})
         finish_reason = meta_info.get("finish_reason")
         finish_reason = finish_reason["type"] if finish_reason else None
+        meta_parse_ms = (time.monotonic() - meta_parse_t0) * 1000
+        _trace_async_skd(
+            "sglang.output_meta_parse_done",
+            request_id=request_id,
+            elapsed_ms=round(meta_parse_ms, 1),
+            finish_reason=finish_reason,
+            output_ids_len=_safe_len(output.get("output_ids")),
+            meta_keys=sorted(meta_info.keys()),
+            queue_time=meta_info.get("queue_time"),
+            prefill_launch_delay=meta_info.get("prefill_launch_delay"),
+            prefill_launch_latency=meta_info.get("prefill_launch_latency"),
+            inference_time=meta_info.get("inference_time"),
+        )
         raw_compact_prompt_rows = None
         if is_skd_prompt_logprob:
+            compact_count_t0 = time.monotonic()
             raw_compact_prompt_rows = _count_compact_prompt_logprob_rows(meta_info, int(prompt_logprobs or 0))
+            compact_count_ms = (time.monotonic() - compact_count_t0) * 1000
+            _trace_async_skd(
+                "sglang.compact_prompt_rows_count_done",
+                request_id=request_id,
+                elapsed_ms=round(compact_count_ms, 1),
+                raw_compact_rows=raw_compact_prompt_rows,
+                prompt_logprobs=prompt_logprobs,
+            )
             _trace_async_skd(
                 "sglang.generate_request_done",
                 request_id=request_id,
                 request_input_kind=request_input_kind,
                 elapsed_ms=round(generate_ms, 1),
                 prompt_len=len(prompt_ids),
-                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
                 output_ids_len=_safe_len(output.get("output_ids")),
                 finish_reason=finish_reason,
                 input_token_logprobs_len=_safe_len(meta_info.get("input_token_logprobs")),
@@ -720,7 +833,6 @@ class SGLangHttpServer:
                 request_input_kind=request_input_kind,
                 elapsed_ms=round(generate_ms, 1),
                 prompt_len=len(prompt_ids),
-                prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
                 output_ids_len=_safe_len(output.get("output_ids")),
                 finish_reason=finish_reason,
                 queue_time=meta_info.get("queue_time"),
@@ -731,6 +843,7 @@ class SGLangHttpServer:
                 response_sent_to_client_ts=meta_info.get("response_sent_to_client_ts"),
             )
         if return_logprob:
+            logprob_parse_t0 = time.monotonic()
             token_ids = list(output.get("output_ids", []))
             output_token_logprobs = meta_info.get("output_token_logprobs") or []
             if output_token_logprobs and len(output_token_logprobs) == len(token_ids):
@@ -744,12 +857,30 @@ class SGLangHttpServer:
                     f"output_ids length ({len(token_ids)}) for request {request_id}"
                 )
                 log_probs = []
+            logprob_parse_ms = (time.monotonic() - logprob_parse_t0) * 1000
+            _trace_async_skd(
+                "sglang.output_logprob_parse_done",
+                request_id=request_id,
+                elapsed_ms=round(logprob_parse_ms, 1),
+                token_ids_len=len(token_ids),
+                output_token_logprobs_len=_safe_len(output_token_logprobs),
+                has_log_probs=log_probs is not None,
+            )
         else:
+            token_parse_t0 = time.monotonic()
             token_ids = output["output_ids"]
             log_probs = None
+            token_parse_ms = (time.monotonic() - token_parse_t0) * 1000
+            _trace_async_skd(
+                "sglang.output_token_parse_done",
+                request_id=request_id,
+                elapsed_ms=round(token_parse_ms, 1),
+                token_ids_len=_safe_len(token_ids),
+            )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
+            routed_t0 = time.monotonic()
             if self.config.skip_tokenizer_init:
                 routed_experts = output.get("meta_info", {}).get("routed_experts", None)
             else:
@@ -765,9 +896,25 @@ class SGLangHttpServer:
                 routed_experts = extract_routed_experts_from_meta_info(output).reshape(
                     -1, hf_config.num_hidden_layers, hf_config.num_experts_per_tok
                 )
+            routed_ms = (time.monotonic() - routed_t0) * 1000
+            _trace_async_skd(
+                "sglang.routed_experts_extract_done",
+                request_id=request_id,
+                elapsed_ms=round(routed_ms, 1),
+                has_routed_experts=routed_experts is not None,
+            )
 
         extra_fields = {"global_steps": self.global_steps}
         if prompt_logprobs is not None:
+            _trace_async_skd(
+                "sglang.prompt_logprobs_extract_begin",
+                request_id=request_id,
+                prompt_logprobs=prompt_logprobs,
+                prompt_logprobs_start_len=prompt_logprobs_start_len,
+                prompt_logprobs_expected_len=prompt_logprobs_expected_len,
+                expected_delta_len=expected_delta_len,
+                expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+            )
             extract_t0 = time.monotonic()
             if prompt_logprobs_start_len is not None and prompt_logprobs_start_len > 0:
                 _extract_skd_delta_prompt_logprobs_sglang(
@@ -805,13 +952,24 @@ class SGLangHttpServer:
                 expected_mm_prefix_surplus=expected_mm_prefix_surplus,
             )
 
-        return TokenOutput(
+        token_output_t0 = time.monotonic()
+        token_output = TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
             routed_experts=routed_experts,
             stop_reason=finish_reason,
             extra_fields=extra_fields,
         )
+        token_output_ms = (time.monotonic() - token_output_t0) * 1000
+        _trace_async_skd(
+            "sglang.token_output_build_done",
+            request_id=request_id,
+            elapsed_ms=round(token_output_ms, 1),
+            token_ids_len=_safe_len(token_ids),
+            has_log_probs=log_probs is not None,
+            extra_field_keys=sorted(extra_fields.keys()),
+        )
+        return token_output
 
     async def set_global_steps(self, global_steps: int):
         """Set the global steps of the model weights."""
@@ -920,7 +1078,12 @@ class SGLangReplica(RolloutReplica):
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1"}},
+                runtime_env={
+                    "env_vars": {
+                        f"RAY_EXPERIMENTAL_NOSET_{visible_devices_keyword}": "1",
+                        visible_devices_keyword: node_cuda_visible_devices,
+                    }
+                },
                 name=name,
                 max_concurrency=self.max_concurrency,
             ).remote(

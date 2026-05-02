@@ -270,10 +270,26 @@ server_prompt_ids
 teacher_server_prompt_ids
 ```
 
-SGLang이 image expansion 때문에 prompt-logprob rows를 더 반환할 수 있으므로, teacher verification은 `expected_mm_prefix_surplus`를 전달한다.
+Pending initialization이 끝난 뒤 WebSKD runtime truth는 teacher 쪽 세 값이다.
 
 ```text
-expected_mm_prefix_surplus =
+teacher_prompt_ids
+teacher_server_prompt_ids
+teacher_sglang_prefix_surplus
+```
+
+의미:
+
+- `teacher_prompt_ids`: local processor-expanded canonical teacher ids
+- `teacher_server_prompt_ids`: teacher verify request에 실제로 들어가는 SGLang logical ids
+- `teacher_sglang_prefix_surplus`: SGLang 반환 rows 앞쪽에서 버려야 하는 multimodal prefix surplus
+
+따라서 verify 단계는 teacher ids를 messages에서 다시 rebuild하면 안 된다. 검증 request와 row trimming은 위 runtime state만 소비해야 한다.
+
+SGLang이 image expansion 때문에 prompt-logprob rows를 더 반환할 수 있으므로, teacher verification은 `teacher_sglang_prefix_surplus`를 전달한다.
+
+```text
+teacher_sglang_prefix_surplus =
   len(teacher_prompt_ids) - len(teacher_server_prompt_ids)
 ```
 
@@ -286,7 +302,8 @@ Teacher context는 student보다 길 수 있다. 특히 WebSKD에서는 a11y tex
 Guard 위치:
 
 1. SKD verification 직전
-   - `teacher_server_prompt_ids + chunk` 검사
+   - runtime truth인 `teacher_server_prompt_ids + chunk` 길이 검사
+   - messages 기반 teacher id rebuild 금지
 
 2. Web observation commit 직전
    - observation을 넣은 뒤 최소 1 future verified token 공간이 남는지 검사

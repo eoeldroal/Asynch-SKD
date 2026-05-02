@@ -4,13 +4,22 @@
 
 이 문서는 WebGym 기반 Async SKD 실행에서 관측된 긴 stall의 원인 조사와 해결 방향을 정리한다.
 
+주의: student native-text 우회는 historical RCA다. 현재 디자인의 source of truth는 ids-only runtime state와 teacher verify contract이며, 이 문서는 stall 해석의 기록으로 읽어야 한다.
+
 현재 결론:
 
 - 병목은 WebGym action server, screenshot base64/PIL decode, tokenizer, 일반 multimodal preprocess가 아니다.
-- 병목은 SGLang에 `input_ids + image_data`로 multimodal generate를 요청하는 pretokenized student generation path다.
-- 같은 이미지와 같은 WebGym loop라도 `text + image_data` native path는 정상 속도로 동작한다.
-- 따라서 해결 방향은 WebSKD image-bearing student generation의 SGLang request만 native text multimodal path로 보내고, 학습용 token stream과 teacher verification 좌표계는 현재 불변식을 유지하는 것이다.
-- 학습 중에는 느린 `input_ids + image_data` fallback을 사용하지 않는다. 대신 tokenization drift를 충분히 로깅하고, returned suffix token ids만 canonical stream에 append한다.
+- 초기 강한 병목 중 하나는 SGLang에 `input_ids + image_data`로 multimodal generate를 요청하는 pretokenized student generation path였다.
+- 같은 이미지와 같은 WebGym loop라도 `text + image_data` native path는 정상 속도로 동작했고, 이 근거로 WebSKD student image generation은 native text path로 우회했다.
+- 이 native-text 우회는 당시 stall을 줄이기 위한 historical workaround였고, 현재는 SGLang upgrade 이후 generation stall의 직접 대응책으로 유지되는 설계가 아니다.
+- native text 우회 이후에도 stall이 완전히 사라진 것은 아니었다. 이전 로그 기준으로는 다음 두 종류의 SGLang-local stall이 관측되었다.
+  1. tokenizer-manager가 request dispatch를 끝낸 뒤 scheduler process가 실제로 request를 받기까지 수십 초가 걸리는 internal handoff stall
+  2. teacher `input_ids + image_data + prompt_logprobs` prefill에서 실제 `forward_batch_generation(...)`가 48-49초까지 걸리는 true model-forward stall
+- 하지만 더 낮은 레벨까지 계측한 최신 실행에서는, 긴 stall의 대부분이 더 이상 handoff/postprocess 쪽이 아니라 **`TpModelWorker -> model_runner.forward(...)` 내부**에서 소비되는 것으로 좁혀졌다.
+- 즉, 현재 이해는 다음과 같다.
+  - historical logs: handoff stall + true forward stall이 모두 있었다
+  - latest low-level run: 재현된 큰 stall은 거의 전부 true forward stall이었다
+- 현재 관점에서 이 우회는 "stall을 막기 위해 계속 필요한 활성 workaround"라기보다, upgrade 이전 증상을 설명하는 historical branch다. generation stall 자체는 SGLang upgrade 이후 현재 blocker로 남아 있지 않다.
 
 ## 1. Problem
 
@@ -567,3 +576,419 @@ native_image + real WebGym:
 - drift는 충분히 로깅하고, 후속 분석에서 위험도를 판단한다.
 
 단, 이 변경은 serving request representation만 바꾸는 것이다. SKD correctness를 담당하는 token streams, teacher streams, response masks, teacher rows, atomic commit contract는 유지한다.
+
+## 13. Updated Stall Anatomy After Native Text Reroute
+
+이 문서의 앞부분은 "왜 student `input_ids + image_data` path를 native `text + image_data`로 우회해야 하는가"를 설명한다. 그 결론은 여전히 맞다.
+
+하지만 이후 실제 Async SKD 학습 로그를 더 깊게 추적해 보니, native text 우회 이후에도 stall은 남아 있었고, 그 내부 구조는 하나가 아니라 둘이었다.
+
+### 13.1 Two Stall Classes
+
+현재 관측되는 긴 stall은 다음 두 클래스로 나뉜다.
+
+1. **Internal handoff stall**
+   - tokenizer / multimodal preprocess는 이미 끝났다.
+   - tokenizer-manager도 request dispatch를 끝냈다.
+   - 그런데 scheduler process가 그 request를 실제로 받기까지 수십 초가 걸린다.
+   - 이 경우 긴 시간은 model forward 이전에 소비된다.
+
+2. **True forward stall**
+   - scheduler가 request를 받아 batch를 구성한다.
+   - `forward_mode='1'` prefill batch가 실제 model worker로 들어간다.
+   - `forward_batch_generation(...)` 자체가 48-49초까지 걸린다.
+   - 이 경우 긴 시간은 실제 model forward 내부에서 소비된다.
+
+둘은 증상이 비슷하게 "응답이 안 오는 것"처럼 보이지만, 로그 경계가 완전히 다르다.
+
+### 13.2 Why `dispatch -> recv` Is a Separate Stall
+
+SGLang trace에서 다음 두 로그는 서로 다른 프로세스 경계를 나타낸다.
+
+```text
+sglang.scheduler_dispatch_done
+  = tokenizer-manager가 _send_one_request(...)를 끝낸 시점
+
+sglang.scheduler_loop_recv_done
+  = scheduler process가 recv_requests()로 실제 request를 받은 시점
+```
+
+즉,
+
+```text
+dispatch_done -> recv_done
+```
+
+구간이 길다면, 그 시간은 다음 중 어느 것도 아니다.
+
+- WebGym tool HTTP
+- base64 / PIL image decode
+- tokenizer
+- Qwen-VL multimodal preprocess
+- model forward
+
+이 시간은 **SGLang 내부에서 tokenizer-manager -> scheduler로 request가 넘어가는 handoff 경계**에서 사라진다.
+
+### 13.3 Decisive Student Example: `3d0fae...`
+
+대표 학생 request:
+
+```text
+request_id='3d0fae45fe214145a92b9bf6cd8f7a99'
+request_input_kind='text'
+image_count=2
+prompt_len=1969
+prompt_text_len=7886
+```
+
+핵심 timeline:
+
+```text
+tokenize_done:                ~35.9ms
+scheduler_dispatch_done:      ~19.6ms
+tokenizer_generate_waiting:    5.0s
+tokenizer_generate_waiting:   10.0s
+scheduler_loop_recv_done:     44.4s
+scheduler_loop_get_batch_done:44.7s
+scheduler_model_forward_begin:44.7s
+first_response_ready:         45.2s
+generate_request_done:        45.2s
+```
+
+해석:
+
+- tokenizer와 multimodal preprocess는 정상이다.
+- request dispatch도 정상이다.
+- model forward는 마지막 수백 ms만 차지한다.
+- 전체 45초 중 대부분은 scheduler가 request를 실제로 받기 전 단계에서 사라진다.
+
+즉 이 request는 **student native text path에서도 internal handoff stall이 실제로 발생함**을 보여준다.
+
+### 13.4 Decisive Teacher Example: `16e625...`
+
+대표 teacher request:
+
+```text
+request_id='16e625d64c0a4f7187cf7c48271929c3'
+request_input_kind='input_ids'
+image_count=3
+prompt_logprobs=32
+logprob_start_len=4609
+```
+
+핵심 timeline:
+
+```text
+tokenizer_generate_waiting:    5.0s
+tokenizer_generate_waiting:   10.0s
+scheduler_model_forward_done: 48.6s
+first_response_ready:         48.8s
+generate_request_done:        48.8s
+```
+
+그리고 같은 request의 scheduler-side trace:
+
+```text
+forward_mode='1'
+return_logprob=True
+seq_lens_sum=tensor(4674)
+prefill_launch_latency=48.650s
+```
+
+이 경우는 internal handoff가 아니라, **teacher multimodal prompt-logprob prefill 자체가 48-49초짜리 true model-forward stall**이라는 뜻이다.
+
+### 13.5 Mixed Case: `52b278...`
+
+`52b278aa...` 같은 request는 두 종류의 stall이 섞일 수 있음을 보여준다.
+
+이 request는:
+
+```text
+request_input_kind='input_ids'
+image_count=3
+generate_request_done: ~43.0s
+```
+
+그런데 잡힌 scheduler-side forward trace는:
+
+```text
+scheduler_model_forward_done: ~0.77s
+batch_size=3
+seq_lens_sum=tensor(14354)
+```
+
+즉, 전체 요청은 43초가 걸렸는데, 실제 관측된 forward는 0.77초다.
+
+이런 패턴은:
+
+- forward collapse만으로 설명되지 않고
+- request lifecycle의 다른 구간, 특히 internal handoff / scheduling admission 쪽에 큰 stall이 있었음을 시사한다.
+
+### 13.6 Replica-local Pathology
+
+긴 요청은 모든 replica에 균등하게 나타나지 않았다.
+
+최근 로그 집계 기준:
+
+```text
+long text requests (>30s):
+  pid 843881: 8건
+  pid 843878: 2건
+  pid 843882: 1건
+  pid 843877: 1건
+
+long input_ids requests (>30s):
+  pid 842996: 5건
+  pid 842911: 1건
+  pid 842907: 1건
+  pid 842829: 1건
+```
+
+즉, 이것은 단순한 "모든 서버가 똑같이 느리다" 문제가 아니라, **특정 SGLang replica가 pathological state에 더 자주 빠지는 경향**도 함께 보인다.
+
+### 13.7 What This Means
+
+현재 WebGym Async SKD stall을 한 문장으로 요약하면 다음과 같다.
+
+```text
+student pretokenized multimodal path는 분명히 잘못된 경로였고 native text path 우회는 필요했다.
+
+하지만 우회 이후에도 SGLang 내부에는
+  (1) tokenizer-manager -> scheduler handoff stall
+  (2) teacher multimodal prompt-logprob prefill forward collapse
+라는 두 개의 서로 다른 stall class가 남아 있다.
+```
+
+따라서 현재 병목 분석은 더 이상 "student pretokenized path 하나의 문제"로 끝나지 않는다.
+
+남은 후속 실험은 다음을 분리해서 봐야 한다.
+
+1. **student native text request**
+   - dispatch -> recv gap
+   - recv -> first token gap
+
+2. **teacher prompt-logprob request**
+   - scheduler admitted 이후 actual forward time
+   - replica별 반복성
+
+이 분리가 되어야, 이후 최적화가
+
+- request ingress / IPC / internal queue 문제인지
+- teacher multimodal prompt-logprob serving 문제인지
+
+정확히 갈라진다.
+
+## 14. Lower-level Instrumentation Update
+
+이후 SGLang manager 레벨보다 한 단계 더 낮은 위치에 계측을 추가했다.
+
+추가한 주요 경계는 다음과 같다.
+
+- `recv_requests()` 내부 세부 시간
+  - `sglang.scheduler_recv_phase_done`
+- overlap scheduler loop 전체 iteration 분해
+  - `sglang.scheduler_overlap_iteration_done`
+- `TpModelWorker.forward_batch_generation(...)` 내부 분해
+  - `sglang.tp_worker_forward_batch_init_done`
+  - `sglang.tp_worker_model_runner_forward_done`
+  - `sglang.tp_worker_sample_done`
+  - `sglang.tp_worker_compute_logprobs_only_done`
+- prefill 후처리 분해
+  - `sglang.prefill_logprob_return_values_done`
+  - `sglang.prefill_cache_update_done`
+  - `sglang.scheduler_stream_collect_done`
+  - `sglang.scheduler_send_to_detokenizer_done`
+
+이 계측의 목적은 다음 세 가설을 분리하는 것이었다.
+
+1. scheduler ingress / recv stall
+2. true prefill forward stall
+3. forward 이후 CPU postprocess / detokenizer send stall
+
+### 14.1 What the New Traces Ruled Out
+
+최신 실행 로그에서는 다음 패턴이 보이지 않았다.
+
+```text
+sglang.scheduler_recv_phase_done total_ms >= 1s
+sglang.scheduler_stream_collect_done elapsed_ms >= 1s
+sglang.scheduler_send_to_detokenizer_done elapsed_ms >= 1s
+sglang.prefill_logprob_return_values_done elapsed_ms >= 1s
+sglang.prefill_cache_update_done elapsed_ms >= 1s
+sglang.scheduler_overlap_iteration_done
+sglang.scheduler_delayed_sample_done
+sglang.scheduler_recv_skipped
+```
+
+즉 최신 실행 기준으로는:
+
+- scheduler ingress / ZMQ receive / broadcast가 수십 초를 먹지 않았다
+- detokenizer send나 CPU-side result packing이 병목이 아니었다
+- overlap scheduling이나 delayed sample path가 stall의 원인이 아니었다
+
+### 14.2 Decisive Student Example: `934145...`
+
+대표 student native-text request:
+
+```text
+request_id='9341453d2af44d2abf530c960a534a74'
+request_input_kind='text'
+image_count=3
+forward_mode='1'
+seq_lens_sum=tensor(4935)
+```
+
+핵심 timeline:
+
+```text
+tp_worker_model_runner_forward_done:   49758.7ms
+scheduler_model_forward_done:          49759.5ms
+scheduler_run_batch_done:              49822.2ms
+prefill_req_loop_done:                     1.0ms
+prefill_cache_update_done:                0.9ms
+scheduler_stream_collect_done:            0.0ms
+scheduler_send_to_detokenizer_done:       0.1ms
+prefill_postprocess_done:                 1.4ms
+scheduler_loop_iteration_done:
+  recv_ms=21.5
+  process_ms=73.2
+  schedule_ms=6.5
+  run_ms=49822.4
+  post_ms=1.5
+```
+
+이 request는 최신 계측 기준으로 매우 결정적이다.
+
+- request ingress는 정상이다.
+- prefill 후처리도 정상이다.
+- 긴 시간의 거의 전부가 `run_ms`이고,
+- 그 `run_ms`는 다시 `tp_worker_model_runner_forward_done`와 거의 동일하다.
+
+즉 이 케이스의 stall은 **scheduler 바깥/주변이 아니라 `model_runner.forward(...)` 내부**다.
+
+### 14.3 Decisive Teacher Example: `b7338f...`
+
+대표 teacher prompt-logprob request:
+
+```text
+request_id='b7338fcd73154cdc8c98b3154b26e497'
+request_input_kind='input_ids'
+image_count=3
+return_logprob=True
+forward_mode='1'
+seq_lens_sum=tensor(4815)
+```
+
+핵심 timeline:
+
+```text
+tp_worker_model_runner_forward_done:   51994.2ms
+scheduler_model_forward_done:          51995.3ms
+scheduler_run_batch_done:              51996.2ms
+prefill_logprob_tolist_done:               0.0ms
+prefill_logprob_return_values_done:        0.0ms
+prefill_cache_update_done:                 0.3ms
+scheduler_stream_collect_done:             0.1ms
+prefill_postprocess_done:                  0.8ms
+scheduler_loop_iteration_done:
+  recv_ms=23.0
+  process_ms=72.3
+  schedule_ms=6.7
+  run_ms=51996.4
+  post_ms=0.9
+```
+
+teacher 경로도 해석은 같다.
+
+- `prompt_logprobs=32` 후처리 자체는 거의 공짜다
+- 결과 packing도 거의 공짜다
+- 실제 52초는 `model_runner.forward(...)` 안에서 소모된다
+
+즉 최신 실행 기준으로는, teacher stall도 더 이상
+"prompt logprob row trimming / return-value packing"
+같은 Python-side postprocess로 설명되지 않는다.
+
+### 14.4 What This Changes
+
+이전에는 "handoff stall"과 "true forward stall"을 동등한 두 축으로 취급했다.
+
+그 해석은 **historical logs를 설명하는 데에는 여전히 유효**하다. 실제로 이전에는
+
+- `dispatch_done -> recv_done`가 수십 초였던 case
+- 전체 요청은 43초인데 scheduler-side forward trace는 0.77초였던 mixed case
+
+가 존재했다.
+
+하지만 최신 저수준 계측 실행에서는 큰 stall이 재현될 때마다 경계가 다음처럼 정렬되었다.
+
+```text
+tp_worker_model_runner_forward_done
+  ~= scheduler_model_forward_done
+  ~= scheduler_run_batch_done
+  >> prefill postprocess
+  >> scheduler send / detokenizer send
+```
+
+따라서 **현재 재현되는 dominant pathology는 `model_runner.forward(...)` 내부의 multimodal EXTEND/prefill collapse**로 보는 것이 가장 정확하다.
+
+### 14.4.1 Sticky Carryover Clarification
+
+여기서 한 가지 표현을 더 정확히 해야 한다.
+
+이 문서 앞선 논의에서 teacher verification을 "긴 multimodal prefix에 대해 매 chunk마다 fresh prefill scoring을 다시 한다"고 요약한 적이 있다. 이 표현은 **방향은 맞지만 너무 거칠다.**
+
+실제 구현은 다음 두 사실을 동시에 가진다.
+
+1. **Sticky carryover는 실제로 존재한다.**
+   - design 문서도 carryover sample을 같은 teacher replica로 다시 보내 **KV locality**를 활용한다고 명시한다.
+   - `AsyncLLMServerManager` docstring도 multi-turn request를 같은 server로 보내 **automatic prefix caching**을 노린다고 적고 있다.
+   - 실제 teacher path는 `bind_sticky_request(...)`를 통해 request id를 특정 teacher replica에 묶는다.
+
+2. **하지만 현재 teacher verify path는 true session continuation은 아니다.**
+   - teacher verify는 매 chunk마다 `verify_sequence = teacher_server_prompt_ids + chunk`를 다시 만들고,
+   - `compute_teacher_logprobs_single(...)`에서 그 전체 `sequence_ids`를 다시 `generate(...)`로 넘긴다.
+   - 이 request는 일반 `GenerateReqInput` 경로를 사용하며, SGLang이 별도로 제공하는 `session_params` / `open_session` / `continue_generation` 기반의 "old kv cache를 이어 쓰는" contract는 사용하지 않는다.
+
+즉 현재 teacher path를 가장 정확히 설명하면 다음과 같다.
+
+```text
+same-replica repeated full-sequence scoring request
++ prefix-cache / KV locality opportunity
+- true live-session continuation
+- completely cold random-replica prefill
+```
+
+이 구분은 중요하다.
+
+- **"매번 완전히 cold prefill"**이라고 말하면 sticky 구현의 효과를 과소평가하게 된다.
+- 반대로 **"이미 KV를 다 재사용하니 prefix cost는 거의 없다"**고 말하면 현재 request contract를 과대평가하게 된다.
+
+현재 stall 해석은 이 중간점 위에 서야 한다.
+Sticky carryover는 분명 teacher 부담을 줄이는 장치다. 다만 지금의 verify 호출은 여전히 **multimodal EXTEND path를 반복해서 밟는 request shape**이므로, prefix locality가 있더라도 pathological `model_runner.forward(...)`를 완전히 피하지는 못한다.
+
+### 14.5 Remaining Open Question
+
+이 문서 수준에서 더 이상 못 자르는 마지막 질문은 이것이다.
+
+```text
+model_runner.forward(...) 내부에서
+정말 dense GPU prefill compute가 오래 도는 것인지,
+아니면 attention backend / CUDA stream / kernel launch / sync 계열의
+internal stall인지
+```
+
+새 로그는 다음을 이미 보여준다.
+
+- manager-level ingress는 병목이 아니다
+- prefill req-loop나 detokenizer send도 병목이 아니다
+- 시간은 `model_runner.forward(...)` 호출 경계 안에 있다
+
+하지만 이 문서 수준의 계측만으로는, 그 내부가
+
+- 실제 matmul-heavy prefill compute
+- multimodal backend-specific pathological wait
+- CUDA graph 비적용 경로에서의 synchronization
+
+중 정확히 무엇인지는 아직 확정하지 못했다.
+
+즉 다음 조사 목표는 자연스럽게 **SGLang `model_runner` / attention backend / model forward implementation 내부 계측**이다.

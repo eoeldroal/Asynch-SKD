@@ -773,6 +773,67 @@ async def test_skd_multimodal_teacher_requires_explicit_sglang_surplus():
         )
 
 
+@pytest.mark.asyncio
+async def test_web_skd_image_generation_keeps_input_ids_request_view():
+    loop = make_web_skd_loop(student_chunks=[[10, EOS]], chunk_size=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 8},
+        ignore_termination=False,
+        stop_after_skd_chunk=False,
+    )
+
+    assert state == AgentState.TERMINATED
+    student_call = loop.server_manager.call_log[0]
+    assert student_call["prompt_ids"] == [1, 2, 3]
+    assert student_call["prompt_text"] is None
+    assert student_call["image_data"] == ["image-1"]
+
+
+@pytest.mark.asyncio
+async def test_web_skd_teacher_verify_uses_tracked_streams_without_recompute():
+    loop = make_web_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields.update(
+        {
+            "server_prompt_ids": [1, 2, 3],
+            "teacher_prompt_ids": [1, 2, 3, 900, 901],
+            "teacher_server_prompt_ids": [1, 2, 3],
+            "teacher_sglang_prefix_surplus": 2,
+            "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+        }
+    )
+
+    async def _boom(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("verify-time teacher recompute must not run under ids-only contract")
+
+    loop._recompute_teacher_prompt_ids = _boom
+    loop._recompute_teacher_server_prompt_ids = _boom
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 2},
+        ignore_termination=False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert state == AgentState.GENERATING
+    teacher_call = loop.teacher_server_manager.call_log[0]
+    assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
+    assert teacher_call["expected_mm_prefix_surplus"] == 2
+    assert teacher_call["expected_logprob_rows"] == 2
+    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+
+
 def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
     loop = make_skd_loop(student_chunks=[])
     agent_data = make_agent_data([1, 2, 3, 70, 71])
@@ -1330,7 +1391,7 @@ async def test_skd_teacher_verification_receives_current_tool_images():
 
 
 @pytest.mark.asyncio
-async def test_web_skd_image_generation_uses_prompt_text_but_appends_suffix_to_server_prompt_ids():
+async def test_web_skd_image_generation_appends_suffix_to_server_prompt_ids_without_prompt_text():
     loop = make_web_skd_loop(student_chunks=[[10, EOS]], chunk_size=8)
     agent_data = make_agent_data([1, 2, 3])
     agent_data.image_data = ["image-1"]
@@ -1344,13 +1405,13 @@ async def test_web_skd_image_generation_uses_prompt_text_but_appends_suffix_to_s
     assert next_state == AgentState.TERMINATED
     student_call = loop.server_manager.call_log[0]
     assert student_call["prompt_ids"] == [1, 2, 3]
-    assert student_call["prompt_text"] == "decoded:1,2,3"
+    assert student_call["prompt_text"] is None
     assert student_call["image_data"] == ["image-1"]
     assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3, 10, EOS]
     assert agent_data.prompt_ids == [1, 2, 3, 10, EOS]
     assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3, 10, EOS]
-    assert agent_data.extra_fields["student_generate_prompt_text_used"] is True
-    assert agent_data.extra_fields["student_generate_roundtrip_match"] is True
+    assert "student_generate_prompt_text_used" not in agent_data.extra_fields
+    assert "student_generate_roundtrip_match" not in agent_data.extra_fields
     assert_skd_alignment(agent_data)
 
 

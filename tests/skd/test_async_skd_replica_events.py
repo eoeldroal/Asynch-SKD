@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
+import types
 
 import pytest
 from omegaconf import OmegaConf
+
+if "datasets" not in sys.modules:
+    datasets_module = types.ModuleType("datasets")
+    datasets_module.Dataset = object
+    sys.modules["datasets"] = datasets_module
 
 from verl.experimental.agent_loop.agent_loop import AsyncLLMServerManager
 from verl.experimental.async_skd.events import async_skd_event_context
@@ -44,8 +52,7 @@ class _FakeServer:
         return TokenOutput(token_ids=[1, 2, 3], log_probs=None, stop_reason="length", extra_fields={})
 
 
-@pytest.mark.asyncio
-async def test_async_llm_server_manager_emits_replica_request_events(tmp_path, monkeypatch):
+def test_async_llm_server_manager_emits_replica_request_events(tmp_path, monkeypatch):
     event_path = tmp_path / "async_skd_events.jsonl"
     monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
     load_balancer = _FakeLoadBalancer()
@@ -61,10 +68,12 @@ async def test_async_llm_server_manager_emits_replica_request_events(tmp_path, m
         source_type="base_current",
         barrier_role="current",
     ):
-        output = await manager.generate(
-            request_id="request-0",
-            prompt_ids=[10, 11, 12],
-            sampling_params={"max_tokens": 1},
+        output = asyncio.run(
+            manager.generate(
+                request_id="request-0",
+                prompt_ids=[10, 11, 12],
+                sampling_params={"max_tokens": 1},
+            )
         )
 
     events = [json.loads(line) for line in event_path.read_text().splitlines()]
@@ -84,8 +93,7 @@ async def test_async_llm_server_manager_emits_replica_request_events(tmp_path, m
     assert load_balancer.released == ["student-replica-0"]
 
 
-@pytest.mark.asyncio
-async def test_async_llm_server_manager_passes_prompt_text_to_server():
+def test_async_llm_server_manager_uses_input_ids_only_runtime_contract():
     load_balancer = _FakeLoadBalancer()
     fake_server = _FakeServer()
     manager = AsyncLLMServerManager(
@@ -94,16 +102,17 @@ async def test_async_llm_server_manager_passes_prompt_text_to_server():
         load_balancer_handle=load_balancer,
     )
 
-    output = await manager.generate(
-        request_id="request-text-view",
-        prompt_ids=[10, 11, 12],
-        prompt_text="<|im_start|>user\n<image><|im_end|>\n<|im_start|>assistant\n",
-        sampling_params={"max_tokens": 1},
-        image_data=["image-1"],
+    output = asyncio.run(
+        manager.generate(
+            request_id="request-text-view",
+            prompt_ids=[10, 11, 12],
+            sampling_params={"max_tokens": 1},
+            image_data=["image-1"],
+        )
     )
 
     assert output.token_ids == [1, 2, 3]
     assert fake_server.calls[0]["prompt_ids"] == [10, 11, 12]
-    assert fake_server.calls[0]["prompt_text"] == "<|im_start|>user\n<image><|im_end|>\n<|im_start|>assistant\n"
+    assert "prompt_text" not in fake_server.calls[0]
     assert fake_server.calls[0]["image_data"] == ["image-1"]
     assert load_balancer.released == ["student-replica-0"]

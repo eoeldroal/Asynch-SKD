@@ -75,27 +75,6 @@ class _ActionFakeTool(_FakeTool):
         }
 
 
-class _FakeRoundTripTokenizer:
-    def __init__(self, *, encoded: list[int] | None = None):
-        self.encoded = encoded
-        self.decode_calls = []
-        self.encode_calls = []
-
-    def decode(self, ids, *, skip_special_tokens=False, clean_up_tokenization_spaces=False):
-        self.decode_calls.append(
-            {
-                "ids": list(ids),
-                "skip_special_tokens": skip_special_tokens,
-                "clean_up_tokenization_spaces": clean_up_tokenization_spaces,
-            }
-        )
-        return "<|im_start|>user\n<image>\nclick<|im_end|>\n<|im_start|>assistant\n"
-
-    def encode(self, text, *, add_special_tokens=False):
-        self.encode_calls.append({"text": text, "add_special_tokens": add_special_tokens})
-        return list(self.encoded if self.encoded is not None else [1, 2, 3, 4])
-
-
 def _build_loop():
     loop = WebSkdAgentLoop.__new__(WebSkdAgentLoop)
     loop.tools = {"computer": _FakeTool()}
@@ -752,113 +731,71 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state, AgentState.TERMINATED)
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
 
-    async def test_build_student_generate_prompt_text_decodes_image_prompt_and_logs_exact_roundtrip(self):
+    async def test_teacher_observation_commit_appends_canonical_delta_ids(self):
         loop = _build_loop()
         loop.loop = __import__("asyncio").get_running_loop()
-        loop.tokenizer = _FakeRoundTripTokenizer(encoded=[1, 2, 3, 4])
-
-        agent_data = AgentData(
-            messages=[{"role": "user", "content": "task"}],
-            image_data=["image-1"],
-            video_data=[],
-            metrics={},
-            request_id="req-text-view",
-            tools_kwargs={},
-        )
-        trace_calls = []
-
-        def _capture_trace(event_name, **kwargs):
-            trace_calls.append((event_name, kwargs))
-
-        with patch.object(web_skd_agent_loop_module, "_trace_async_skd", side_effect=_capture_trace):
-            prompt_text = await loop._build_student_generate_prompt_text(agent_data, [1, 2, 3, 4])
-
-        self.assertEqual(
-            prompt_text,
-            "<|im_start|>user\n<image>\nclick<|im_end|>\n<|im_start|>assistant\n",
-        )
-        self.assertEqual(
-            loop.tokenizer.decode_calls,
-            [
-                {
-                    "ids": [1, 2, 3, 4],
-                    "skip_special_tokens": False,
-                    "clean_up_tokenization_spaces": False,
-                }
-            ],
-        )
-        self.assertEqual(loop.tokenizer.encode_calls[0]["add_special_tokens"], False)
-        self.assertTrue(agent_data.extra_fields["student_generate_prompt_text_used"])
-        self.assertTrue(agent_data.extra_fields["student_generate_roundtrip_match"])
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_prompt_len"], 4)
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_len"], 4)
-        self.assertIsNone(agent_data.extra_fields["student_generate_roundtrip_first_mismatch"])
-        roundtrip_event = next(
-            kwargs for event_name, kwargs in trace_calls if event_name == "web_skd.student_prompt_text_view"
-        )
-        self.assertTrue(roundtrip_event["roundtrip_match"])
-        self.assertEqual(roundtrip_event["roundtrip_prompt_len"], 4)
-        self.assertEqual(roundtrip_event["roundtrip_len"], 4)
-
-    async def test_build_student_generate_prompt_text_logs_drift_without_fallback(self):
-        loop = _build_loop()
-        loop.loop = __import__("asyncio").get_running_loop()
-        loop.tokenizer = _FakeRoundTripTokenizer(encoded=[1, 99, 3])
-
-        agent_data = AgentData(
-            messages=[{"role": "user", "content": "task"}],
-            image_data=["image-1"],
-            video_data=[],
-            metrics={},
-            request_id="req-text-view-drift",
-            tools_kwargs={},
-        )
-        trace_calls = []
-
-        def _capture_trace(event_name, **kwargs):
-            trace_calls.append((event_name, kwargs))
-
-        with patch.object(web_skd_agent_loop_module, "_trace_async_skd", side_effect=_capture_trace):
-            prompt_text = await loop._build_student_generate_prompt_text(agent_data, [1, 2, 3, 4])
-
-        self.assertIsInstance(prompt_text, str)
-        self.assertTrue(agent_data.extra_fields["student_generate_prompt_text_used"])
-        self.assertFalse(agent_data.extra_fields["student_generate_roundtrip_match"])
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_prompt_len"], 4)
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_len"], 3)
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_first_mismatch"], 1)
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_prompt_window"], [1, 2, 3, 4])
-        self.assertEqual(agent_data.extra_fields["student_generate_roundtrip_roundtrip_window"], [1, 99, 3])
-        roundtrip_event = next(
-            kwargs for event_name, kwargs in trace_calls if event_name == "web_skd.student_prompt_text_view"
-        )
-        self.assertFalse(roundtrip_event["roundtrip_match"])
-        self.assertEqual(roundtrip_event["roundtrip_first_mismatch"], 1)
-        self.assertEqual(roundtrip_event["roundtrip_prompt_window"], [1, 2, 3, 4])
-        self.assertEqual(roundtrip_event["roundtrip_roundtrip_window"], [1, 99, 3])
-
-    async def test_build_student_generate_prompt_text_returns_none_without_images(self):
-        loop = _build_loop()
-        loop.loop = __import__("asyncio").get_running_loop()
-        loop.tokenizer = _FakeRoundTripTokenizer(encoded=[1, 2, 3])
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        loop.teacher_server_manager = None
 
         agent_data = AgentData(
             messages=[{"role": "user", "content": "task"}],
             image_data=[],
             video_data=[],
             metrics={},
-            request_id="req-text-view-no-image",
+            request_id="req-canonical-append",
             tools_kwargs={},
         )
-        trace_calls = []
+        agent_data._active_tools = {"computer": _ImageFakeTool()}
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "task-1",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+            }
+        )
 
-        def _capture_trace(event_name, **kwargs):
-            trace_calls.append((event_name, kwargs))
+        async def _fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, tools=None):
+            del videos, remove_system_prompt, tools
+            if messages and messages[0]["role"] == "tool" and images:
+                return [71, 72, 73, 74]
+            return [61, 62]
 
-        with patch.object(web_skd_agent_loop_module, "_trace_async_skd", side_effect=_capture_trace):
-            prompt_text = await loop._build_student_generate_prompt_text(agent_data, [1, 2, 3])
+        async def _fake_server_template(messages, tools=None, remove_system_prompt=False):
+            del tools, remove_system_prompt
+            if messages and messages[0]["role"] == "tool":
+                return [81, 82]
+            return [91]
 
-        self.assertIsNone(prompt_text)
-        self.assertEqual(loop.tokenizer.decode_calls, [])
-        self.assertNotIn("student_generate_prompt_text_used", agent_data.extra_fields)
-        self.assertEqual(trace_calls, [])
+        async def _never_overflow(*args, **kwargs):
+            del args, kwargs
+            return False
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_server_template
+        loop._terminate_if_teacher_prefix_overflows = _never_overflow
+
+        agent_data.tool_calls = [
+            type(
+                "ToolCall",
+                (),
+                {"name": "computer", "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}'},
+            )()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 71, 72, 73, 74])
+        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [1, 2, 3, 81, 82])
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 2)

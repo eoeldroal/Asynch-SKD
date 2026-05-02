@@ -15,6 +15,7 @@ import asyncio
 import logging
 import os
 import random
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -63,6 +64,16 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 ASYNC_SKD_MANAGER_CLASS = "verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager"
 ASYNC_SKD_MODES = {"sample_async", "lookahead"}
+_ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+
+
+def _trace_async_skd(stage: str, **fields: Any) -> None:
+    if _ASYNC_SKD_TRACE <= 0:
+        return
+    fields = {"pid": os.getpid(), "mono_ns": time.monotonic_ns(), **fields}
+    parts = [f"{key}={value!r}" for key, value in fields.items()]
+    suffix = f" {' '.join(parts)}" if parts else ""
+    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
 
 
 def _select_config(config, path: str, default=None):
@@ -225,7 +236,6 @@ class AsyncLLMServerManager:
         request_id,
         *,
         prompt_ids: list[int],
-        prompt_text: Optional[str] = None,
         sampling_params: dict[str, Any],
         image_data: Optional[list[Any]] = None,
         video_data: Optional[list[Any]] = None,
@@ -241,7 +251,23 @@ class AsyncLLMServerManager:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        _trace_async_skd(
+            "llm_manager.acquire_server_begin",
+            request_id=request_id,
+            prompt_len=len(prompt_ids),
+            request_input_kind="input_ids",
+            image_count=len(image_data) if image_data is not None else 0,
+            video_count=len(video_data) if video_data is not None else 0,
+        )
+        acquire_t0 = time.monotonic()
         server_id, server = await self._acquire_server(request_id)
+        acquire_ms = (time.monotonic() - acquire_t0) * 1000
+        _trace_async_skd(
+            "llm_manager.acquire_server_done",
+            request_id=request_id,
+            server_id=server_id,
+            elapsed_ms=round(acquire_ms, 1),
+        )
         request_instance_id = uuid4().hex
         emit_async_skd_event(
             "replica_request_start",
@@ -250,20 +276,30 @@ class AsyncLLMServerManager:
             request_kind="student_generate",
             request_instance_id=request_instance_id,
             prompt_len=len(prompt_ids),
-            request_input_kind="text" if prompt_text is not None else "input_ids",
-            prompt_text_len=len(prompt_text) if prompt_text is not None else 0,
+            request_input_kind="input_ids",
             image_count=len(image_data) if image_data is not None else 0,
         )
         try:
+            _trace_async_skd(
+                "llm_manager.remote_generate_submit",
+                request_id=request_id,
+                request_instance_id=request_instance_id,
+                server_id=server_id,
+                prompt_len=len(prompt_ids),
+                request_input_kind="input_ids",
+                image_count=len(image_data) if image_data is not None else 0,
+                video_count=len(video_data) if video_data is not None else 0,
+            )
+            remote_t0 = time.monotonic()
             output: TokenOutput | DiffusionOutput = await server.generate.remote(
                 request_id=request_instance_id,  # use new request_id for each turn
                 prompt_ids=prompt_ids,
-                prompt_text=prompt_text,
                 sampling_params=sampling_params,
                 image_data=image_data,
                 video_data=video_data,
                 **kwargs,
             )
+            remote_ms = (time.monotonic() - remote_t0) * 1000
             if isinstance(output, TokenOutput):
                 output.extra_fields["rollout_server_id"] = server_id
                 output_tokens = len(output.token_ids)
@@ -278,8 +314,24 @@ class AsyncLLMServerManager:
                 status="ok",
                 output_tokens=output_tokens,
             )
+            _trace_async_skd(
+                "llm_manager.remote_generate_done",
+                request_id=request_id,
+                request_instance_id=request_instance_id,
+                server_id=server_id,
+                elapsed_ms=round(remote_ms, 1),
+                output_tokens=output_tokens,
+            )
             return output
         except Exception as exc:
+            _trace_async_skd(
+                "llm_manager.remote_generate_error",
+                request_id=request_id,
+                request_instance_id=request_instance_id,
+                server_id=server_id,
+                error_type=type(exc).__name__,
+                error=repr(exc),
+            )
             emit_async_skd_event(
                 "replica_request_finish",
                 replica_id=server_id,
@@ -291,6 +343,12 @@ class AsyncLLMServerManager:
             )
             raise
         finally:
+            _trace_async_skd(
+                "llm_manager.release_server",
+                request_id=request_id,
+                request_instance_id=request_instance_id,
+                server_id=server_id,
+            )
             self._release_server(server_id)
 
 
@@ -782,6 +840,7 @@ class AgentLoopWorker:
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
+        prompt_length = int(kwargs.pop("_prompt_length_override", self.rollout_config.prompt_length))
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
@@ -809,7 +868,7 @@ class AgentLoopWorker:
         prompt_output = self.tokenizer.pad(
             {"input_ids": output.prompt_ids},
             padding="max_length",
-            max_length=self.rollout_config.prompt_length,
+            max_length=prompt_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
