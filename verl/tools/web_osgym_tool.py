@@ -20,7 +20,6 @@ _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEB
 def _trace_async_skd(stage: str, **fields: Any) -> None:
     if _ASYNC_SKD_TRACE <= 0:
         return
-    fields = {"pid": os.getpid(), "mono_ns": time.monotonic_ns(), **fields}
     parts = [f"{key}={value!r}" for key, value in fields.items()]
     suffix = f" {' '.join(parts)}" if parts else ""
     print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
@@ -102,26 +101,7 @@ class WebOsGymTool(BaseTool):
         del kwargs
         instance_id = instance_id or str(uuid4())
         include_a11y = self.include_a11y if include_a11y is None else include_a11y
-        _trace_async_skd(
-            "web_tool.create_begin",
-            instance_id=instance_id,
-            tool_request_id=request_id,
-            task_id=task_id,
-            include_a11y=include_a11y,
-        )
-        start_t0 = time.monotonic()
         response = await self.client.start(request_id=request_id, task_id=task_id, include_a11y=include_a11y)
-        start_ms = (time.monotonic() - start_t0) * 1000
-        _trace_async_skd(
-            "web_tool.create_start_done",
-            instance_id=instance_id,
-            tool_request_id=request_id,
-            task_id=task_id,
-            elapsed_ms=round(start_ms, 1),
-            response_text_len=len(response.text or ""),
-            has_image=response.image_b64 is not None,
-            image_b64_len=len(response.image_b64 or ""),
-        )
         self.restore_instance(
             instance_id,
             task_id=task_id,
@@ -129,30 +109,10 @@ class WebOsGymTool(BaseTool):
             include_a11y=include_a11y,
             reward=None,
         )
-        image_t0 = time.monotonic()
         image = [response.image] if response.image is not None else None
-        image_ms = (time.monotonic() - image_t0) * 1000
-        decoded_image = image[0] if image else None
-        width, height = _image_size(decoded_image)
-        _trace_async_skd(
-            "web_tool.create_image_decode_done",
-            instance_id=instance_id,
-            tool_request_id=request_id,
-            elapsed_ms=round(image_ms, 1),
-            has_image=decoded_image is not None,
-            image_width=width,
-            image_height=height,
-        )
         response_kwargs = {"text": response.text}
         if image is not None:
             response_kwargs["image"] = image
-        _trace_async_skd(
-            "web_tool.create_done",
-            instance_id=instance_id,
-            tool_request_id=request_id,
-            response_text_len=len(response.text or ""),
-            image_count=_safe_len(image),
-        )
         return instance_id, ToolResponse(**response_kwargs)
 
     @staticmethod
@@ -314,18 +274,7 @@ class WebOsGymTool(BaseTool):
         agent_request_id: str | None = None,
     ) -> tuple[ToolResponse, float | None, dict]:
         state = self._instance_dict[instance_id]
-        payload_t0 = time.monotonic()
         final_actions = [action.model_dump(exclude_none=True) for action in actions]
-        payload_ms = (time.monotonic() - payload_t0) * 1000
-        _trace_async_skd(
-            "web_tool.action_payload_ready",
-            agent_request_id=agent_request_id,
-            tool_request_id=state["request_id"],
-            task_id=state["task_id"],
-            elapsed_ms=round(payload_ms, 1),
-            action_count=len(actions),
-            final_actions=final_actions,
-        )
         logger.warning(
             "[WebOsGymTool][ServerPayload] op=action request_id=%r task_id=%r include_a11y=%r actions=%s",
             state["request_id"],
@@ -345,14 +294,6 @@ class WebOsGymTool(BaseTool):
         )
 
         try:
-            _trace_async_skd(
-                "web_tool.action_client_call_begin",
-                agent_request_id=agent_request_id,
-                tool_request_id=state["request_id"],
-                task_id=state["task_id"],
-                include_a11y=state["include_a11y"],
-                action_count=len(actions),
-            )
             http_t0 = time.monotonic()
             response = await self.client.action(
                 request_id=state["request_id"],
@@ -361,16 +302,6 @@ class WebOsGymTool(BaseTool):
                 actions=actions,
             )
             http_ms = (time.monotonic() - http_t0) * 1000
-            _trace_async_skd(
-                "web_tool.action_client_call_done",
-                agent_request_id=agent_request_id,
-                tool_request_id=state["request_id"],
-                elapsed_ms=round(http_ms, 1),
-                status=response.status,
-                response_text_len=len(response.text or ""),
-                has_image=response.image_b64 is not None,
-                image_b64_len=len(response.image_b64 or ""),
-            )
         except httpx.HTTPStatusError as exc:
             _trace_async_skd(
                 "web_tool.action_http_error",
@@ -457,40 +388,9 @@ class WebOsGymTool(BaseTool):
         state = self._instance_dict[instance_id]
         extra_fields = self._restore_cursor_from_agent_data(state, agent_data)
         agent_request_id = getattr(agent_data, "request_id", None)
-        _trace_async_skd(
-            "web_tool.execute_begin",
-            agent_request_id=agent_request_id,
-            instance_id=instance_id,
-            tool_name=self.name,
-            tool_request_id=state["request_id"],
-            parameters_type=type(parameters).__name__,
-            parameters_keys=sorted(parameters.keys()) if isinstance(parameters, Mapping) else None,
-            cursor_x=state.get("cursor_x"),
-            cursor_y=state.get("cursor_y"),
-        )
         try:
-            parse_t0 = time.monotonic()
             actions, cursor_x, cursor_y = self._parse_actions(parameters, state)
-            parse_ms = (time.monotonic() - parse_t0) * 1000
-            _trace_async_skd(
-                "web_tool.execute_parse_done",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                tool_name=self.name,
-                elapsed_ms=round(parse_ms, 1),
-                action_count=len(actions),
-                cursor_x=cursor_x,
-                cursor_y=cursor_y,
-            )
         except (TypeError, ValueError, ValidationError) as exc:
-            _trace_async_skd(
-                "web_tool.execute_parse_error",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                tool_name=self.name,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
             return ToolResponse(text=f"Invalid Web/OSGym action payload: {exc}"), None, {
                 "terminated": False,
                 "termination_reason": None,
@@ -498,42 +398,14 @@ class WebOsGymTool(BaseTool):
                 "invalid_action": True,
             }
 
-        send_t0 = time.monotonic()
-        try:
-            response, reward, result = await self._send_actions(
-                instance_id,
-                actions,
-                cursor_x=cursor_x,
-                cursor_y=cursor_y,
-                extra_fields=extra_fields,
-                agent_request_id=agent_request_id,
-            )
-            send_ms = (time.monotonic() - send_t0) * 1000
-            _trace_async_skd(
-                "web_tool.execute_done",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                tool_name=self.name,
-                elapsed_ms=round(send_ms, 1),
-                action_count=result.get("action_count"),
-                terminated=result.get("terminated"),
-                invalid_action=result.get("invalid_action", False),
-                response_text_len=len(response.text or ""),
-                image_count=_safe_len(response.image),
-            )
-            return response, reward, result
-        except Exception as exc:
-            send_ms = (time.monotonic() - send_t0) * 1000
-            _trace_async_skd(
-                "web_tool.execute_error",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                tool_name=self.name,
-                elapsed_ms=round(send_ms, 1),
-                error_type=type(exc).__name__,
-                error=repr(exc),
-            )
-            raise
+        return await self._send_actions(
+            instance_id,
+            actions,
+            cursor_x=cursor_x,
+            cursor_y=cursor_y,
+            extra_fields=extra_fields,
+            agent_request_id=agent_request_id,
+        )
 
     @rollout_trace_op
     async def execute_action_bundle(
@@ -543,36 +415,9 @@ class WebOsGymTool(BaseTool):
         state = self._instance_dict[instance_id]
         extra_fields = self._restore_cursor_from_agent_data(state, agent_data)
         agent_request_id = getattr(agent_data, "request_id", None)
-        _trace_async_skd(
-            "web_tool.execute_bundle_begin",
-            agent_request_id=agent_request_id,
-            instance_id=instance_id,
-            tool_request_id=state["request_id"],
-            raw_action_count=_safe_len(actions),
-            cursor_x=state.get("cursor_x"),
-            cursor_y=state.get("cursor_y"),
-        )
         try:
-            parse_t0 = time.monotonic()
             parsed_actions, cursor_x, cursor_y = self._parse_raw_actions(actions, state)
-            parse_ms = (time.monotonic() - parse_t0) * 1000
-            _trace_async_skd(
-                "web_tool.execute_bundle_parse_done",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                elapsed_ms=round(parse_ms, 1),
-                action_count=len(parsed_actions),
-                cursor_x=cursor_x,
-                cursor_y=cursor_y,
-            )
         except (TypeError, ValueError, ValidationError) as exc:
-            _trace_async_skd(
-                "web_tool.execute_bundle_parse_error",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
             return ToolResponse(text=f"Invalid Web/OSGym action payload: {exc}"), None, {
                 "terminated": False,
                 "termination_reason": None,
@@ -580,77 +425,22 @@ class WebOsGymTool(BaseTool):
                 "invalid_action": True,
             }
 
-        send_t0 = time.monotonic()
-        try:
-            response, reward, result = await self._send_actions(
-                instance_id,
-                parsed_actions,
-                cursor_x=cursor_x,
-                cursor_y=cursor_y,
-                extra_fields=extra_fields,
-                agent_request_id=agent_request_id,
-            )
-            send_ms = (time.monotonic() - send_t0) * 1000
-            _trace_async_skd(
-                "web_tool.execute_bundle_done",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                elapsed_ms=round(send_ms, 1),
-                action_count=result.get("action_count"),
-                terminated=result.get("terminated"),
-                invalid_action=result.get("invalid_action", False),
-                response_text_len=len(response.text or ""),
-                image_count=_safe_len(response.image),
-            )
-            return response, reward, result
-        except Exception as exc:
-            send_ms = (time.monotonic() - send_t0) * 1000
-            _trace_async_skd(
-                "web_tool.execute_bundle_error",
-                agent_request_id=agent_request_id,
-                instance_id=instance_id,
-                elapsed_ms=round(send_ms, 1),
-                error_type=type(exc).__name__,
-                error=repr(exc),
-            )
-            raise
+        return await self._send_actions(
+            instance_id,
+            parsed_actions,
+            cursor_x=cursor_x,
+            cursor_y=cursor_y,
+            extra_fields=extra_fields,
+            agent_request_id=agent_request_id,
+        )
 
     async def calc_reward(self, instance_id: str, **kwargs) -> float:
         del kwargs
         state = self._instance_dict[instance_id]
-        _trace_async_skd(
-            "web_tool.reward_begin",
-            instance_id=instance_id,
-            tool_request_id=state["request_id"],
-            task_id=state["task_id"],
-            cached=state["reward"] is not None,
-        )
         if state["reward"] is None:
-            reward_t0 = time.monotonic()
             state["reward"] = await self.client.reward(request_id=state["request_id"], task_id=state["task_id"])
-            reward_ms = (time.monotonic() - reward_t0) * 1000
-            _trace_async_skd(
-                "web_tool.reward_fetch_done",
-                instance_id=instance_id,
-                tool_request_id=state["request_id"],
-                elapsed_ms=round(reward_ms, 1),
-                reward=state["reward"],
-            )
-        _trace_async_skd(
-            "web_tool.reward_done",
-            instance_id=instance_id,
-            tool_request_id=state["request_id"],
-            reward=state["reward"],
-        )
         return float(state["reward"])
 
     async def release(self, instance_id: str, **kwargs) -> None:
         del kwargs
-        state = self._instance_dict.get(instance_id)
-        _trace_async_skd(
-            "web_tool.release",
-            instance_id=instance_id,
-            tool_request_id=state.get("request_id") if state else None,
-            task_id=state.get("task_id") if state else None,
-        )
         self._instance_dict.pop(instance_id, None)

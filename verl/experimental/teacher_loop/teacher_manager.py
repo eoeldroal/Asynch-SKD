@@ -35,7 +35,6 @@ _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEB
 def _trace_async_skd(stage: str, **fields: Any) -> None:
     if _ASYNC_SKD_TRACE <= 0:
         return
-    fields = {"pid": os.getpid(), "mono_ns": time.monotonic_ns(), **fields}
     parts = [f"{key}={value!r}" for key, value in fields.items()]
     suffix = f" {' '.join(parts)}" if parts else ""
     print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
@@ -159,23 +158,8 @@ class AsyncTeacherLLMServerManager:
 
     async def release_sticky_session(self, request_id: str, routing_key: Optional[str] = None) -> None:
         teacher_key = self._resolve_teacher_key(routing_key)
-        _trace_async_skd(
-            "teacher.release_sticky_session_begin",
-            teacher_key=teacher_key,
-            routing_key=routing_key,
-            request_id=request_id,
-        )
-        release_t0 = time.monotonic()
         await self.server_managers[teacher_key]._load_balancer.release_request_binding.remote(
             request_id=request_id,
-        )
-        release_ms = (time.monotonic() - release_t0) * 1000
-        _trace_async_skd(
-            "teacher.release_sticky_session_done",
-            teacher_key=teacher_key,
-            routing_key=routing_key,
-            request_id=request_id,
-            elapsed_ms=round(release_ms, 1),
         )
 
     async def compute_teacher_logprobs_single(
@@ -229,40 +213,14 @@ class AsyncTeacherLLMServerManager:
             video_count=_safe_len(multi_modal_data.get("videos")),
             prompt_logprobs=sampling_params.get("prompt_logprobs"),
         )
-        _trace_async_skd(
-            "teacher.generate_begin",
-            teacher_key=teacher_key,
-            routing_key=routing_key,
-            request_id=effective_request_id,
-            seq_len=len(sequence_ids),
-            logprob_start_len=logprob_start_len,
-            expected_len=expected_len,
-            expected_mm_prefix_surplus=expected_mm_prefix_surplus,
-            expected_logprob_rows=expected_logprob_rows,
-            image_count=_safe_len(multi_modal_data.get("images")),
-            video_count=_safe_len(multi_modal_data.get("videos")),
-        )
         generate_t0 = time.monotonic()
-        try:
-            teacher_output = await server_manager.generate(
-                request_id=effective_request_id,
-                prompt_ids=sequence_ids,
-                sampling_params=sampling_params,
-                image_data=multi_modal_data.get("images"),
-                video_data=multi_modal_data.get("videos"),
-            )
-        except Exception as exc:
-            generate_ms = (time.monotonic() - generate_t0) * 1000
-            _trace_async_skd(
-                "teacher.generate_error",
-                teacher_key=teacher_key,
-                routing_key=routing_key,
-                request_id=effective_request_id,
-                elapsed_ms=round(generate_ms, 1),
-                error_type=type(exc).__name__,
-                error=repr(exc),
-            )
-            raise
+        teacher_output = await server_manager.generate(
+            request_id=effective_request_id,
+            prompt_ids=sequence_ids,
+            sampling_params=sampling_params,
+            image_data=multi_modal_data.get("images"),
+            video_data=multi_modal_data.get("videos"),
+        )
         generate_ms = (time.monotonic() - generate_t0) * 1000
         prompt_ids_rows = teacher_output.extra_fields.get("prompt_ids", [])
         prompt_logprobs_rows = teacher_output.extra_fields.get("prompt_logprobs", [])
@@ -281,14 +239,6 @@ class AsyncTeacherLLMServerManager:
         )
         # Shapes: # S, (1 or K), where S is the response length, K is either 1 or topk depending on
         # the distillation loss settings.
-        _trace_async_skd(
-            "teacher.tensorize_begin",
-            teacher_key=teacher_key,
-            routing_key=routing_key,
-            request_id=effective_request_id,
-            prompt_ids_rows=_safe_len(teacher_output.extra_fields.get("prompt_ids")),
-            prompt_logprobs_rows=_safe_len(teacher_output.extra_fields.get("prompt_logprobs")),
-        )
         tensor_t0 = time.monotonic()
         teacher_ids = torch.tensor(teacher_output.extra_fields["prompt_ids"], dtype=torch.int32)
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])

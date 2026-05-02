@@ -608,12 +608,19 @@ generate TTFT는 17/34/51s 패턴이 사라짐
 
 ## 12. Artifacts
 
-실험 스크립트:
+당시 사용한 실험 스크립트:
 
 ```text
 WebOSWorld/sglang_replay_bench/verl_path_replay_bench.py
 WebOSWorld/sglang_replay_bench/webgym_fixed_server_loop_bench.py
 ```
+
+주의:
+
+- 위 벤치 스크립트들은 RCA 당시의 일회성 재현 자산이었다.
+- stall의 최종 원인이 runtime/cuDNN 쪽으로 정리된 뒤에는 기본 코드 경로를
+  더럽히지 않기 위해 repo에서 제거했다.
+- 아래 로그 경로는 historical result reference로만 남긴다.
 
 주요 결과 로그:
 

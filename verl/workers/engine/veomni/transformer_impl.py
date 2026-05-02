@@ -13,10 +13,7 @@
 # limitations under the License.
 
 
-import inspect
-import os
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
@@ -36,13 +33,6 @@ from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.device import get_device_id, get_device_name
-from verl.utils.exact_snapshot import (
-    exact_snapshot_pending,
-    get_exact_snapshot_dir,
-    mark_exact_snapshot_done,
-    should_abort_after_exact_snapshot,
-    write_exact_snapshot,
-)
 from verl.utils.fsdp_utils import fsdp_version
 from verl.utils.model import convert_weight_keys
 from verl.utils.profiler import log_gpu_memory_usage
@@ -65,32 +55,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__file__)
-_ENGINE_TRAIN_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
-
-
-def _trace_engine(stage: str, **kwargs):
-    if _ENGINE_TRAIN_TRACE <= 0:
-        return
-    suffix = "".join(f" {key}={value!r}" for key, value in kwargs.items())
-    print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
-
-
-def _shape_dim0(tensor: Any) -> int | None:
-    if tensor is None:
-        return None
-    shape = getattr(tensor, "shape", None)
-    if shape is None or len(shape) == 0:
-        return None
-    return int(shape[0])
-
-
-def _shape_repr(tensor: Any) -> str | None:
-    if tensor is None:
-        return None
-    shape = getattr(tensor, "shape", None)
-    if shape is None:
-        return None
-    return repr(shape)
 
 
 class VeOmniEngine(FSDPEngine):
@@ -231,17 +195,14 @@ class VeOmniEngine(FSDPEngine):
 
     def _build_model_optimizer(self):
         # Load base model with specified configuration and dtype
-        build_foundation_model_kwargs = dict(
+        module = build_foundation_model(
             config_path=self.model_config.local_hf_config_path,
             weights_path=self.model_config.local_path,
             torch_dtype="float32" if self.engine_config.mixed_precision else "bfloat16",
             attn_implementation=self.engine_config.attn_implementation,
+            moe_implementation=self.engine_config.moe_implementation,
             init_device=self.engine_config.init_device,
         )
-        if "moe_implementation" in inspect.signature(build_foundation_model).parameters:
-            build_foundation_model_kwargs["moe_implementation"] = self.engine_config.moe_implementation
-
-        module = build_foundation_model(**build_foundation_model_kwargs)
         log_gpu_memory_usage("After load base model", logger=logger)
 
         # Applies parallel strategies to the model.
@@ -284,7 +245,6 @@ class VeOmniEngine(FSDPEngine):
         """
         Perform an optimization step using the optimizer.
         """
-        start_time = time.perf_counter()
         if hasattr(self.module, "clip_grad_norm_"):
             grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
         else:
@@ -299,14 +259,7 @@ class VeOmniEngine(FSDPEngine):
             self.optimizer.zero_grad()
         else:
             self.optimizer.step()
-        grad_norm_value = grad_norm.item()
-        _trace_engine(
-            "veomni.optimizer_step_done",
-            rank=self.rank,
-            elapsed_ms=round((time.perf_counter() - start_time) * 1000, 1),
-            grad_norm=round(grad_norm_value, 4),
-        )
-        return grad_norm_value
+        return grad_norm.item()
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
         """
@@ -333,45 +286,15 @@ class VeOmniEngine(FSDPEngine):
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
-        _trace_engine(
-            "veomni.train_microbatch_plan",
-            rank=self.rank,
-            num_micro_batches=len(micro_batches),
-            batch_size=len(data),
-            batch_num_tokens=batch_num_tokens.item(),
-            use_dynamic_bsz=tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True),
-            max_token_len_per_gpu=tu.get(data, "max_token_len_per_gpu", default=None),
-            micro_batch_size_per_gpu=tu.get(data, "micro_batch_size_per_gpu", default=None),
-            pixel_values_rows=_shape_dim0(data.get("pixel_values")),
-            image_grid_rows=_shape_dim0(data.get("image_grid_thw")),
-        )
 
         output_lst = []
 
-        for micro_batch_idx, micro_batch in enumerate(micro_batches):
-            forward_start = time.perf_counter()
+        for micro_batch in micro_batches:
             with self.model_fwd_context:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
-            forward_ms = (time.perf_counter() - forward_start) * 1000
-            backward_ms = 0.0
             if not forward_only:
-                backward_start = time.perf_counter()
                 with self.model_bwd_context:
                     loss.backward()
-                backward_ms = (time.perf_counter() - backward_start) * 1000
-
-            _trace_engine(
-                "veomni.train_microbatch_done",
-                rank=self.rank,
-                micro_batch_idx=micro_batch_idx,
-                num_micro_batches=len(micro_batches),
-                batch_size=len(micro_batch),
-                loss_tokens=int(micro_batch["loss_mask"].sum().item()),
-                forward_ms=round(forward_ms, 1),
-                backward_ms=round(backward_ms, 1),
-                pixel_values_rows=_shape_dim0(micro_batch.get("pixel_values")),
-                image_grid_rows=_shape_dim0(micro_batch.get("image_grid_thw")),
-            )
 
             output_lst.append(meta_info)
 
@@ -712,155 +635,4 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
             if sp_enabled:
                 model_inputs["position_ids"] = sp_shard_collator.sp_slice(model_inputs["position_ids"], dim=-1)
 
-        _trace_engine(
-            "veomni.forward_step_prepare_inputs_done",
-            rank=self.rank,
-            use_remove_padding=use_remove_padding,
-            sp_enabled=sp_enabled,
-            model_input_keys=sorted(model_inputs.keys()),
-            input_ids_shape=_shape_repr(model_inputs.get("input_ids")),
-            position_ids_shape=_shape_repr(model_inputs.get("position_ids")),
-            pixel_values_shape=_shape_repr(model_inputs.get("pixel_values")),
-            image_grid_shape=_shape_repr(model_inputs.get("image_grid_thw")),
-            image_mask_rows=_shape_dim0(model_inputs.get("image_mask")),
-            video_mask_rows=_shape_dim0(model_inputs.get("video_mask")),
-        )
-
         return model_inputs, output_args
-
-    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
-        device_name = get_device_name()
-
-        to_device_start = time.perf_counter()
-        micro_batch = micro_batch.to(get_device_id())
-        _trace_engine(
-            "veomni.forward_step_batch_to_device_done",
-            rank=self.rank,
-            elapsed_ms=round((time.perf_counter() - to_device_start) * 1000, 1),
-            input_ids_shape=_shape_repr(micro_batch.get("input_ids")),
-            position_ids_shape=_shape_repr(micro_batch.get("position_ids")),
-            pixel_values_shape=_shape_repr(micro_batch.get("pixel_values")),
-            image_grid_shape=_shape_repr(micro_batch.get("image_grid_thw")),
-        )
-
-        model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
-
-        if exact_snapshot_pending():
-            snapshot_dir = get_exact_snapshot_dir()
-            assert snapshot_dir is not None
-            snapshot_paths = write_exact_snapshot(
-                snapshot_dir=snapshot_dir,
-                rank=self.rank,
-                model_inputs=model_inputs,
-                output_args=output_args,
-                micro_batch=micro_batch,
-                meta={
-                    "rank": self.rank,
-                    "world_size": dist.get_world_size(),
-                    "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
-                    "module_type": type(self.module).__name__,
-                    "model_path": self.model_config.path,
-                    "local_model_path": self.model_config.local_path,
-                    "attn_implementation": self.engine_config.attn_implementation,
-                    "moe_implementation": self.engine_config.moe_implementation,
-                    "use_remove_padding": tu.get_non_tensor_data(
-                        data=micro_batch, key="use_remove_padding", default=True
-                    ),
-                    "use_torch_compile": self.engine_config.use_torch_compile,
-                    "sp_enabled": parallel_state.get_parallel_state().sp_enabled,
-                    "ulysses_parallel_size": self.engine_config.ulysses_parallel_size,
-                    "expert_parallel_size": self.engine_config.expert_parallel_size,
-                    "param_offload": self.engine_config.param_offload,
-                    "optimizer_offload": self.engine_config.optimizer_offload,
-                    "enable_full_shard": self.engine_config.enable_full_shard,
-                    "enable_gradient_checkpointing": self.model_config.enable_gradient_checkpointing,
-                    "mixed_precision": self.engine_config.mixed_precision,
-                    "init_device": self.engine_config.init_device,
-                    "activation_gpu_limit": self.engine_config.activation_gpu_limit,
-                    "enable_reentrant": self.engine_config.enable_reentrant,
-                    "forward_prefetch": self.engine_config.forward_prefetch,
-                    "basic_modules": self.engine_config.basic_modules,
-                    "model_training": bool(self.module.training),
-                    "model_input_keys": sorted(model_inputs.keys()),
-                    "output_arg_keys": sorted(output_args.keys()),
-                    "micro_batch_keys": sorted(micro_batch.keys()),
-                    "input_ids_shape": _shape_repr(model_inputs.get("input_ids")),
-                    "position_ids_shape": _shape_repr(model_inputs.get("position_ids")),
-                    "pixel_values_shape": _shape_repr(model_inputs.get("pixel_values")),
-                    "image_grid_shape": _shape_repr(model_inputs.get("image_grid_thw")),
-                    "image_mask_rows": _shape_dim0(model_inputs.get("image_mask")),
-                    "video_mask_rows": _shape_dim0(model_inputs.get("video_mask")),
-                },
-            )
-            mark_exact_snapshot_done()
-            _trace_engine(
-                "veomni.exact_snapshot_written",
-                rank=self.rank,
-                snapshot_dir=str(snapshot_dir),
-                model_inputs_path=str(snapshot_paths["model_inputs"]),
-                output_args_path=str(snapshot_paths["output_args"]),
-                micro_batch_path=str(snapshot_paths["micro_batch"]),
-                meta_path=str(snapshot_paths["meta"]),
-            )
-            if dist.is_initialized():
-                dist.barrier()
-            if should_abort_after_exact_snapshot():
-                raise RuntimeError(
-                    f"VeOmni exact snapshot captured at {snapshot_dir} on rank {self.rank}; aborting by request."
-                )
-
-        with torch.autocast(device_type=device_name, dtype=torch.bfloat16):
-            module_forward_start = time.perf_counter()
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
-            _trace_engine(
-                "veomni.forward_step_module_forward_done",
-                rank=self.rank,
-                elapsed_ms=round((time.perf_counter() - module_forward_start) * 1000, 1),
-                raw_output_type=type(raw_output).__name__,
-            )
-
-            prepare_outputs_start = time.perf_counter()
-            model_output = self.prepare_model_outputs(
-                output=raw_output,
-                output_args=output_args,
-                micro_batch=micro_batch,
-                logits_processor_func=loss_function,
-            )
-            _trace_engine(
-                "veomni.forward_step_prepare_outputs_done",
-                rank=self.rank,
-                elapsed_ms=round((time.perf_counter() - prepare_outputs_start) * 1000, 1),
-                model_output_keys=sorted(model_output.keys()),
-            )
-
-            if loss_function is not None:
-                loss_compute_start = time.perf_counter()
-                loss, metrics = loss_function(
-                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
-                )
-                loss_compute_ms = (time.perf_counter() - loss_compute_start) * 1000
-            else:
-                assert forward_only, "forward_only must be True when loss_function is None"
-                loss = torch.tensor(1.0, device=device_name)
-                metrics = {}
-                loss_compute_ms = 0.0
-
-            _trace_engine(
-                "veomni.forward_step_loss_done",
-                rank=self.rank,
-                elapsed_ms=round(loss_compute_ms, 1),
-                forward_only=forward_only,
-                loss_value=round(loss.detach().item(), 6),
-                metric_keys=sorted(metrics.keys()),
-            )
-
-            output = {
-                "model_output": model_output,
-                "loss": loss.detach().item(),
-                "metrics": metrics,
-            }
-
-            return loss, output
