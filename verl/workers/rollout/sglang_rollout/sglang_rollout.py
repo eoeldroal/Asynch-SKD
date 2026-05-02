@@ -19,6 +19,7 @@ import logging
 import multiprocessing as mp
 import os
 from dataclasses import asdict
+from importlib.metadata import PackageNotFoundError, version
 from typing import Generator
 
 import ray
@@ -77,11 +78,20 @@ def _set_envs_and_config(server_args: ServerArgs):
             "Please uninstall the old version and reinstall the latest version by following the instructions at https://docs.flashinfer.ai/installation.html.",
         )
     if is_cuda():
-        assert_pkg_version(
-            "sgl-kernel",
-            "0.1.1",
-            "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
-        )
+        try:
+            version("sglang-kernel")
+        except PackageNotFoundError:
+            assert_pkg_version(
+                "sgl-kernel",
+                "0.1.1",
+                "Please reinstall the latest version with `pip install sgl-kernel --force-reinstall`",
+            )
+        else:
+            assert_pkg_version(
+                "sglang-kernel",
+                "0.4.1",
+                "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
+            )
 
     # Set mp start method
     mp.set_start_method("spawn", force=True)
