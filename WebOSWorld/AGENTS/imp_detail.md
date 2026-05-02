@@ -309,27 +309,7 @@ mock server는 real WebGym 전에 wire contract와 trainer integration을 검증
 - action list가 protocol대로 들어오는지
 - terminal 후 reward가 회수되는지
 
-## 15. Mock dataset
-
-생성기:
-
-```bash
-python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
-  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
-  --num-samples 256
-```
-
-row 계약:
-
-- `agent_name=web_skd_agent`
-- `ability=web_osgym`
-- `data_source=mock_web_osgym`
-- `extra_info.task_id`
-- `extra_info.tools_kwargs.computer.create_kwargs.task_id`
-
-`session_id`는 dataset에 넣지 않는다.
-
-## 16. Completion milestone 해석
+## 15. Completion milestone 해석
 
 Web mock milestone에서 확인된 것은 모델이 좋은 웹 정책을 배웠다는 뜻이 아니다. 확인된 것은 다음 end-to-end plumbing이다.
 

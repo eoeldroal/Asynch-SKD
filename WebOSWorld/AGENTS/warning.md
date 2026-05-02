@@ -136,7 +136,7 @@ mm_attention_backend=triton_attn
 확인 후보:
 
 ```bash
-ps -ef | rg 'verl.trainer.main_ppo|ray|sglang|web_osgym_mock_server|uvicorn'
+ps -ef | rg 'verl.trainer.main_ppo|ray|sglang|uvicorn'
 ```
 
 ## 17. Debug level은 비용이 있다

@@ -234,6 +234,5 @@ Rollout:
 
 Web server:
 
-- `logs/mock_web_osgym_requests.jsonl`
 - same `session_id` across `start -> action* -> reward`
 - expected `task_id`

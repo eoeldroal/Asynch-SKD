@@ -43,72 +43,21 @@ bash WebOSWorld/run_qwen35_math_async_skd_tool_fsdp.sh
 - 기본 train batch 64, response length 8192
 - validation은 `tool_agent`로 전환되어 teacher guidance 없이 student policy를 평가한다.
 
-### WebSKD mock RL
+### WebSKD RL
 
-먼저 mock Web/OSGym 서버를 띄운다.
-
-```bash
-cd /home/sogang_nlpy/verl
-conda activate skd
-
-nohup python WebOSWorld/mock_server/web_osgym_mock_server.py \
-  --host 127.0.0.1 \
-  --port 18000 \
-  --log-path logs/mock_web_osgym_requests.jsonl \
-  > logs/mock_web_osgym_server.log 2>&1 &
-```
-
-데이터셋이 없으면 생성한다.
+현재 owned Web/OSGym 학습 경로는 실서버 기준 WebSKD launcher만 유지한다.
 
 ```bash
-python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
-  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym \
-  --num-samples 64
-```
-
-훈련 경로는 다음 스크립트를 사용한다.
-
-```bash
-bash WebOSWorld/run_qwen35_web_mock_async_skd_tool_fsdp.sh
+bash WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni.sh
 ```
 
 특징:
 
 - `default_agent_loop=web_skd_agent`
 - tool config: `WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
-- mock server 기본 endpoint: `http://127.0.0.1:18000`
-- 기본 train batch 16, response length 1024
-- teacher max model len은 기본 8073으로 student보다 여유를 둔다.
-- prefetch 기본값은 batch/worker 비율에서 계산된다.
-
-### Fully async Web/OSGym mock RL
-
-이 경로는 교사 모델과 distillation loss가 없다. 먼저 mock server를 띄우는 절차는 WebSKD와 같다.
-
-데이터셋은 `web_tool_agent`용으로 생성한다.
-
-```bash
-python WebOSWorld/mock_server/create_mock_web_osgym_dataset.py \
-  --local-save-dir /home/sogang_nlpy/verl/data/mock_web_osgym_fully_async_rl \
-  --num-samples 256 \
-  --agent-name web_tool_agent
-```
-
-훈련 경로:
-
-```bash
-bash WebOSWorld/run_qwen35_web_mock_fully_async_rl_tool_fsdp.sh
-```
-
-특징:
-
-- `default_agent_loop=web_tool_agent`
-- fully async policy trainer: `python -m verl.experimental.fully_async_policy.fully_async_main`
-- `actor_rollout_ref.rollout.n=8`
-- `actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=16`
-- `data.max_response_length=8192`
-- SGLang backend 명시는 AsyncSKD와 같은 `attention_backend=triton`, `mm_attention_backend=triton_attn`
-- checkpoint weight transfer bucket은 `update_weights_bucket_megabytes=4096`
+- screenshot image + teacher-only a11y/text observation split
+- bounded windowed actor update
+- Qwen3.5 / VeOmni runtime baseline
 
 ## 핵심 코드 위치
 
@@ -163,8 +112,6 @@ bash WebOSWorld/run_qwen35_web_mock_fully_async_rl_tool_fsdp.sh
   - model-facing `computer` tool
   - `actions: [...]` parsing
   - `DONE` / `FAIL` terminal handling
-- `WebOSWorld/mock_server`
-  - session-aware mock Web/OSGym server, client, dataset generator, reward function
 
 ## Web/OSGym의 현재 입력 계약
 
