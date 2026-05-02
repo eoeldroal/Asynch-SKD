@@ -92,6 +92,8 @@ Image-less failure observation:
 
 이 예외는 action failure를 복구 가능한 환경 feedback으로 취급하기 위한 것이다.
 
+정리하면 observation의 정체성은 `image 유무`가 아니라 **commit된 environment feedback bundle**이다. image는 observation의 한 속성일 뿐이며, parser/training logic은 이를 step boundary의 유일한 source-of-truth로 삼으면 안 된다.
+
 ## 5. A11y/Text Policy
 
 a11y tree는 server가 `text` 필드에 제공하는 observation text다. WebSKD loop는 정상 image-bearing observation에서 이 text를 teacher-only channel에 둔다.
@@ -117,6 +119,8 @@ Protocol wire format은 base64 PNG다.
 ```
 
 `web_osgym_protocol.py`는 이를 PIL image로 decode한다. 내부 multimodal data path는 기존 verl multimodal interface와 맞추기 위해 image object list를 사용한다.
+
+다만 image metadata는 step마다 sparse/optional하다. text-only failure observation처럼 visual step이 아닌 경우에는 `image`/`images` placeholder를 만들지 않고 image data를 생략해야 한다.
 
 현재 manager는 image를 다시 SGLang request payload에 실어 보낸다. 따라서 server에서 screenshot이 와도 SGLang student/teacher request에 image가 빠지는 문제는 이 계층에서 막아야 한다.
 
@@ -172,6 +176,8 @@ WAIT, DONE, FAIL
 
 `DONE`과 `FAIL`은 표면상 action이지만 loop 의미상 terminal request다. 단독 action으로 보내는 것이 원칙이다.
 
+또한 `DONE` / `FAIL`은 **새로운 learnable mini-step observation을 하나 더 추가하는 신호가 아니다.** terminal action 이후 최종 reward는 별도 reward request로 회수하며, training-side mini-step reconstruction은 terminal action 자체를 마지막 assistant target으로 취급해야 한다.
+
 ## 11. Failure Semantics
 
 Transport-level failure와 action failure는 다르다.
@@ -182,6 +188,11 @@ Transport-level failure와 action failure는 다르다.
 Action failure는 policy가 다음 행동을 고치는 데 필요한 observation일 수 있다. image가 없으면 text feedback을 student와 teacher 모두에게 제공한다.
 
 Malformed model action payload도 가능하면 action failure observation으로 바꿔 trajectory를 계속 진행한다.
+
+따라서 mini-step reconstruction은 다음 두 경우를 모두 동일한 observation step으로 다뤄야 한다.
+
+- visual observation: screenshot image가 붙은 step
+- text-only failure observation: image는 없고 text feedback만 있는 step
 
 ## 12. Reward Semantics
 

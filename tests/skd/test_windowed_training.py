@@ -75,6 +75,49 @@ def _overlength_prompt_output() -> AgentLoopOutput:
     return output
 
 
+def _sparse_image_output() -> AgentLoopOutput:
+    response_ids = [11, 12, 90, 91, 13, 92, 93, 16]
+    response_mask = [1, 1, 0, 0, 1, 0, 0, 1]
+    return AgentLoopOutput(
+        prompt_ids=[1, 2, 3],
+        response_ids=response_ids,
+        response_mask=response_mask,
+        multi_modal_data={"images": ["obs1", "obs3"]},
+        reward_score=1.0,
+        num_turns=6,
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "teacher_ids_list": _teacher_rows(len(response_ids)),
+            "teacher_logprobs_list": _teacher_logprobs(len(response_ids)),
+            "mini_step_image_spans": [
+                {"step_idx": 1, "image_start": 0, "image_end": 1, "terminal": False},
+                {"step_idx": 3, "image_start": 1, "image_end": 2, "terminal": False},
+            ],
+        },
+    )
+
+
+def _trailing_observation_output() -> AgentLoopOutput:
+    response_ids = [11, 12, 90, 91]
+    response_mask = [1, 1, 0, 0]
+    return AgentLoopOutput(
+        prompt_ids=[1, 2, 3],
+        response_ids=response_ids,
+        response_mask=response_mask,
+        multi_modal_data={"images": ["obs1"]},
+        reward_score=1.0,
+        num_turns=3,
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "teacher_ids_list": _teacher_rows(len(response_ids)),
+            "teacher_logprobs_list": _teacher_logprobs(len(response_ids)),
+            "mini_step_image_spans": [
+                {"step_idx": 1, "image_start": 0, "image_end": 1, "terminal": False},
+            ],
+        },
+    )
+
+
 def test_windowed_outputs_split_contiguous_response_runs():
     windows, metrics = build_windowed_agent_loop_outputs(
         _output(),
@@ -106,6 +149,82 @@ def test_windowed_outputs_bound_images_and_keep_current_observation():
     assert windows[1].response_ids == [90, 91, 13, 14, 15]
     assert windows[1].response_mask == [0, 0, 1, 1, 1]
     assert metrics["window/max_images"] == 1
+
+
+def test_windowed_outputs_allow_text_only_steps_without_emitting_empty_images():
+    windows, metrics = build_windowed_agent_loop_outputs(
+        _sparse_image_output(),
+        config=WindowedSkdConfig(enabled=True, history_n=0, max_images_per_sample=6),
+    )
+
+    assert len(windows) == 3
+    assert metrics["window/max_images"] == 1
+
+    assert windows[0].multi_modal_data["images"] == ["obs1"]
+    assert windows[1].response_ids == [90, 91, 13]
+    assert windows[1].response_mask == [0, 0, 1]
+    assert "images" not in windows[1].multi_modal_data
+    assert windows[2].response_ids == [92, 93, 16]
+    assert windows[2].response_mask == [0, 0, 1]
+    assert windows[2].multi_modal_data["images"] == ["obs3"]
+
+
+def test_windowed_outputs_drop_trailing_observation_only_suffix_from_training_rows():
+    windows, metrics = build_windowed_agent_loop_outputs(
+        _trailing_observation_output(),
+        config=WindowedSkdConfig(enabled=True, history_n=5, max_images_per_sample=6),
+    )
+
+    assert len(windows) == 1
+    assert metrics["window/num_samples"] == 1
+    assert windows[0].response_ids == [11, 12]
+    assert windows[0].response_mask == [1, 1]
+
+
+def test_worker_postprocess_handles_text_only_failure_window_with_correct_loss_mask():
+    worker = _PostprocessWorker()
+    raw_prompt = [{"role": "user", "content": "hi"}]
+    input_non_tensor_batch = {
+        "raw_prompt": np.array([raw_prompt], dtype=object),
+        "agent_name": np.array(["skd_agent"], dtype=object),
+        "index": np.array([7], dtype=object),
+    }
+
+    batch = asyncio.run(
+        worker._postprocess_completed_skd_output(
+            _sparse_image_output(),
+            validate=False,
+            input_non_tensor_batch=input_non_tensor_batch,
+        )
+    )
+
+    assert len(batch) == 3
+    assert batch.batch["response_mask"][0].sum().item() == 2
+    assert batch.batch["response_mask"][1].sum().item() == 1
+    assert batch.batch["response_mask"][2].sum().item() == 1
+    assert batch.batch["teacher_ids"].shape[:2] == batch.batch["input_ids"].shape[:2]
+
+
+def test_worker_postprocess_keeps_context_tokens_out_of_loss_for_windowed_target():
+    worker = _PostprocessWorker()
+    raw_prompt = [{"role": "user", "content": "hi"}]
+    input_non_tensor_batch = {
+        "raw_prompt": np.array([raw_prompt], dtype=object),
+        "agent_name": np.array(["skd_agent"], dtype=object),
+        "index": np.array([7], dtype=object),
+    }
+
+    batch = asyncio.run(
+        worker._postprocess_completed_skd_output(
+            _sparse_image_output(),
+            validate=False,
+            input_non_tensor_batch=input_non_tensor_batch,
+        )
+    )
+
+    second_mask = batch.batch["response_mask"][1].tolist()
+    assert second_mask[:4] == [0, 0, 0, 0]
+    assert second_mask[4] == 1
 
 
 def test_windowed_outputs_require_teacher_alignment():

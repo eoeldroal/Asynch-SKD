@@ -53,34 +53,12 @@ def _normalise_image_spans(value: Any) -> list[dict[str, int | bool]]:
     return spans
 
 
-def _image_range(
-    image_spans: list[dict[str, int | bool]],
-    *,
-    recent_start: int,
-    target_step: int,
-    image_count: int,
-) -> tuple[int, int]:
-    selected = [
-        span
-        for span in image_spans
-        if recent_start <= int(span["step_idx"]) <= target_step
-    ]
-    if selected:
-        start = min(int(span["image_start"]) for span in selected)
-        end = max(int(span["image_end"]) for span in selected)
-        return max(0, min(start, image_count)), max(0, min(end, image_count))
-
-    # WebOSGym normally has one screenshot observation per mini-step. This
-    # fallback keeps the transform usable for tests and older rollouts that do
-    # not carry explicit image spans yet.
-    return max(0, min(recent_start - 1, image_count)), max(0, min(target_step, image_count))
-
-
 def _slice_multi_modal_data(
     multi_modal_data: dict[str, Any] | None,
     *,
     image_start: int,
     image_end: int,
+    include_images: bool,
 ) -> dict[str, Any]:
     if not multi_modal_data:
         return {}
@@ -88,7 +66,10 @@ def _slice_multi_modal_data(
     sliced = dict(multi_modal_data)
     images = multi_modal_data.get("images")
     if images is not None:
-        sliced["images"] = list(images)[image_start:image_end]
+        if include_images:
+            sliced["images"] = list(images)[image_start:image_end]
+        else:
+            sliced.pop("images", None)
     return sliced
 
 
@@ -191,7 +172,18 @@ def build_windowed_agent_loop_outputs(
         )
 
     images = list((output.multi_modal_data or {}).get("images") or [])
-    image_spans = _normalise_image_spans(output.extra_fields.get("mini_step_image_spans"))
+    image_by_step: dict[int, int] = {}
+    for item in _normalise_image_spans(output.extra_fields.get("mini_step_image_spans")):
+        step_idx = int(item["step_idx"])
+        image_start = int(item["image_start"])
+        image_end = int(item["image_end"])
+        if image_end != image_start + 1:
+            raise ValueError(
+                "Windowed WebSKD parser expects visual step metadata to point to exactly one image, "
+                f"got step_idx={step_idx}, image_start={image_start}, image_end={image_end}"
+            )
+        image_by_step[step_idx] = image_start
+
     topk = len(teacher_ids[0]) if teacher_ids else 0
     zero_ids = [0] * topk
     zero_logprobs = [0.0] * topk
@@ -207,21 +199,30 @@ def build_windowed_agent_loop_outputs(
         recent_start = max(1, target_step - max(0, int(config.history_n)))
 
         while True:
-            image_start, image_end = _image_range(
-                image_spans,
-                recent_start=recent_start,
-                target_step=target_step,
-                image_count=len(images),
-            )
+            selected_image_indices = [
+                image_by_step[step_idx]
+                for step_idx in range(recent_start, target_step + 1)
+                if step_idx in image_by_step
+            ]
             if config.max_images_per_sample is None:
                 break
-            if image_end - image_start <= int(config.max_images_per_sample):
+            if len(selected_image_indices) <= int(config.max_images_per_sample):
                 break
             if recent_start >= target_step:
                 break
             recent_start += 1
 
         response_start = 0 if recent_start <= 1 else assistant_spans[recent_start - 2][1]
+
+        if selected_image_indices:
+            image_start = min(selected_image_indices)
+            image_end = max(selected_image_indices) + 1
+            has_images = True
+        else:
+            image_start = len(images)
+            image_end = len(images)
+            has_images = False
+
         local_target_start = target_start - response_start
         local_target_end = target_end - response_start
         response_len = target_end - response_start
@@ -261,6 +262,7 @@ def build_windowed_agent_loop_outputs(
                 output.multi_modal_data,
                 image_start=image_start,
                 image_end=image_end,
+                include_images=has_images,
             ),
             reward_score=output.reward_score,
             num_turns=output.num_turns,

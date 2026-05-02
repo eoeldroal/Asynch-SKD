@@ -105,6 +105,8 @@ loss_i =
 
 `observation_i`는 assistant가 `action_i`를 내기 직전에 본 화면/텍스트 상태다. 따라서 policy 관점에서는 "현재 observation/history를 보고 다음 reasoning/action을 낸다"가 된다.
 
+중요한 점은 `observation_i`가 항상 screenshot일 필요는 없다는 것이다. 정상 경로에서는 image-bearing observation이 기본이지만, action failure / screenshot failure 같은 복구 경로에서는 text-only failure observation이 합법이다. 따라서 mini-step parser는 `image 유무`를 step 경계의 기준으로 삼지 말고, **student trajectory 안에서 commit된 observation bundle과 assistant target span의 순서**를 기준으로 step을 복원해야 한다.
+
 ## 4. Example
 
 Task:
@@ -272,7 +274,7 @@ loss = assistant_i only
 
 `sample_policy: all_mini_steps` means every original assistant action becomes exactly one windowed training sample. A trajectory with seven assistant actions produces seven training samples. `DONE` and `FAIL` are actions too, so terminal action steps remain trainable targets.
 
-`history_n` bounds the number of previous screenshot-bearing mini-steps. The recommended default is `history_n=5`, so a late training sample carries at most five previous screenshots plus the current screenshot. This should be exposed as a runtime argument rather than hard-coded, because ablations may need smaller or larger windows. The key invariant is that image count is bounded by `history_n + 1`, not by total trajectory length.
+`history_n` bounds the number of previous mini-steps retained in recent context. The recommended default is `history_n=5`, so a late training sample carries at most five previous mini-steps plus the current observation bundle. Some of those steps may be text-only failure observations with no image metadata. This should be exposed as a runtime argument rather than hard-coded, because ablations may need smaller or larger windows. The key invariant is that the window is chosen by student-topology step order, while visual inputs remain bounded by the subset of selected steps that actually carry screenshots.
 
 `step_weighting: uniform_by_mini_step` means longer trajectories naturally contribute more training examples because they contain more policy decisions. Task-level reweighting is a later experiment, not part of the first implementation.
 
@@ -518,6 +520,26 @@ old_action_summary = parse_actions_for_history(assistant_text)
 
 Teacher rows should follow the same response-relative span as the target tokens. In the current SKD path, real teacher top-k rows are appended for assistant tokens and dummy rows are appended for tool/observation tokens, so `teacher_row_start/end` is redundant with `target_start/end`.
 
+Mini-step parsing itself should be student-topology-driven:
+
+```text
+step 1 observation  = prompt-side initial observation
+step i>=2 observation = response-side committed zero-run bundle between assistant_{i-1} and assistant_i
+step target          = the original contiguous response_mask == 1 run for assistant_i
+```
+
+This means:
+
+- assistant target spans come from contiguous `response_mask == 1` runs
+- response-side committed observation bundles come from contiguous `response_mask == 0` runs between assistant spans
+- image metadata is an optional attribute of a step:
+  - visual step => one attached image
+  - text-only failure step => no attached image
+
+Do not require `assistant span count == image span count`. A valid trajectory may contain text-only failure observations, so image metadata is intentionally sparse.
+
+If a reconstructed training row contains no visual steps in its selected window, do not materialize `multi_modal_data["images"] = []`. Treat that row as text-only and omit the image field entirely so downstream multimodal processors do not interpret it as a malformed visual batch.
+
 The Qwen3.5 chat template opens generation with an assistant prefix such as:
 
 ```text
@@ -527,9 +549,9 @@ The Qwen3.5 chat template opens generation with an assistant prefix such as:
 
 That prefix belongs to the prompt side. The supervised target should follow the existing rollout/loss convention: whatever the model actually generated and `response_mask` marks as assistant output is the target. Do not infer a second target boundary from decoded text unless a validation dump proves the mask is wrong.
 
-The only metadata that should be kept explicitly in the first implementation is lightweight image/observation indexing, because image placeholder order and actual image object order are the most fragile part of reconstruction.
+The only metadata that should be kept explicitly in the first implementation is lightweight visual-step image indexing, because image placeholder order and actual image object order are the most fragile part of reconstruction.
 
-Minimum useful metadata per trajectory:
+Minimum useful sparse visual metadata per trajectory:
 
 ```python
 mini_step_image_spans = [
@@ -541,6 +563,8 @@ mini_step_image_spans = [
     },
 ]
 ```
+
+This table is **not** the full mini-step table. It records only steps that actually carried images. A text-only failure observation step may have no corresponding `mini_step_image_spans` entry and is still a valid mini-step.
 
 Optional debug metadata can include `target_start` and `target_end`, but those should be treated as cached derivations from `response_mask`, not as a separate source of truth.
 
@@ -562,10 +586,13 @@ The source of truth is:
 target tokens       = original responses[target_start:target_end]
 target loss mask    = 1 only on that target slice in the reconstructed sample
 teacher supervision = original teacher rows for that same target slice
-images              = explicit lightweight image spans
+observations        = prompt initial observation + response-side committed zero-run bundles
+images              = sparse explicit metadata for visual steps only
 ```
 
 EOS, stop, and tool-call closing tokens should be included if they are inside the original `response_mask == 1` run. This preserves the current training semantics exactly. If a future dump shows non-generated prompt/header tokens inside a target run, treat that as an alignment bug.
+
+If a completed trajectory ends with a committed observation bundle that has no following assistant-generated tokens yet, that trailing observation is not a trainable mini-step and should be excluded from window rows.
 
 ## 12. Alignment Invariants
 
@@ -601,6 +628,7 @@ target span follows the original response_mask == 1 run
 Image invariant:
 
 ```text
+for every selected visual step, image placeholder order matches the selected image object order
 num_image_placeholders == image_grid_thw.shape[0]
 sum(image_grid_thw[:, 0] * image_grid_thw[:, 1] * image_grid_thw[:, 2]) == pixel_values.shape[0]
 ```
@@ -843,6 +871,7 @@ The intended training recipe is:
 ```text
 Generate a full WebGym trajectory.
 Split it into mini-steps from original token ids and response_mask.
+Treat step boundaries as student-topology-driven observation bundles plus assistant target spans, not as image-count boundaries.
 For each mini-step, build one bounded-context training sample.
 Keep task identity in the permanent anchor.
 Keep old progress as action-only text summary, omitting invalid/no-tool old actions.
@@ -852,7 +881,7 @@ Keep only recent history_n steps as multimodal screenshot/action context.
 Reuse original token-id slices for recent context and target whenever possible.
 Use the current mini-step assistant reasoning/action as the only loss target, following the original response_mask == 1 span.
 Reuse the original full-context teacher top-k rows for those target tokens.
-Drop old images outside the window.
+Drop old images outside the window while allowing text-only failure observation steps to remain in-context without images.
 Validate token, teacher, image, and loss-mask alignment strictly.
 Log compact window metrics, with debug text dumps sharply limited.
 ```
