@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from tensordict import TensorDict
 
@@ -272,6 +273,78 @@ def test_async_skd_training_batch_expands_input_to_windowed_output_rows():
     assert len(merged_output) == 2
     assert merged_input.non_tensor_batch["uid"].tolist() == ["base-0", "base-0"]
     assert merged_output.non_tensor_batch["uid"].tolist() == ["base-0", "base-0"]
+
+
+def test_async_skd_base_output_expands_input_rows_by_uid_when_windowed():
+    base_input = _single_sample_batch("base-0", 10, with_teacher=False)
+    base_output = _windowed_output_batch("base-0", [101, 102, 103])
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input,
+        base_output,
+        async_skd_data_source=AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory()),
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=0,
+        pad_token_id=0,
+    )
+
+    assert len(merged_input) == 3
+    assert len(merged_output) == 3
+    assert merged_input.non_tensor_batch["uid"].tolist() == ["base-0", "base-0", "base-0"]
+    assert merged_output.non_tensor_batch["uid"].tolist() == ["base-0", "base-0", "base-0"]
+
+
+def test_async_skd_base_output_rejects_missing_window_identity_with_precise_error():
+    base_input = _single_sample_batch("base-0", 10, with_teacher=False)
+    base_output = _windowed_output_batch("base-0", [101, 102])
+    base_output.non_tensor_batch["uid"] = np.array([None, "base-0"], dtype=object)
+
+    with pytest.raises(ValueError, match="Cannot expand async-SKD input batch"):
+        _assemble_async_skd_training_batch(
+            base_input,
+            base_output,
+            async_skd_data_source=AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory()),
+            validate=False,
+            required_multiple=None,
+            max_promoted_count=0,
+            pad_token_id=0,
+        )
+
+
+def test_async_skd_training_batch_handles_mixed_base_completed_rows():
+    fresh_input = _single_sample_batch("fresh-0", 10, with_teacher=False)
+    carry_input = _single_sample_batch("carry-0", 20, with_teacher=False)
+    base_input = DataProto.concat([fresh_input, carry_input])
+
+    fresh_output = _windowed_output_batch("fresh-0", [101, 102])
+    carry_output = _windowed_output_batch("carry-0", [201, 202, 203])
+    base_output = DataProto.concat([fresh_output, carry_output])
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input,
+        base_output,
+        async_skd_data_source=AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory()),
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=0,
+        pad_token_id=0,
+    )
+
+    assert merged_input.non_tensor_batch["uid"].tolist() == [
+        "fresh-0",
+        "fresh-0",
+        "carry-0",
+        "carry-0",
+        "carry-0",
+    ]
+    assert merged_output.non_tensor_batch["uid"].tolist() == [
+        "fresh-0",
+        "fresh-0",
+        "carry-0",
+        "carry-0",
+        "carry-0",
+    ]
 
 
 def test_async_skd_training_batch_uses_windowed_prompts_before_union():

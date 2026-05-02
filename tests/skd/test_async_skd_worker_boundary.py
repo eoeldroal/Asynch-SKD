@@ -125,6 +125,7 @@ class _DummyWorker(AsyncSkdAgentLoopWorker):
             }
         )
         self.tokenizer = _FakeTokenizer()
+        self.tokenizer.pad_token_id = 0
         self.loop = SkdAgentLoop.__new__(SkdAgentLoop)
         self.loop.calls = []
         self.expected_agent_name = expected_agent_name
@@ -391,6 +392,29 @@ async def test_completed_resumed_partial_does_not_leak_internal_input_snapshot_k
 
     assert result.kind == "completed"
     assert "async_skd_input_non_tensor_batch" not in result.require_completed().non_tensor_batch
+
+
+@pytest.mark.asyncio
+async def test_resume_to_completion_requires_identity_key_for_windowed_training():
+    partial = make_partial()
+    partial.extra_fields["async_skd_input_non_tensor_batch"] = {
+        "raw_prompt": _object_array([[{"role": "user", "content": "hi"}]]),
+        "agent_name": np.array(["skd_agent"], dtype=object),
+    }
+    output = AgentLoopOutput(
+        prompt_ids=[1, 2, 3],
+        response_ids=[10],
+        response_mask=[1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "teacher_ids_list": [[10, 0, 0, 0]],
+            "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
+        },
+    )
+    worker = _DummyWorker(output)
+
+    with pytest.raises(ValueError, match="uid.*index.*input_pos"):
+        await worker.generate_skd_from_partial_to_completion(partial)
 
 
 @pytest.mark.asyncio

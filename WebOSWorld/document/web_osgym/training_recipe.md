@@ -730,6 +730,8 @@ Do not create one `AsyncSkdSample` per window row, such as `A#1`, `A#2`, `A#3`. 
 
 The completed-batch envelope should therefore validate trajectory-level metadata across rows instead of requiring a single row. Values such as `uid`, `rollout_birth_version`, `rollout_min_version`, `rollout_max_version`, `skd_committed_gen_chunks`, `skd_committed_env_units`, and `skd_committed_prefix_tokens` must be identical across all rows from the same trajectory. Window-specific fields such as `response_ids`, `response_mask`, `teacher_ids`, `teacher_logprobs`, `multi_modal_inputs`, `window_step_idx`, and `window_image_start/end` may differ per row.
 
+Fresh completed trajectories and carryover-resumed completed trajectories must produce the same completed-batch envelope before actor update. The scheduler may distinguish them for rollout accounting, but trainer-facing window rows must not depend on whether the trajectory arrived fresh or through carryover.
+
 This keeps the two accounting systems separate:
 
 ```text
@@ -748,7 +750,9 @@ The required contract at this point is:
 
 ```text
 input batch rows == output batch rows
-each output window row can be matched to its original input row by uid or index
+uid, index, and input_pos are hard join keys for trainer assembly
+those join keys are input-owned and must survive fresh rollout, partial export, carryover resume, completed trajectory windowing, and trainer batch assembly without being replaced by rollout-local extra_fields values
+each output window row can be matched to its original input row by uid/index/input_pos
 general meta_info contains only batch-invariant values
 per-window/per-trajectory numbers live in metrics or row fields
 ```

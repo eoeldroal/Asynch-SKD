@@ -1202,8 +1202,16 @@ class AgentLoopWorker:
         non_tensor_batch = {
             "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
         }
+        hard_identity_keys = {"uid", "index", "input_pos"}
+        if input_non_tensor_batch:
+            for key in hard_identity_keys:
+                if key in input_non_tensor_batch:
+                    non_tensor_batch[key] = input_non_tensor_batch[key]
         if self.reward_loop_worker_handles is None and input_non_tensor_batch:
-            non_tensor_batch.update(input_non_tensor_batch)
+            for key, value in input_non_tensor_batch.items():
+                if key in hard_identity_keys:
+                    continue
+                non_tensor_batch[key] = value
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
@@ -1229,6 +1237,8 @@ class AgentLoopWorker:
         }
         all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
         for key in all_keys:
+            if key in hard_identity_keys:
+                continue
             temp_arr = np.empty(len(inputs), dtype=object)
             temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
             extra_fields[key] = temp_arr

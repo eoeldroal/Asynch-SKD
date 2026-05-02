@@ -13,6 +13,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopWorker,
     RolloutTraceConfig,
     get_trajectory_info,
+    rollout_trace_attr,
 )
 from verl.experimental.async_skd.events import async_skd_event_context
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
@@ -190,6 +191,30 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
         trajectory_info = await get_trajectory_info(batch.meta_info.get("global_steps", -1), index.tolist(), validate)
 
         kwargs = {k: v[0] for k, v in batch.non_tensor_batch.items()}
+        agent_name = kwargs["agent_name"]
+        from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+        try:
+            agent_loop = self._get_or_create_agent_loop(agent_name)
+        except AssertionError:
+            agent_loop = None
+
+        if isinstance(agent_loop, SkdAgentLoop):
+            with async_skd_event_context(**(async_skd_context or {})):
+                with rollout_trace_attr(
+                    step=trajectory_info[0]["step"],
+                    sample_index=trajectory_info[0]["sample_index"],
+                    rollout_n=trajectory_info[0]["rollout_n"],
+                    validate=trajectory_info[0]["validate"],
+                    name="agent_loop",
+                    trace=trace_this_sample,
+                ):
+                    output = await agent_loop.run(sampling_params, **kwargs)
+            return await self._postprocess_completed_skd_output(
+                output,
+                validate=validate,
+                input_non_tensor_batch=self._single_input_non_tensor_batch(batch),
+            )
+
         with async_skd_event_context(**(async_skd_context or {})):
             internal_output = await self._run_agent_loop(
                 sampling_params, trajectory_info[0], trace=trace_this_sample, **kwargs
@@ -230,6 +255,11 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             kwargs = {}
             validate = False
             input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
+            if not any(key in input_non_tensor_batch for key in ("uid", "index", "input_pos")):
+                raise ValueError(
+                    "Windowed async-SKD carryover partial resume requires at least one join key "
+                    "from {'uid', 'index', 'input_pos'}."
+                )
             agent_name = self._agent_name_from_input_non_tensor_batch(input_non_tensor_batch, default=agent_name)
         _trace_async_skd(
             "worker.generate_until_boundary.entry",
@@ -336,6 +366,11 @@ class AsyncSkdAgentLoopWorker(AgentLoopWorker):
             committed_prefix_tokens=partial_state.committed_prefix_tokens,
         )
         input_non_tensor_batch = self._input_non_tensor_from_partial(partial_state)
+        if not any(key in input_non_tensor_batch for key in ("uid", "index", "input_pos")):
+            raise ValueError(
+                "Windowed async-SKD carryover partial resume requires at least one join key "
+                "from {'uid', 'index', 'input_pos'}."
+            )
         agent_name = self._agent_name_from_input_non_tensor_batch(input_non_tensor_batch, default=agent_name)
         sampling_params = self._build_sampling_params(validate=False)
         agent_loop = self._get_or_create_agent_loop(agent_name)

@@ -7,9 +7,11 @@ import pytest
 from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.async_skd.worker import AsyncSkdAgentLoopWorker
 from verl.experimental.async_skd.windowed_training import WindowedSkdConfig, build_windowed_agent_loop_outputs
-from tests.experimental.agent_loop.test_agent_loop_extra_fields_schema_on_cpu import _FakeTokenizer
+from verl.protocol import DataProto
+from tests.experimental.agent_loop.test_agent_loop_extra_fields_schema_on_cpu import _FakeTokenizer, _to_internal
 
 
 class _PostprocessWorker(AsyncSkdAgentLoopWorker):
@@ -37,6 +39,65 @@ class _PostprocessWorker(AsyncSkdAgentLoopWorker):
         )
         self.tokenizer = _FakeTokenizer()
         self.tokenizer.pad_token_id = 0
+
+
+class _FreshCompletedWorker(AsyncSkdAgentLoopWorker):
+    reward_loop_worker_handles = None
+    distillation_enabled = False
+    stream_teacher_with_rollout = False
+    processor = None
+
+    def __init__(self):
+        self.rollout_config = OmegaConf.create(
+            {
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 50,
+                "calculate_log_probs": False,
+                "prompt_length": 4,
+                "response_length": 8,
+                "val_kwargs": {"temperature": 0.0, "top_p": 1.0, "top_k": -1},
+                "agent": {"default_agent_loop": "skd_agent"},
+            }
+        )
+        self.distillation_config = OmegaConf.create(
+            {
+                "skd": {
+                    "windowed_training_enabled": True,
+                    "window_history_n": 5,
+                    "window_max_images_per_sample": 6,
+                }
+            }
+        )
+        self.tokenizer = _FakeTokenizer()
+        self.tokenizer.pad_token_id = 0
+        self.loop = SkdAgentLoop.__new__(SkdAgentLoop)
+        self.loop_runs = []
+        self.run_agent_loop_calls = 0
+
+        async def fake_run(sampling_params, **kwargs):
+            self.loop_runs.append({"sampling_params": sampling_params, "kwargs": kwargs, "via": "loop.run"})
+            return _output()
+
+        self.loop.run = fake_run
+
+    def _get_or_create_agent_loop(self, agent_name: str):
+        assert agent_name == "skd_agent"
+        return self.loop
+
+    async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name: str, trace: bool = True, **kwargs):
+        del trace
+        self.run_agent_loop_calls += 1
+        self.loop_runs.append(
+            {
+                "sampling_params": sampling_params,
+                "trajectory": trajectory,
+                "agent_name": agent_name,
+                "kwargs": kwargs,
+                "via": "_run_agent_loop",
+            }
+        )
+        return await self._agent_loop_postprocess(_output(), trajectory["validate"], **kwargs)
 
 
 def _teacher_rows(count: int, width: int = 2) -> list[list[int]]:
@@ -335,3 +396,65 @@ def test_worker_postprocess_overwrites_stale_identity_keys_from_output_extras():
 
     assert batch.non_tensor_batch["uid"].tolist() == ["sample-a", "sample-a"]
     assert batch.non_tensor_batch["index"].tolist() == [7, 7]
+
+
+def test_worker_generic_postprocess_reserves_join_keys_from_input_metadata():
+    worker = _PostprocessWorker()
+    internal_output = _to_internal(
+        output_prompt_ids=[1, 2, 3],
+        output_response_ids=[11, 12],
+        output_response_mask=[1, 1],
+        metrics=AgentLoopMetrics(),
+        extra_fields={
+            "uid": "stale-output-uid",
+            "index": 999,
+            "input_pos": 77,
+            "custom_extra": "kept",
+        },
+        num_turns=1,
+        prompt_len=4,
+        response_len=4,
+    )
+    raw_prompt = [{"role": "user", "content": "hi"}]
+    input_non_tensor_batch = {
+        "raw_prompt": np.array([raw_prompt], dtype=object),
+        "agent_name": np.array(["skd_agent"], dtype=object),
+        "uid": np.array(["sample-a"], dtype=object),
+        "index": np.array([7], dtype=object),
+        "input_pos": np.array([3], dtype=object),
+    }
+
+    batch = worker._postprocess(
+        [internal_output],
+        input_non_tensor_batch=input_non_tensor_batch,
+        validate=False,
+    )
+
+    assert batch.non_tensor_batch["uid"].tolist() == ["sample-a"]
+    assert batch.non_tensor_batch["index"].tolist() == [7]
+    assert batch.non_tensor_batch["input_pos"].tolist() == [3]
+    assert batch.non_tensor_batch["custom_extra"].tolist() == ["kept"]
+
+
+@pytest.mark.asyncio
+async def test_worker_fresh_completed_path_repeats_join_keys_for_windowed_outputs():
+    worker = _FreshCompletedWorker()
+    raw_prompt = [{"role": "user", "content": "hi"}]
+
+    batch = await worker.generate_sequence_single(
+        DataProto.from_dict(
+            non_tensors={
+                "raw_prompt": np.array([raw_prompt], dtype=object),
+                "agent_name": np.array(["skd_agent"], dtype=object),
+                "uid": np.array(["sample-a"], dtype=object),
+                "index": np.array([7], dtype=object),
+                "input_pos": np.array([3], dtype=object),
+            },
+            meta_info={"global_steps": 12, "validate": False},
+        )
+    )
+
+    assert len(batch) == 2
+    assert batch.non_tensor_batch["uid"].tolist() == ["sample-a", "sample-a"]
+    assert batch.non_tensor_batch["index"].tolist() == [7, 7]
+    assert batch.non_tensor_batch["input_pos"].tolist() == [3, 3]
