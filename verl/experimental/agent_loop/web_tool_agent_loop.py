@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
-from verl.experimental.agent_loop.web_osgym_prompt_window import build_web_osgym_prompt_window
+from verl.experimental.agent_loop.web_osgym_rl_prompt_window import build_web_osgym_prompt_window
 from verl.experimental.agent_loop.web_osgym_windowing import build_mini_step_image_spans
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.utils.profiler import simple_timer
