@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.web_osgym_windowing import build_mini_step_image_spans
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -76,6 +77,60 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 content.append({"type": "text", "text": tool_response_text})
             return {"role": "tool", "content": content}
         return {"role": "tool", "content": tool_response_text or ""}
+
+    def _record_web_osgym_step(
+        self,
+        agent_data: AgentData,
+        *,
+        phase: str,
+        image_start: int,
+        image_end: int,
+        text_len: int,
+        terminal: bool,
+        termination_reason: str | None,
+        actions: list[dict[str, Any]] | None,
+    ) -> None:
+        normalized_actions = [dict(action) for action in (actions or []) if isinstance(action, dict)]
+        steps = list(agent_data.extra_fields.get("web_osgym_steps") or [])
+        steps.append(
+            {
+                "step_idx": len(steps) + 1,
+                "assistant_turn": int(agent_data.assistant_turns),
+                "user_turn": int(agent_data.user_turns),
+                "phase": phase,
+                "text_len": int(text_len),
+                "action_names": [
+                    str(action_name)
+                    for action_name in (
+                        action.get("action_type") or action.get("name") for action in normalized_actions
+                    )
+                    if action_name is not None
+                ],
+                "actions": normalized_actions,
+                "image_start": int(image_start),
+                "image_end": int(image_end),
+                "terminal": bool(terminal),
+                "termination_reason": termination_reason,
+            }
+        )
+        agent_data.extra_fields["web_osgym_steps"] = steps
+        agent_data.extra_fields["mini_step_image_spans"] = build_mini_step_image_spans(steps)
+
+    def _record_web_osgym_unit_trace(self, agent_data: AgentData) -> None:
+        steps = list(agent_data.extra_fields.get("web_osgym_steps") or [])
+        image_spans = list(agent_data.extra_fields.get("mini_step_image_spans") or [])
+        unit_trace = {
+            "rollout_context": "full_accumulated_prompt",
+            "backprop_context": "full_agent_loop_output",
+            "harness_prompt_window": "metadata_available_not_active",
+            "step_count": len(steps),
+            "image_span_count": len(image_spans),
+        }
+        agent_data.extra_fields["web_osgym_unit_trace"] = unit_trace
+        agent_data.metrics["web_osgym/step_count"] = len(steps)
+        agent_data.metrics["web_osgym/image_span_count"] = len(image_spans)
+        if os.getenv("WEB_OSGYM_UNIT_TRACE"):
+            logger.warning("[WebOsGymTool][UnitTrace] %s", unit_trace)
 
     @staticmethod
     def _trace_tool_calls(tool_calls) -> list[dict[str, Any]]:
@@ -225,9 +280,22 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             videos=agent_data.video_data,
         )
 
+        image_start = len(agent_data.image_data) if agent_data.image_data else 0
         self._extend_image_data(agent_data, image_data)
+        image_end = len(agent_data.image_data) if agent_data.image_data else image_start
         agent_data.messages = messages
         agent_data.prompt_ids = prompt_ids
+        if student_obs or image_data:
+            self._record_web_osgym_step(
+                agent_data,
+                phase="initial",
+                image_start=image_start,
+                image_end=image_end,
+                text_len=len(student_obs or ""),
+                terminal=False,
+                termination_reason=None,
+                actions=[],
+            )
         return AgentState.GENERATING
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
@@ -274,7 +342,19 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             )
             return AgentState.TERMINATED
 
+        image_start = len(agent_data.image_data) if agent_data.image_data else 0
         self._extend_image_data(agent_data, image_data)
+        image_end = len(agent_data.image_data) if agent_data.image_data else image_start
+        self._record_web_osgym_step(
+            agent_data,
+            phase="tool_observation",
+            image_start=image_start,
+            image_end=image_end,
+            text_len=len(student_obs or ""),
+            terminal=False,
+            termination_reason=None,
+            actions=result.get("web_osgym_actions") or self._trace_actions_from_tool_calls(agent_data),
+        )
         agent_data.messages.append(message)
         agent_data.prompt_ids += response_ids
         agent_data.response_mask += [0] * len(response_ids)
@@ -300,6 +380,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         return next_state
 
     def _finalize_web_agent_output(self, agent_data: AgentData) -> AgentLoopOutput:
+        self._record_web_osgym_unit_trace(agent_data)
         if agent_data.response_mask:
             response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
             prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
