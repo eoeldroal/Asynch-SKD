@@ -375,7 +375,7 @@ Trainer entrypoint:
 
 Tool config:
 
-- `WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
+- `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
 
 ## 20. One-line Summary
 

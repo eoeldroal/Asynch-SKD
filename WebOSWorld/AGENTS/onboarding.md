@@ -54,7 +54,7 @@ bash WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni.sh
 특징:
 
 - `default_agent_loop=web_skd_agent`
-- tool config: `WebOSWorld/config/tool_config/web_osgym_tool_config_webgym_rl.yaml`
+- tool config: `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
 - screenshot image + teacher-only a11y/text observation split
 - bounded windowed actor update
 - Qwen3.5 / VeOmni runtime baseline
