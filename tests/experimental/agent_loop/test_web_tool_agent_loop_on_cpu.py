@@ -1,6 +1,6 @@
+import asyncio
 from types import SimpleNamespace
 
-import pytest
 from PIL import Image
 
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
@@ -64,6 +64,29 @@ class _FakeWebTool:
     async def release(self, instance_id):
         self.released.append(instance_id)
         self._instance_dict.pop(instance_id, None)
+
+
+class _FakeTerminalObservationTool(_FakeWebTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters, kwargs))
+        return ToolResponse(
+            text="terminal screenshot should not become a new observation",
+            image=[Image.new("RGB", (2, 2), "green")],
+        ), None, {
+            "terminated": True,
+            "termination_reason": "model_done",
+            "action_count": 1,
+        }
+
+
+class _FakeNonTerminalObservationTool(_FakeWebTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters, kwargs))
+        return ToolResponse(text="non-terminal observation"), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": 1,
+        }
 
 
 def _make_loop():
@@ -158,158 +181,204 @@ def test_generation_metadata_merge_keeps_zero_param_version_with_web_session_fie
     assert agent_data.extra_fields["max_global_steps"] == 3
 
 
-@pytest.mark.asyncio
-async def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
-    loop = _make_loop()
-    tool = _FakeWebTool()
-    agent_data = _agent_data(tool)
+def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakeWebTool()
+        agent_data = _agent_data(tool)
 
-    next_state = await loop._handle_pending_state(agent_data, sampling_params={})
+        next_state = await loop._handle_pending_state(agent_data, sampling_params={})
 
-    assert next_state == AgentState.GENERATING
-    assert tool.created[0]["task_id"] == "12345"
-    assert tool.created[0]["include_a11y"] is False
-    assert agent_data.extra_fields["web_osgym_instance_id"] == "instance-1"
-    assert agent_data.extra_fields["web_osgym_session_id"] == tool.created[0]["request_id"]
-    assert agent_data.image_data and len(agent_data.image_data) == 1
+        assert next_state == AgentState.GENERATING
+        assert tool.created[0]["task_id"] == "12345"
+        assert tool.created[0]["include_a11y"] is False
+        assert agent_data.extra_fields["web_osgym_instance_id"] == "instance-1"
+        assert agent_data.extra_fields["web_osgym_session_id"] == tool.created[0]["request_id"]
+        assert agent_data.image_data and len(agent_data.image_data) == 1
 
-    appended_message = agent_data.messages[-1]
-    assert appended_message["role"] == "tool"
-    assert appended_message["content"] == [{"type": "image"}]
+        appended_message = agent_data.messages[-1]
+        assert appended_message["role"] == "tool"
+        assert appended_message["content"] == [{"type": "image"}]
+
+    asyncio.run(_run())
 
 
-@pytest.mark.asyncio
-async def test_processing_reuses_session_and_sets_reward_score_on_terminal_action():
-    loop = _make_loop()
-    tool = _FakeWebTool()
-    agent_data = _agent_data(tool)
-    agent_data.extra_fields.update(
-        {
-            "web_osgym_instance_id": "instance-1",
-            "web_osgym_task_id": "12345",
-            "web_osgym_session_id": 777,
-            "web_osgym_include_a11y": False,
+def test_processing_reuses_session_and_sets_reward_score_on_terminal_action():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakeWebTool()
+        agent_data = _agent_data(tool)
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
         }
-    )
-    tool._instance_dict["instance-1"] = {
-        "task_id": "12345",
-        "request_id": 777,
-        "include_a11y": False,
-        "reward": None,
-    }
-    agent_data.tool_calls = [
-        FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
-    ]
-
-    next_state = await loop._handle_processing_tools_state(agent_data)
-
-    assert next_state == AgentState.TERMINATED
-    assert tool.executed[0][0] == "instance-1"
-    assert tool.executed[0][1]["actions"][0]["action_type"] == "DONE"
-    assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
-    assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
-    assert agent_data.response_mask and all(value == 0 for value in agent_data.response_mask)
-
-
-@pytest.mark.asyncio
-async def test_processing_accepts_action_named_tool_call():
-    loop = _make_loop()
-    tool = _FakeWebTool()
-    agent_data = _action_agent_data(tool, action_name="CLICK")
-    agent_data.extra_fields.update(
-        {
-            "web_osgym_instance_id": "instance-1",
-            "web_osgym_task_id": "12345",
-            "web_osgym_session_id": 777,
-            "web_osgym_include_a11y": False,
-        }
-    )
-    tool._instance_dict["instance-1"] = {
-        "task_id": "12345",
-        "request_id": 777,
-        "include_a11y": False,
-        "reward": None,
-    }
-    agent_data.tool_calls = [
-        FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
-    ]
-
-    next_state = await loop._handle_processing_tools_state(agent_data)
-
-    assert next_state == AgentState.TERMINATED
-    assert tool.executed[0][0] == "instance-1"
-    assert tool.executed[0][1] == {"x": 1, "y": 2}
-    assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
-
-
-@pytest.mark.asyncio
-async def test_processing_bundles_multiple_action_named_tool_calls():
-    loop = _make_loop()
-    tool = _FakeWebTool()
-    agent_data = _action_agent_data(tool, action_name="CLICK")
-    agent_data.extra_fields.update(
-        {
-            "web_osgym_instance_id": "instance-1",
-            "web_osgym_task_id": "12345",
-            "web_osgym_session_id": 777,
-            "web_osgym_include_a11y": False,
-        }
-    )
-    tool._instance_dict["instance-1"] = {
-        "task_id": "12345",
-        "request_id": 777,
-        "include_a11y": False,
-        "reward": None,
-    }
-    agent_data.tool_calls = [
-        FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
-        FunctionCall(name="CLICK", arguments='{"x":3,"y":4}'),
-    ]
-
-    next_state = await loop._handle_processing_tools_state(agent_data)
-
-    assert next_state == AgentState.TERMINATED
-    assert tool.executed[0][0] == "instance-1"
-    assert tool.executed[0][1] == {
-        "actions": [
-            {"action_type": "CLICK", "x": 1, "y": 2},
-            {"action_type": "CLICK", "x": 3, "y": 4},
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
         ]
-    }
-    assert agent_data.metrics["web_osgym/action_count"] == 2
-    assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert tool.executed[0][0] == "instance-1"
+        assert tool.executed[0][1]["actions"][0]["action_type"] == "DONE"
+        assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+        assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+        assert agent_data.response_mask == []
+
+    asyncio.run(_run())
 
 
-@pytest.mark.asyncio
-async def test_tool_response_budget_exhaustion_fetches_reward_without_committing_observation():
-    loop = _make_loop()
-    loop.response_length = 2
-    tool = _FakeWebTool()
-    agent_data = _agent_data(tool)
-    agent_data.response_mask = [1]
-    agent_data.prompt_ids = [100]
-    agent_data.extra_fields.update(
-        {
-            "web_osgym_instance_id": "instance-1",
-            "web_osgym_task_id": "12345",
-            "web_osgym_session_id": 777,
-            "web_osgym_include_a11y": False,
+def test_terminal_action_response_observation_is_not_committed():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakeTerminalObservationTool()
+        agent_data = _agent_data(tool)
+        agent_data.prompt_ids = [100, 101]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
         }
-    )
-    tool._instance_dict["instance-1"] = {
-        "task_id": "12345",
-        "request_id": 777,
-        "include_a11y": False,
-        "reward": None,
-    }
-    agent_data.tool_calls = [
-        FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
-    ]
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"DONE"}]}'),
+        ]
 
-    next_state = await loop._handle_processing_tools_state(agent_data)
+        next_state = await loop._handle_processing_tools_state(agent_data)
 
-    assert next_state == AgentState.TERMINATED
-    assert agent_data.prompt_ids == [100]
-    assert agent_data.response_mask == [1]
-    assert agent_data.extra_fields["web_osgym_termination_reason"] == "tool_response_budget_exhausted"
-    assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+        assert next_state == AgentState.TERMINATED
+        assert agent_data.prompt_ids == [100, 101]
+        assert agent_data.messages == [{"role": "user", "content": "task"}]
+        assert agent_data.image_data == []
+        assert agent_data.response_mask == []
+        assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+
+    asyncio.run(_run())
+
+
+def test_processing_accepts_action_named_tool_call():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakeWebTool()
+        agent_data = _action_agent_data(tool, action_name="CLICK")
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert tool.executed[0][0] == "instance-1"
+        assert tool.executed[0][1] == {"x": 1, "y": 2}
+        assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+
+    asyncio.run(_run())
+
+
+def test_processing_bundles_multiple_action_named_tool_calls():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakeWebTool()
+        agent_data = _action_agent_data(tool, action_name="CLICK")
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
+            FunctionCall(name="CLICK", arguments='{"x":3,"y":4}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert tool.executed[0][0] == "instance-1"
+        assert tool.executed[0][1] == {
+            "actions": [
+                {"action_type": "CLICK", "x": 1, "y": 2},
+                {"action_type": "CLICK", "x": 3, "y": 4},
+            ]
+        }
+        assert agent_data.metrics["web_osgym/action_count"] == 2
+        assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+
+    asyncio.run(_run())
+
+
+def test_tool_response_budget_exhaustion_fetches_reward_without_committing_observation():
+    async def _run():
+        loop = _make_loop()
+        loop.response_length = 2
+        tool = _FakeNonTerminalObservationTool()
+        agent_data = _agent_data(tool)
+        agent_data.response_mask = [1]
+        agent_data.prompt_ids = [100]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"WAIT"}]}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert agent_data.prompt_ids == [100]
+        assert agent_data.response_mask == [1]
+        assert agent_data.extra_fields["web_osgym_termination_reason"] == "tool_response_budget_exhausted"
+        assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+
+    asyncio.run(_run())

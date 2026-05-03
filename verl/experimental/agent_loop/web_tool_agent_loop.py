@@ -133,16 +133,17 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if result.get("invalid_action"):
             agent_data.metrics["web_osgym/invalid_action"] = 1
 
+        if result.get("terminated"):
+            await self._finalize_with_web_osgym_reward(
+                agent_data,
+                termination_reason=result.get("termination_reason") or "model_done",
+            )
+            return AgentState.TERMINATED
+
         image_data = self._normalize_image_data(tool_response.image)
         student_obs = self._split_env_observation(tool_response.text, image_data)
 
         if not student_obs and not image_data:
-            if result.get("terminated"):
-                await self._finalize_with_web_osgym_reward(
-                    agent_data,
-                    termination_reason=result.get("termination_reason") or "model_done",
-                )
-                return AgentState.TERMINATED
             return AgentState.GENERATING
 
         message = self._build_tool_message(student_obs, image_data)
@@ -170,13 +171,6 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if agent_data.response_logprobs:
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.user_turns += 1
-
-        if result.get("terminated"):
-            await self._finalize_with_web_osgym_reward(
-                agent_data,
-                termination_reason=result.get("termination_reason") or "model_done",
-            )
-            return AgentState.TERMINATED
 
         return AgentState.GENERATING
 

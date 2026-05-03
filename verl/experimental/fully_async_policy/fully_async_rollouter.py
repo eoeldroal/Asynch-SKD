@@ -39,6 +39,29 @@ from verl.utils.profiler import marked_timer
 from verl.utils.tracking import ValidationGenerationsLogger
 
 
+def resolve_max_concurrent_rollout_samples_per_gpu(config) -> int:
+    configured_trajectory_budget = config.actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu
+    if configured_trajectory_budget is None:
+        return 16
+
+    rollout_n = int(config.actor_rollout_ref.rollout.n)
+    trajectory_budget = int(configured_trajectory_budget)
+    if rollout_n <= 0:
+        raise ValueError(f"actor_rollout_ref.rollout.n must be positive; got {rollout_n}.")
+    if trajectory_budget <= 0:
+        raise ValueError(
+            "actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu must be positive; "
+            f"got {trajectory_budget}."
+        )
+    if trajectory_budget % rollout_n != 0:
+        raise ValueError(
+            "actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu is interpreted as maximum "
+            "concurrent trajectories per GPU in fully async mode and must be divisible by "
+            f"actor_rollout_ref.rollout.n={rollout_n}; got {trajectory_budget}."
+        )
+    return trajectory_budget // rollout_n
+
+
 @ray.remote(num_cpus=10, max_concurrency=100)
 class FullyAsyncRollouter(SeparateRayPPOTrainer):
     """
@@ -204,17 +227,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            configured_max_concurrent_samples_per_gpu = (
-                self.config.actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu
+            max_concurrent_samples_per_gpu = resolve_max_concurrent_rollout_samples_per_gpu(self.config)
+            self.max_concurrent_samples = (
+                len(self.async_rollout_manager.server_handles) * max_concurrent_samples_per_gpu
             )
-            if configured_max_concurrent_samples_per_gpu is None:
-                self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
-            else:
-                self.max_concurrent_samples = (
-                    len(self.async_rollout_manager.server_handles) * int(configured_max_concurrent_samples_per_gpu)
-                )
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
+            rollout_n = int(self.config.actor_rollout_ref.rollout.n)
 
             print(
                 f"[FullyAsyncRollouter] required_samples : {self.required_samples} "
@@ -223,6 +242,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 f"total_train_steps: {self.total_train_steps} "
                 f"total_rollout_steps: {self.total_rollout_steps} "
                 f"max_concurrent_samples: {self.max_concurrent_samples} "
+                f"max_concurrent_trajectories: {self.max_concurrent_samples * rollout_n} "
             )
 
     def get_rollout_wg(self):
@@ -737,6 +757,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "static/staleness_threshold": self.staleness_threshold,
             "static/max_queue_size": self.max_queue_size,
             "static/max_concurrent_samples": self.max_concurrent_samples,
+            "static/max_concurrent_trajectories": self.max_concurrent_samples
+            * int(self.config.actor_rollout_ref.rollout.n),
         }
 
         return stats

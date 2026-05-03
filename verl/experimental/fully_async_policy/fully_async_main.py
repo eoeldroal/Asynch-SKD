@@ -22,7 +22,10 @@ import hydra
 import ray
 from omegaconf import OmegaConf
 
-from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
+from verl.experimental.fully_async_policy.fully_async_rollouter import (
+    FullyAsyncRollouter,
+    resolve_max_concurrent_rollout_samples_per_gpu,
+)
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
 from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
@@ -51,6 +54,7 @@ class FullyAsyncTaskRunner:
         print(f"[ASYNC MAIN] TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
+        resolve_max_concurrent_rollout_samples_per_gpu(config)
 
         print("[ASYNC MAIN] Initializing model and tokenizer...")
         local_path = copy_to_local(

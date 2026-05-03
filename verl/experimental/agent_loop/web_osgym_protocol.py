@@ -26,6 +26,8 @@ class WebOsGymResponse(BaseModel):
     status: str
     text: str | None = None
     reward: float | None = None
+    error_type: str | None = None
+    message: str | None = None
     image_b64: str | None = None
     image_mime_type: str | None = None
 
@@ -50,6 +52,8 @@ class WebOsGymClient:
             status=payload["status"],
             text=payload.get("text"),
             reward=payload.get("reward"),
+            error_type=payload.get("error_type"),
+            message=payload.get("message"),
             image_b64=image_payload.get("data"),
             image_mime_type=image_payload.get("mimeType"),
         )

@@ -404,6 +404,33 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metrics["invalid_action"])
         self.assertFalse(tool.client.action_called)
 
+    async def test_tool_execute_returns_observation_for_gateway_error_response(self):
+        class _FakeClient:
+            async def action(self, **kwargs):
+                class _Response:
+                    status = "error"
+                    error_type = "fail_request_handle"
+                    message = "WEBGYM-RL failed to handle request."
+                    text = None
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+
+        response, reward, metrics = await tool.execute(
+            "i1", {"actions": [{"action_type": "SCROLL", "dx": 0, "dy": -10}]}
+        )
+
+        self.assertIn("Web/OSGym environment error", response.text)
+        self.assertIn("WEBGYM-RL failed to handle request.", response.text)
+        self.assertIsNone(reward)
+        self.assertFalse(metrics["terminated"])
+        self.assertTrue(metrics["invalid_action"])
+        self.assertEqual(metrics["action_count"], 1)
+
     async def test_tool_execute_returns_observation_for_invalid_action_item(self):
         class _FakeClient:
             def __init__(self):

@@ -327,16 +327,31 @@ class WebOsGymTool(BaseTool):
                 error_type=type(exc).__name__,
             )
             raise
+        response_status = getattr(response, "status", "ok")
         _trace_async_skd(
             "web_tool.action_http_done",
             agent_request_id=agent_request_id,
             tool_request_id=state["request_id"],
             elapsed_ms=round(http_ms, 1),
-            status=response.status,
+            status=response_status,
             text_len=len(response.text or ""),
-            has_image=response.image_b64 is not None,
-            image_b64_len=len(response.image_b64 or ""),
+            has_image=getattr(response, "image_b64", None) is not None,
+            image_b64_len=len(getattr(response, "image_b64", None) or ""),
         )
+        if response_status != "ok":
+            error_message = (
+                getattr(response, "message", None)
+                or getattr(response, "text", None)
+                or "Web/OSGym environment returned an error response."
+            )
+            error_type = getattr(response, "error_type", None) or "unknown"
+            return ToolResponse(text=f"Web/OSGym environment error ({error_type}): {error_message}"), None, {
+                "terminated": False,
+                "termination_reason": None,
+                "action_count": len(actions),
+                "invalid_action": True,
+                "web_osgym_error_type": error_type,
+            }
         state["cursor_x"] = cursor_x
         state["cursor_y"] = cursor_y
         if isinstance(extra_fields, dict):
@@ -383,7 +398,9 @@ class WebOsGymTool(BaseTool):
         }
 
     @rollout_trace_op
-    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float | None, dict]:
+    async def execute(
+        self, instance_id: str, parameters: dict[str, Any], **kwargs
+    ) -> tuple[ToolResponse, float | None, dict]:
         agent_data = kwargs.get("agent_data")
         state = self._instance_dict[instance_id]
         extra_fields = self._restore_cursor_from_agent_data(state, agent_data)
