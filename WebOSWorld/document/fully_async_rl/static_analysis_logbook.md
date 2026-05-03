@@ -455,3 +455,81 @@ Current preferred next checks:
 - Add model-input image ids/paths to the sidecar event so we can prove exactly which screenshot was used for each generation call.
 - If possible, include explicit cursor state as text or render cursor overlay into screenshots before relying on cursor-relative actions.
 - Keep normalization conservative; malformed tool calls should remain visible as learning signal unless a recovery rule is clearly protocol-compatible.
+
+## 2026-05-03 - Prompt/tool contract alignment with WebSKD
+
+Goal:
+
+- Keep Qwen3.5's native tool-calling advantage: expose action-named tools such as `CLICK`, `WAIT`, `DONE`, and `FAIL`.
+- Match the OSWorld/Qwen3-VL harness everywhere else that affects browser policy behavior: screenshot grounding instructions, previous-action framing, terminal-action semantics, and message ordering.
+- Avoid splitting SKD and RL into subtly different prompt distributions.
+
+Current comparison:
+
+- Both active launchers now point at the same canonical tool config:
+  - `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
+- The old duplicate config `web_osgym_tool_config_webgym_rl.yaml` differed only by endpoint and was removed to avoid divergent contracts.
+- The active tool schema is the Computer 13 action set exposed as named Qwen3.5 functions, not the OSWorld `computer_use(action=...)` wrapper.
+- Current SKD and RL parquet prompts are identical except for routing:
+  - SKD rows use `agent_name=web_skd_agent`.
+  - RL rows use `agent_name=web_tool_agent`.
+- That routing difference is intended. Prompt text, tool schema, and task-facing browser contract should remain shared.
+
+Prompt gap:
+
+- The current dataset prompt is valid but too terse compared with the OSWorld Qwen3-VL harness.
+- It lists tools and terminal rules, but it weakly states the screenshot-grounded policy behavior:
+  - use the current screenshot to choose the next browser action;
+  - click near the center of visible target elements;
+  - use `WAIT` when the page may still be loading;
+  - adjust failed clicks based on the latest screenshot;
+  - provide `Instruction:` and `Previous actions:` in the user message.
+
+Preferred prompt direction:
+
+- Put browser-GUI behavior rules in the shared dataset system prompt.
+- Put the OSWorld-style instruction block in the user message:
+
+```text
+Please generate the next move according to the UI screenshot, instruction and previous actions.
+
+Instruction: {task_instruction}
+
+Previous actions:
+None
+```
+
+- For later bounded-window training, replace `None` with a compact action-only summary of old steps outside the recent multimodal window.
+- Keep `qwen3_coder` / named-tool serialization delegated to the chat template and active tool schema.
+
+Non-goals for this prompt pass:
+
+- Do not switch to the OSWorld `computer_use` wrapper. That would throw away the current Qwen3.5 named-tool contract.
+- Do not reintroduce the temporary 10-action cap prompt.
+- Do not promise `1000x1000` coordinates until the server, screenshots, and stored trajectory metadata are consistently normalized.
+- Do not make RL-only prompt edits. SKD and RL should consume the same task-facing prompt unless there is a deliberate experiment.
+
+## 2026-05-03 - WebOSGym RL windowing implementation boundary
+
+Implemented foundation:
+
+- Extracted WebOSGym step/window primitives into a shared module so AsyncSKD and AsyncRL do not import each other for basic parsing.
+- AsyncSKD windowed training now imports the shared `contiguous_one_spans` and image-span normalization helpers, while its teacher-row window builder remains SKD-specific.
+- WebOSGym fully async RL now records committed observation metadata in `web_osgym_steps`.
+- `mini_step_image_spans` is derived from `web_osgym_steps`, so the SKD-compatible image projection and RL observation ledger share one source of truth.
+- Added a pure prompt-window builder that can produce an OSWorld-style model-facing view from base task messages, image data, and `web_osgym_steps`.
+
+Important boundary:
+
+- Runtime windowed generation is not enabled yet.
+- The reason is not implementation difficulty; it is training consistency.
+- If rollout generation uses a windowed prompt but the final PPO/GRPO update still recomputes logprobs from the full accumulated trajectory, the model would be trained under a different context from the one used to sample the action.
+- Therefore the current safe boundary is:
+  - record step/action/image metadata during RL rollout;
+  - provide a pure window prompt builder;
+  - keep the live generation path on the existing full prompt until update-time samples can use the same stored/windowed context.
+
+Next implementation step:
+
+- Store per-assistant-turn generation views or emit windowed `AgentLoopOutput` rows so rollout and update use the same prompt/image context.
+- Only after that should `WebOsGymToolAgentLoop` override generation-time prompts or the launcher enable windowed generation by config.

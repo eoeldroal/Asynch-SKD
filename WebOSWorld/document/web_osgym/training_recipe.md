@@ -318,6 +318,22 @@ Only valid parsed actions should enter `Previous actions`. If an old assistant t
 
 The student prompt should follow the OSWorld Qwen3-VL harness as closely as possible in content and message ordering, while keeping Qwen3.5 / verl-native tool syntax.
 
+This policy applies to both WebSKD and pure fully async RL. The two paths should differ in optimization target and agent loop only, not in the model-facing browser task contract:
+
+```text
+WebSKD:
+  agent loop: web_skd_agent
+  optimization: teacher-verified / windowed SKD
+  prompt/tool contract: OSWorld-style browser prompt + Qwen3.5 named tools
+
+Fully async RL:
+  agent loop: web_tool_agent
+  optimization: PPO/GRPO from environment reward
+  prompt/tool contract: the same OSWorld-style browser prompt + Qwen3.5 named tools
+```
+
+In other words, if a prompt change is intended to make the policy behave more like the OSWorld harness, it should normally land in the shared WebGym dataset prompt and be used by both SKD and RL datasets. The dataset rows may still route to different loops through `agent_name`.
+
 Recommended default:
 
 ```yaml
@@ -331,7 +347,7 @@ student_prompt_policy:
   add_new_current_observation_label: false
 ```
 
-Carry over the benchmark harness prompt content:
+Carry over the benchmark harness prompt content in the user message:
 
 ```text
 Please generate the next move according to the UI screenshot, instruction and previous actions.
@@ -341,6 +357,8 @@ Instruction: {task_instruction}
 Previous actions:
 {old_action_summary_or_None}
 ```
+
+For the initial rollout prompt, `{old_action_summary_or_None}` should be `None`. Later, when constructing bounded training windows, it should become the compact action-only summary for old steps outside the recent multimodal window.
 
 The `Previous actions` block is real benchmark-harness behavior. It should contain only old, window-external Computer 13 actions in our named-tool form:
 
@@ -352,6 +370,28 @@ Step 3: PRESS(key="ENTER")
 ```
 
 Do not introduce a new literal label such as `Current observation:` unless the evaluation harness also uses it. In the OSWorld Qwen3-VL harness, the current screenshot is represented by message order: it is the final image-only user message before the model predicts the next action.
+
+The system message should carry browser-GUI behavior rules, not a competing tool serialization tutorial. The Qwen3.5 `qwen3_coder` chat template already renders the active tool schema. Good system content is therefore:
+
+```text
+You are controlling a browser GUI with mouse and keyboard action tools.
+At each step, use the current screenshot to decide the next browser action.
+Use the screenshot to locate buttons, links, inputs, and other page elements.
+For coordinate-based actions, choose coordinates from the current screenshot and click near the center of the target element.
+If the page may still be loading or changing, use WAIT and inspect the next screenshot before continuing.
+If a previous click or input did not work, adjust based on the latest screenshot.
+When the task is complete, call DONE. If it cannot be completed, call FAIL.
+```
+
+The system message may also mention the named action set and simple defaults such as `CLICK` defaulting to left click. It should not mention the OSWorld `computer_use` wrapper, because this training stack intentionally exposes action-named Qwen3.5 tools.
+
+Current RL comparison:
+
+- The pure RL dataset currently routes to `web_tool_agent`; SKD routes to `web_skd_agent`.
+- Both datasets should share the same prompt text and `webgym_rl_tool_config.yaml` tool schema.
+- The current short prompt is functionally valid but under-specifies OSWorld-style screenshot grounding. It should be upgraded in the shared dataset generator rather than patched only in the RL script.
+- RL rollout currently keeps a full conversation trajectory during generation. That is acceptable for rollout parity, but actor update should later adopt the same bounded-window prompt view as SKD once reward/advantage grouping is designed.
+- Do not add a tool-call count cap or `1000x1000` coordinate promise in this prompt pass. The former was a superseded mitigation, and the latter should wait until coordinates are normalized end to end.
 
 For a target mini-step `i`, the windowed student message order should be:
 
