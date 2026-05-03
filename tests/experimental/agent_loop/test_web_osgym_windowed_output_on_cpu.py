@@ -34,8 +34,12 @@ def _web_osgym_output() -> AgentLoopOutput:
                     "response_end": 2,
                     "prompt_ids": [101, 102, 103],
                     "window_used": True,
-                    "image_indices": [0],
+                    "prompt_image_indices": [0],
                     "selected_step_indices": [1],
+                    "old_summary_turn_indices": [],
+                    "recent_observation_step_indices": [1],
+                    "recent_assistant_turn_indices": [],
+                    "text_only_recent_step_count": 0,
                 },
                 {
                     "assistant_turn": 2,
@@ -43,8 +47,12 @@ def _web_osgym_output() -> AgentLoopOutput:
                     "response_end": 6,
                     "prompt_ids": [201, 202, 203, 204],
                     "window_used": True,
-                    "image_indices": [1],
+                    "prompt_image_indices": [1],
                     "selected_step_indices": [2],
+                    "old_summary_turn_indices": [1],
+                    "recent_observation_step_indices": [2],
+                    "recent_assistant_turn_indices": [1],
+                    "text_only_recent_step_count": 0,
                 },
             ],
         },
@@ -68,7 +76,49 @@ def test_web_osgym_windowed_outputs_use_exact_generation_prompt_and_target_only(
     assert windows[1].response_mask == [1, 1]
     assert windows[1].multi_modal_data["images"] == ["after-click"]
     assert windows[1].extra_fields["web_osgym_window_row"] is True
+    assert windows[1].extra_fields["web_osgym_window_old_summary_turn_indices"] == [1]
+    assert windows[1].extra_fields["web_osgym_window_recent_observation_step_indices"] == [2]
+    assert windows[1].extra_fields["web_osgym_window_recent_assistant_turn_indices"] == [1]
     assert "web_osgym_generation_windows" not in windows[1].extra_fields
+
+
+def test_web_osgym_windowed_outputs_keep_exact_prompt_image_order_for_live_recent_history():
+    output = _web_osgym_output()
+    output.multi_modal_data = {"images": ["obs-2", "obs-3", "obs-4"]}
+    output.extra_fields["web_osgym_generation_windows"][1].update(
+        {
+            "prompt_ids": [201, 202, 203, 204, 205],
+            "prompt_image_indices": [0, 1, 2],
+            "old_summary_turn_indices": [1],
+            "recent_observation_step_indices": [2, 3, 4],
+            "recent_assistant_turn_indices": [2, 3],
+        }
+    )
+
+    windows, _ = build_web_osgym_windowed_agent_loop_outputs(output, enabled=True)
+
+    assert windows[1].prompt_ids == [201, 202, 203, 204, 205]
+    assert windows[1].multi_modal_data["images"] == ["obs-2", "obs-3", "obs-4"]
+    assert windows[1].response_ids == [13, 14]
+    assert windows[1].response_mask == [1, 1]
+
+
+def test_web_osgym_windowed_outputs_omit_images_for_text_only_prompt_window():
+    output = _web_osgym_output()
+    output.multi_modal_data = {"images": ["obs-1"]}
+    output.extra_fields["web_osgym_generation_windows"][0].update(
+        {
+            "prompt_ids": [101, 102, 103, 104],
+            "prompt_image_indices": [],
+            "text_only_recent_step_count": 1,
+        }
+    )
+
+    windows, _ = build_web_osgym_windowed_agent_loop_outputs(output, enabled=True)
+
+    assert windows[0].prompt_ids == [101, 102, 103, 104]
+    assert "images" not in windows[0].multi_modal_data
+    assert windows[0].response_ids == [11, 12]
 
 
 class _WindowedWorker(AgentLoopWorker):

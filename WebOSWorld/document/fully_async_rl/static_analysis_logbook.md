@@ -538,3 +538,29 @@ Updated boundary:
 Remaining follow-up:
 
 - Keep termination-reason fields in rollout dumps while tuning `max_response_length`, turn caps, and server/session release behavior.
+
+## 2026-05-03 - RL harness-style prompt window alignment
+
+Implemented:
+
+- The earlier RL helper shape was too shallow: it attached only the current screenshot and collapsed all previous steps into `Previous actions`.
+- The RL-only prompt helper now mirrors the OSWorld Qwen harness topology:
+  - old actions outside the recent window are summarized in `Previous actions`
+  - recent `history_n` steps remain live as `user(observation)` -> `assistant(response)` chat messages
+  - the current observation is the final `user` message
+  - text-only failure observations remain as text-only `user` messages and do not force fake image placeholders
+- `normalize_web_osgym_steps()` now preserves raw observation text in addition to `text_len`, so text-only RL windows can be reconstructed without relying on decoded dumps.
+- WebOSGym RL rollout now records assistant-turn metadata keyed by observation step, including response text and parsed actions.
+- `web_osgym_generation_windows` now records:
+  - `prompt_image_indices`
+  - `old_summary_turn_indices`
+  - `recent_observation_step_indices`
+  - `recent_assistant_turn_indices`
+  - `text_only_recent_step_count`
+- Tool sidecar events now include a compact `prompt_window` object so tool-call/result traces can be audited against the exact rollout prompt contract.
+- RL update-row reconstruction now consumes recorded prompt-image indices and recent-history metadata while still keeping the target restricted to the current assistant span only.
+
+Result:
+
+- Rollout prompt semantics and update prompt semantics are now aligned to the same OSWorld/Qwen-style window contract.
+- The remaining known gap versus the benchmark harness is not prompt window shape but environment/protocol behavior such as session release/finalization and any future coordinate normalization work.

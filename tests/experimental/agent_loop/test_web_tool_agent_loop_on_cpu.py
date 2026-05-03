@@ -217,6 +217,7 @@ def test_record_web_osgym_step_initial_observation():
             "assistant_turn": 0,
             "user_turn": 0,
             "phase": "initial",
+            "text": "",
             "text_len": 0,
             "action_names": [],
             "actions": [],
@@ -258,6 +259,7 @@ def test_record_web_osgym_step_action_observation_preserves_actions():
     assert recorded_step["assistant_turn"] == 2
     assert recorded_step["user_turn"] == 1
     assert recorded_step["phase"] == "tool_observation"
+    assert recorded_step["text"] == ""
     assert recorded_step["text_len"] == 7
     assert recorded_step["action_names"] == ["CLICK"]
     assert recorded_step["actions"] == actions
@@ -302,11 +304,12 @@ def test_windowed_generation_uses_harness_prompt_window():
             multi_turn=SimpleNamespace(
                 web_osgym_window_enable=True,
                 web_osgym_window_history_n=1,
-                web_osgym_window_max_images_per_sample=1,
+                web_osgym_window_max_images_per_sample=6,
             )
         )
         loop.server_manager = _FakeServerManager()
         loop.tool_parser = _FakeToolParser()
+        loop.tokenizer.decode = lambda ids, skip_special_tokens=False: "A2"
 
         agent_data = _agent_data(_FakeWebTool())
         agent_data._web_osgym_base_messages = [
@@ -319,6 +322,7 @@ def test_windowed_generation_uses_harness_prompt_window():
             {
                 "step_idx": 1,
                 "phase": "tool_observation",
+                "text": "",
                 "actions": [{"action_type": "CLICK", "x": 12, "y": 34}],
                 "image_start": 0,
                 "image_end": 1,
@@ -326,10 +330,19 @@ def test_windowed_generation_uses_harness_prompt_window():
             {
                 "step_idx": 2,
                 "phase": "tool_observation",
+                "text": "",
                 "actions": [],
                 "image_start": 1,
                 "image_end": 2,
             },
+        ]
+        agent_data.extra_fields["web_osgym_assistant_turns"] = [
+            {
+                "assistant_turn": 1,
+                "observation_step_idx": 1,
+                "response_text": "A1",
+                "actions": [{"action_type": "CLICK", "x": 12, "y": 34}],
+            }
         ]
 
         state = await loop._handle_generating_state(agent_data, {})
@@ -337,21 +350,34 @@ def test_windowed_generation_uses_harness_prompt_window():
         assert state == AgentState.PROCESSING_TOOLS
         generate_call = loop.server_manager.calls[0]
         assert generate_call["prompt_ids"] != list(range(100))
-        assert generate_call["image_data"] == ["current-image"]
+        assert generate_call["image_data"] == ["old-image", "current-image"]
         assert generate_call["video_data"] is None
         prompt_messages, prompt_kwargs = loop.apply_chat_template_calls[-1]
-        assert prompt_kwargs["images"] == ["current-image"]
+        assert prompt_kwargs["images"] == ["old-image", "current-image"]
         assert prompt_messages[0] == {"role": "system", "content": "Use the computer carefully."}
-        prompt_text = prompt_messages[-1]["content"][-1]["text"]
+        prompt_text = prompt_messages[1]["content"][-1]["text"]
         assert "Instruction: Open the settings page" in prompt_text
-        assert "CLICK(x=12, y=34)" in prompt_text
+        assert "Previous actions:\nNone" in prompt_text
+        assert prompt_messages[2] == {"role": "assistant", "content": "A1"}
+        assert prompt_messages[3] == {"role": "user", "content": [{"type": "image"}]}
         assert agent_data.prompt_ids[-2:] == [101, 102]
         assert agent_data.response_mask[-2:] == [1, 1]
         assert agent_data.metrics["web_osgym/window_active"] == 1
-        assert agent_data.metrics["web_osgym/window_step_count"] == 1
-        assert agent_data.metrics["web_osgym/window_image_count"] == 1
-        assert agent_data.extra_fields["web_osgym_generation_windows"][0]["image_indices"] == [1]
-        assert agent_data.extra_fields["web_osgym_generation_windows"][0]["selected_step_indices"] == [2]
+        assert agent_data.metrics["web_osgym/window_step_count"] == 2
+        assert agent_data.metrics["web_osgym/window_image_count"] == 2
+        assert agent_data.metrics["web_osgym/window_old_summary_turn_count"] == 0
+        assert agent_data.metrics["web_osgym/window_recent_observation_step_count"] == 2
+        assert agent_data.metrics["web_osgym/window_recent_assistant_turn_count"] == 1
+        assert agent_data.metrics["web_osgym/window_text_only_recent_step_count"] == 0
+        window = agent_data.extra_fields["web_osgym_generation_windows"][0]
+        assert window["prompt_image_indices"] == [0, 1]
+        assert window["selected_step_indices"] == [1, 2]
+        assert window["old_summary_turn_indices"] == []
+        assert window["recent_observation_step_indices"] == [1, 2]
+        assert window["recent_assistant_turn_indices"] == [1]
+        assert window["text_only_recent_step_count"] == 0
+        assert agent_data.extra_fields["web_osgym_assistant_turns"][-1]["observation_step_idx"] == 2
+        assert agent_data.extra_fields["web_osgym_assistant_turns"][-1]["response_text"] == "A2"
 
     asyncio.run(_run())
 
@@ -380,6 +406,7 @@ def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
                 "assistant_turn": 0,
                 "user_turn": 0,
                 "phase": "initial",
+                "text": "",
                 "text_len": 0,
                 "action_names": [],
                 "actions": [],
@@ -654,6 +681,7 @@ def test_processing_records_non_terminal_image_observation_step():
                 "assistant_turn": 0,
                 "user_turn": 0,
                 "phase": "initial",
+                "text": "",
                 "text_len": 0,
                 "action_names": [],
                 "actions": [],
@@ -667,6 +695,7 @@ def test_processing_records_non_terminal_image_observation_step():
                 "assistant_turn": 1,
                 "user_turn": 0,
                 "phase": "tool_observation",
+                "text": "",
                 "text_len": 0,
                 "action_names": ["CLICK"],
                 "actions": [{"action_type": "CLICK", "x": 1, "y": 2}],
@@ -707,6 +736,7 @@ def test_finalize_output_records_rollout_backprop_unit_trace():
             "assistant_turn": 0,
             "user_turn": 0,
             "phase": "initial",
+            "text": "",
             "text_len": 0,
             "action_names": [],
             "actions": [],
@@ -732,6 +762,11 @@ def test_finalize_output_records_rollout_backprop_unit_trace():
         "generation_window_count": 0,
         "step_count": 1,
         "image_span_count": 1,
+        "window_old_summary_turn_count": 0,
+        "window_recent_observation_step_count": 0,
+        "window_recent_assistant_turn_count": 0,
+        "window_text_only_recent_step_count": 0,
+        "window_prompt_image_count": 0,
     }
     assert agent_data.metrics["web_osgym/step_count"] == 1
     assert agent_data.metrics["web_osgym/image_span_count"] == 1
@@ -762,6 +797,16 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
                 "web_osgym_task_id": "12345",
                 "web_osgym_session_id": 777,
                 "web_osgym_include_a11y": False,
+                "web_osgym_generation_windows": [
+                    {
+                        "prompt_ids": [11, 12],
+                        "prompt_image_indices": [4, 5],
+                        "old_summary_turn_indices": [1],
+                        "recent_observation_step_indices": [2, 3],
+                        "recent_assistant_turn_indices": [2],
+                        "text_only_recent_step_count": 1,
+                    }
+                ],
             }
         )
         tool._instance_dict["instance-1"] = {
@@ -791,6 +836,13 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
         ]
         assert event["actions"] == [{"action_type": "CLICK", "x": 1, "y": 2}]
         assert event["result"]["terminated"] is False
+        assert event["prompt_window"] == {
+            "prompt_image_indices": [4, 5],
+            "old_summary_turn_indices": [1],
+            "recent_observation_step_indices": [2, 3],
+            "recent_assistant_turn_indices": [2],
+            "text_only_recent_step_count": 1,
+        }
         assert event["observation"]["text"] == "A11Y_TREE:\nbutton"
         assert event["observation"]["images"][0]["width"] == 3
         assert event["observation"]["images"][0]["height"] == 2

@@ -124,6 +124,7 @@ def normalize_web_osgym_steps(value: Any) -> list[dict[str, Any]]:
             text_len = len(str(item.get("text") or ""))
         else:
             text_len = _coerce_int(raw_text_len, default=0)
+        text = str(item.get("text") or "")
         image_start, image_end = _normalize_image_bounds(item.get("image_start", 0), item.get("image_end", 0))
         steps.append(
             {
@@ -131,6 +132,7 @@ def normalize_web_osgym_steps(value: Any) -> list[dict[str, Any]]:
                 "assistant_turn": assistant_turn,
                 "user_turn": user_turn,
                 "phase": str(item.get("phase", "")),
+                "text": text,
                 "text_len": text_len,
                 "action_names": _normalize_string_list(item.get("action_names")),
                 "actions": _normalize_action_list(item.get("actions")),

@@ -98,7 +98,10 @@ def build_web_osgym_windowed_agent_loop_outputs(
         if not prompt_ids:
             raise ValueError("Web/OSGym generation window is missing prompt_ids.")
 
-        image_indices = [int(idx) for idx in generation_window.get("image_indices") or []]
+        prompt_image_indices = generation_window.get("prompt_image_indices")
+        if prompt_image_indices is None:
+            prompt_image_indices = generation_window.get("image_indices") or []
+        image_indices = [int(idx) for idx in prompt_image_indices]
         target_response_ids = list(output.response_ids[target_start:target_end])
         target_logprobs = (
             list(output.response_logprobs[target_start:target_end]) if output.response_logprobs is not None else None
@@ -112,7 +115,19 @@ def build_web_osgym_windowed_agent_loop_outputs(
         extra_fields["web_osgym_window_target_start"] = int(target_start)
         extra_fields["web_osgym_window_target_end"] = int(target_end)
         extra_fields["web_osgym_window_prompt_tokens"] = len(prompt_ids)
-        extra_fields["web_osgym_window_image_count"] = len(image_indices)
+        extra_fields["web_osgym_window_prompt_image_count"] = len(image_indices)
+        extra_fields["web_osgym_window_old_summary_turn_indices"] = list(
+            generation_window.get("old_summary_turn_indices") or []
+        )
+        extra_fields["web_osgym_window_recent_observation_step_indices"] = list(
+            generation_window.get("recent_observation_step_indices") or []
+        )
+        extra_fields["web_osgym_window_recent_assistant_turn_indices"] = list(
+            generation_window.get("recent_assistant_turn_indices") or []
+        )
+        extra_fields["web_osgym_window_text_only_recent_step_count"] = int(
+            generation_window.get("text_only_recent_step_count", 0)
+        )
         extra_fields["web_osgym_generation_window"] = _compact_generation_window(generation_window)
 
         windows.append(
