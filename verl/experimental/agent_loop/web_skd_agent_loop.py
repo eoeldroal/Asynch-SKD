@@ -367,6 +367,22 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             image_count=_safe_len(tool_response.image),
         )
 
+        if result.get("terminated"):
+            termination_reason = result.get("termination_reason") or "model_done"
+            _trace_async_skd(
+                "web_skd.tool_processing_terminated",
+                request_id=agent_data.request_id,
+                appended_len=0,
+                response_len=len(agent_data.response_mask),
+                termination_reason=termination_reason,
+                image_count=_safe_len(agent_data.image_data),
+            )
+            await self._finalize_with_web_osgym_reward(
+                agent_data,
+                termination_reason=termination_reason,
+            )
+            return AgentState.TERMINATED
+
         student_obs, teacher_obs = self._split_env_observation(tool_response.text, tool_response.image)
         image_data = tool_response.image if tool_response.image else None
         _trace_async_skd(
@@ -527,7 +543,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 teacher_server_prompt_len=len(teacher_server_prompt_ids),
                 teacher_server_response_ids_len=len(teacher_server_response_ids),
             )
-            if not result.get("terminated") and await self._terminate_if_teacher_prefix_overflows(
+            if await self._terminate_if_teacher_prefix_overflows(
                 agent_data,
                 prefix_len=len(teacher_server_prompt_ids) + len(teacher_server_response_ids),
                 stage="tool_observation",
@@ -545,7 +561,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                     "step_idx": int(agent_data.assistant_turns) + 1,
                     "image_start": image_start,
                     "image_end": image_end,
-                    "terminal": bool(result.get("terminated")),
+                    "terminal": False,
                 }
             )
             agent_data.extra_fields["mini_step_image_spans"] = spans
@@ -625,21 +641,6 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             teacher_logprobs_rows=len(agent_data.extra_fields.get("teacher_logprobs_list", [])),
             response_len=len(agent_data.response_mask),
         )
-
-        if result.get("terminated"):
-            _trace_async_skd(
-                "web_skd.tool_processing_terminated",
-                request_id=agent_data.request_id,
-                appended_len=appended_len,
-                response_len=len(agent_data.response_mask),
-                termination_reason=result.get("termination_reason") or "model_done",
-                image_count=_safe_len(agent_data.image_data),
-            )
-            await self._finalize_with_web_osgym_reward(
-                agent_data,
-                termination_reason=result.get("termination_reason") or "model_done",
-            )
-            return AgentState.TERMINATED
 
         _trace_async_skd(
             "web_skd.tool_processing_commit_done",

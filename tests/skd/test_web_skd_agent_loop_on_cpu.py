@@ -55,6 +55,16 @@ class _ImageFakeTool(_FakeTool):
         }
 
 
+class _TerminalImageFakeTool(_FakeTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters))
+        return ToolResponse(text="A11Y_TREE:\nterminal", image=["terminal-image"]), None, {
+            "terminated": True,
+            "termination_reason": "model_done",
+            "action_count": len(parameters["actions"]),
+        }
+
+
 class _ActionFakeTool(_FakeTool):
     name = "CLICK"
 
@@ -695,6 +705,82 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             agent_data.extra_fields["web_osgym_teacher_messages"], before_extra["web_osgym_teacher_messages"]
         )
         self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_response_budget_exhausted")
+        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+
+    async def test_processing_tools_does_not_commit_terminal_action_response_observation(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _TerminalImageFakeTool()}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fail_if_template_called(*args, **kwargs):
+            del args, kwargs
+            raise AssertionError("terminal action response must not be templated")
+
+        loop.apply_chat_template = _fail_if_template_called
+        loop._apply_server_chat_template = _fail_if_template_called
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=["initial-image"],
+            video_data=[],
+            metrics={},
+            request_id="req-terminal",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_ids = [41, 42]
+        agent_data.response_mask = [1, 1]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [[1, 0, 0, 0], [2, 0, 0, 0]],
+                "teacher_logprobs_list": [[-1.0, 0.0, 0.0, 0.0], [-2.0, 0.0, 0.0, 0.0]],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "mini_step_image_spans": [{"step_idx": 1, "image_start": 0, "image_end": 1}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"DONE"}]}',
+                },
+            )()
+        ]
+        before_messages = deepcopy(agent_data.messages)
+        before_image_data = deepcopy(agent_data.image_data)
+        before_prompt_ids = list(agent_data.prompt_ids)
+        before_response_mask = list(agent_data.response_mask)
+        before_extra = deepcopy(agent_data.extra_fields)
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.TERMINATED)
+        self.assertEqual(agent_data.messages, before_messages)
+        self.assertEqual(agent_data.image_data, before_image_data)
+        self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
+        self.assertEqual(agent_data.response_mask, before_response_mask)
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], before_extra["server_prompt_ids"])
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], before_extra["teacher_prompt_ids"])
+        self.assertEqual(
+            agent_data.extra_fields["teacher_server_prompt_ids"],
+            before_extra["teacher_server_prompt_ids"],
+        )
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 0)
+        self.assertEqual(agent_data.extra_fields["web_osgym_teacher_messages"], before_extra["web_osgym_teacher_messages"])
+        self.assertEqual(agent_data.extra_fields["mini_step_image_spans"], before_extra["mini_step_image_spans"])
+        self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "model_done")
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
 
     async def test_system_stop_fetches_reward_on_skd_loop(self):
