@@ -397,6 +397,11 @@ Current RL comparison:
 - The active WebGym fully async RL launcher enables windowed generation with `history_n=5` and `max_images_per_sample=6`.
 - Actor update now also consumes WebOSGym window rows when `web_osgym_window_enable=True`: each assistant generation records the exact prompt/image slice used at rollout time, and the completed trajectory is expanded into one training row per assistant generation before `_agent_loop_postprocess()`.
 - Do not add a tool-call count cap or `1000x1000` coordinate promise in this prompt pass. The former was a superseded mitigation, and the latter should wait until coordinates are normalized end to end.
+- The RL-only prompt helper now mirrors the OSWorld Qwen harness topology instead of collapsing everything into a single user turn:
+  - old actions outside the recent window go into `Previous actions`
+  - recent `history_n` steps stay as live `user(observation)` -> `assistant(response)` messages
+  - the current observation is the final `user` message and has no assistant reply yet
+  - text-only failure observations remain as text-only `user` messages and do not force fake image placeholders
 
 In this RL mode, `max_model_len` and `max_num_batched_tokens` bound the model-facing windowed generation request. `data.max_response_length` remains the full trajectory rollout cap and termination budget, but WebOSGym window rows are padded to the maximum target response length in the emitted mini-row batch rather than blindly to the full trajectory cap. A large `data.max_response_length` therefore allows long trajectories without making every update row pay the same padding cost.
 
@@ -433,6 +438,23 @@ assistant:
 ```
 
 When there is no recent history, the harness attaches the instruction prompt to the current screenshot. Mirror that behavior for early mini-steps.
+
+In the current RL implementation, the exact rollout window is recorded per assistant generation through:
+
+```python
+web_osgym_generation_windows = [
+    {
+        "prompt_ids": list[int],
+        "prompt_image_indices": list[int],
+        "old_summary_turn_indices": list[int],
+        "recent_observation_step_indices": list[int],
+        "recent_assistant_turn_indices": list[int],
+        "text_only_recent_step_count": int,
+    }
+]
+```
+
+These fields are the source of truth for RL update-row reconstruction and rollout debugging. The update row must keep only the current assistant span as target, but the prompt/image context must match this recorded rollout window exactly.
 
 Coordinate handling is deferred for the first implementation. The target benchmark-aligned mode is OSWorld-style `1000x1000` relative coordinates, and the tool server is expected to provide a11y/tree coordinates in that same frame. However, existing local rollout data and screenshots are still in the original image coordinate frame. Therefore the first windowed-loss implementation should avoid changing coordinate semantics and should not rewrite coordinate prompts yet. Once the tool server and stored trajectory metadata are consistently `1000x1000`, coordinate preprocessing can be added as a separate step.
 
