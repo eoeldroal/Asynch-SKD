@@ -511,25 +511,33 @@ Non-goals for this prompt pass:
 
 ## 2026-05-03 - WebOSGym RL windowing implementation boundary
 
-Implemented foundation:
+Implemented:
 
 - Extracted WebOSGym step/window primitives into a shared module so AsyncSKD and AsyncRL do not import each other for basic parsing.
 - AsyncSKD windowed training now imports the shared `contiguous_one_spans` and image-span normalization helpers, while its teacher-row window builder remains SKD-specific.
 - WebOSGym fully async RL now records committed observation metadata in `web_osgym_steps`.
 - `mini_step_image_spans` is derived from `web_osgym_steps`, so the SKD-compatible image projection and RL observation ledger share one source of truth.
 - Added a pure prompt-window builder that can produce an OSWorld-style model-facing view from base task messages, image data, and `web_osgym_steps`.
+- Added RL runtime controls under `actor_rollout_ref.rollout.multi_turn`:
+  - `web_osgym_window_enable`
+  - `web_osgym_window_history_n`
+  - `web_osgym_window_max_images_per_sample`
+- `WebOsGymToolAgentLoop` now uses the prompt-window builder during generation when `web_osgym_window_enable=True`.
+- The active WebGym fully async RL launcher enables this path with `history_n=5` and `max_images_per_sample=6`.
+- The rollout trace now reports whether the model-facing prompt was `windowed_prompt` or `full_accumulated_prompt`, plus the window settings and fallback count.
+- WebOSGym reward finalization now also writes `web_osgym_reward_score` and `web_osgym_termination_reason` into `reward_extra_info`, so trainer rollout dumps can show whether a sample ended by `model_done`, `model_fail`, `system_stop`, or `tool_response_budget_exhausted`.
 
 Important boundary:
 
-- Runtime windowed generation is not enabled yet.
-- The reason is not implementation difficulty; it is training consistency.
-- If rollout generation uses a windowed prompt but the final PPO/GRPO update still recomputes logprobs from the full accumulated trajectory, the model would be trained under a different context from the one used to sample the action.
-- Therefore the current safe boundary is:
-  - record step/action/image metadata during RL rollout;
-  - provide a pure window prompt builder;
-  - keep the live generation path on the existing full prompt until update-time samples can use the same stored/windowed context.
+- Runtime rollout generation is now windowed when the config flag is enabled.
+- Update/backprop is still the full `AgentLoopOutput` trajectory. This is intentionally visible in `web_osgym_unit_trace` as:
+  - `rollout_context=windowed_prompt`
+  - `backprop_context=full_agent_loop_output`
+- This is useful for testing benchmark-like rollout behavior immediately, but it is not the final harness-aligned training boundary.
+- `data.max_response_length` remains the full trajectory output cap. With windowed rollout it no longer directly controls the per-step model context; that role is mostly handled by `max_model_len`, `max_num_batched_tokens`, `web_osgym_window_history_n`, and `web_osgym_window_max_images_per_sample`.
 
 Next implementation step:
 
 - Store per-assistant-turn generation views or emit windowed `AgentLoopOutput` rows so rollout and update use the same prompt/image context.
-- Only after that should `WebOsGymToolAgentLoop` override generation-time prompts or the launcher enable windowed generation by config.
+- Convert completed trajectories into update-time window rows so rollout and backprop use the same prompt/image context.
+- Keep termination-reason fields in rollout dumps while tuning `max_response_length`, turn caps, and server/session release behavior.

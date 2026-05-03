@@ -209,6 +209,12 @@ multi_turn:
   # Number of repeat rollouts for each sample
   num_repeat_rollouts: null
 
+  # Web/OSGym prompt window controls. These are exposed for RL rollout
+  # experiments; the default keeps the historical full accumulated prompt path.
+  web_osgym_window_enable: False
+  web_osgym_window_history_n: 5
+  web_osgym_window_max_images_per_sample: 6
+
 # support logging rollout prob for debugging purpose
 # "Truncated importance sampling" requires rollout log probs, set to True when turning on Truncated importance sampling
 calculate_log_probs: False

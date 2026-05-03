@@ -390,8 +390,15 @@ Current RL comparison:
 - The pure RL dataset currently routes to `web_tool_agent`; SKD routes to `web_skd_agent`.
 - Both datasets should share the same prompt text and `webgym_rl_tool_config.yaml` tool schema.
 - The current short prompt is functionally valid but under-specifies OSWorld-style screenshot grounding. It should be upgraded in the shared dataset generator rather than patched only in the RL script.
-- RL rollout currently keeps a full conversation trajectory during generation. That is acceptable for rollout parity, but actor update should later adopt the same bounded-window prompt view as SKD once reward/advantage grouping is designed.
+- RL rollout can now use the same bounded prompt-window builder during generation via:
+  - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable`
+  - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n`
+  - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample`
+- The active WebGym fully async RL launcher enables windowed generation with `history_n=5` and `max_images_per_sample=6`.
+- Actor update still consumes the full `AgentLoopOutput` trajectory. This is a deliberate intermediate state for testing benchmark-like rollout behavior before converting completed trajectories into update-time window rows.
 - Do not add a tool-call count cap or `1000x1000` coordinate promise in this prompt pass. The former was a superseded mitigation, and the latter should wait until coordinates are normalized end to end.
+
+In this intermediate RL mode, `max_model_len` and `max_num_batched_tokens` bound the model-facing windowed generation request, while `data.max_response_length` remains the full trajectory output cap used for storage, reward placement, logprob/update tensors, and termination if the trajectory grows too long. A large `data.max_response_length` does not by itself make the model read the full trajectory once windowed generation is active, but it can still increase actor update memory and long-tail trajectory cost.
 
 For a target mini-step `i`, the windowed student message order should be:
 

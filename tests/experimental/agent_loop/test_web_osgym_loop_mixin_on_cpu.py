@@ -106,6 +106,13 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         await loop._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
 
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+        self.assertEqual(
+            agent_data.extra_fields["reward_extra_info"],
+            {
+                "web_osgym_reward_score": 1.0,
+                "web_osgym_termination_reason": "system_stop",
+            },
+        )
         self.assertEqual(len(tool.rewards), 1)
 
     def test_ensure_session_restores_missing_local_instance_state(self):

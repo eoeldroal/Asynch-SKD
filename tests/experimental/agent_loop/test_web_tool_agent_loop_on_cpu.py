@@ -9,6 +9,7 @@ from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, 
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl.experimental.agent_loop.web_tool_agent_loop import WebOsGymToolAgentLoop
 from verl.tools.schemas import ToolResponse
+from verl.workers.rollout.replica import TokenOutput
 
 
 class _FakeWebTool:
@@ -272,6 +273,85 @@ def test_record_web_osgym_step_action_observation_preserves_actions():
             "terminal": False,
         }
     ]
+
+
+def test_windowed_generation_uses_harness_prompt_window():
+    class _FakeServerManager:
+        def __init__(self):
+            self.calls = []
+
+        async def generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return TokenOutput(
+                token_ids=[101, 102],
+                log_probs=[-0.1, -0.2],
+                extra_fields={"global_steps": 0},
+            )
+
+    class _FakeToolParser:
+        def __init__(self):
+            self.calls = []
+
+        async def extract_tool_calls(self, response_ids, tools):
+            self.calls.append((response_ids, tools))
+            return "", [FunctionCall(name="computer", arguments="{}")]
+
+    async def _run():
+        loop = _make_loop()
+        loop.rollout_config = SimpleNamespace(
+            multi_turn=SimpleNamespace(
+                web_osgym_window_enable=True,
+                web_osgym_window_history_n=1,
+                web_osgym_window_max_images_per_sample=1,
+            )
+        )
+        loop.server_manager = _FakeServerManager()
+        loop.tool_parser = _FakeToolParser()
+
+        agent_data = _agent_data(_FakeWebTool())
+        agent_data._web_osgym_base_messages = [
+            {"role": "system", "content": "Use the computer carefully."},
+            {"role": "user", "content": "Open the settings page"},
+        ]
+        agent_data.prompt_ids = list(range(100))
+        agent_data.image_data = ["old-image", "current-image"]
+        agent_data.extra_fields["web_osgym_steps"] = [
+            {
+                "step_idx": 1,
+                "phase": "tool_observation",
+                "actions": [{"action_type": "CLICK", "x": 12, "y": 34}],
+                "image_start": 0,
+                "image_end": 1,
+            },
+            {
+                "step_idx": 2,
+                "phase": "tool_observation",
+                "actions": [],
+                "image_start": 1,
+                "image_end": 2,
+            },
+        ]
+
+        state = await loop._handle_generating_state(agent_data, {})
+
+        assert state == AgentState.PROCESSING_TOOLS
+        generate_call = loop.server_manager.calls[0]
+        assert generate_call["prompt_ids"] != list(range(100))
+        assert generate_call["image_data"] == ["current-image"]
+        assert generate_call["video_data"] is None
+        prompt_messages, prompt_kwargs = loop.apply_chat_template_calls[-1]
+        assert prompt_kwargs["images"] == ["current-image"]
+        assert prompt_messages[0] == {"role": "system", "content": "Use the computer carefully."}
+        prompt_text = prompt_messages[-1]["content"][-1]["text"]
+        assert "Instruction: Open the settings page" in prompt_text
+        assert "CLICK(x=12, y=34)" in prompt_text
+        assert agent_data.prompt_ids[-2:] == [101, 102]
+        assert agent_data.response_mask[-2:] == [1, 1]
+        assert agent_data.metrics["web_osgym/window_active"] == 1
+        assert agent_data.metrics["web_osgym/window_step_count"] == 1
+        assert agent_data.metrics["web_osgym/window_image_count"] == 1
+
+    asyncio.run(_run())
 
 
 def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
@@ -644,6 +724,9 @@ def test_finalize_output_records_rollout_backprop_unit_trace():
         "rollout_context": "full_accumulated_prompt",
         "backprop_context": "full_agent_loop_output",
         "harness_prompt_window": "metadata_available_not_active",
+        "window_history_n": 5,
+        "window_max_images_per_sample": 6,
+        "window_fallback_count": 0,
         "step_count": 1,
         "image_span_count": 1,
     }

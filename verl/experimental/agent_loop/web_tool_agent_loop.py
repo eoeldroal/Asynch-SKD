@@ -12,10 +12,12 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.web_osgym_prompt_window import build_web_osgym_prompt_window
 from verl.experimental.agent_loop.web_osgym_windowing import build_mini_step_image_spans
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -119,10 +121,14 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
     def _record_web_osgym_unit_trace(self, agent_data: AgentData) -> None:
         steps = list(agent_data.extra_fields.get("web_osgym_steps") or [])
         image_spans = list(agent_data.extra_fields.get("mini_step_image_spans") or [])
+        window_enabled = self._web_osgym_window_enabled()
         unit_trace = {
-            "rollout_context": "full_accumulated_prompt",
+            "rollout_context": "windowed_prompt" if window_enabled else "full_accumulated_prompt",
             "backprop_context": "full_agent_loop_output",
-            "harness_prompt_window": "metadata_available_not_active",
+            "harness_prompt_window": "active" if window_enabled else "metadata_available_not_active",
+            "window_history_n": self._web_osgym_window_history_n(),
+            "window_max_images_per_sample": self._web_osgym_window_max_images_per_sample(),
+            "window_fallback_count": agent_data.metrics.get("web_osgym/window_fallback_count", 0),
             "step_count": len(steps),
             "image_span_count": len(image_spans),
         }
@@ -160,6 +166,57 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             else:
                 actions.append({"action_type": tool_call.name, **tool_args})
         return actions
+
+    def _web_osgym_window_enabled(self) -> bool:
+        multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
+        return bool(getattr(multi_turn, "web_osgym_window_enable", False))
+
+    def _web_osgym_window_history_n(self) -> int:
+        multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
+        return int(getattr(multi_turn, "web_osgym_window_history_n", 5))
+
+    def _web_osgym_window_max_images_per_sample(self) -> int | None:
+        multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
+        value = getattr(multi_turn, "web_osgym_window_max_images_per_sample", 6)
+        return None if value is None else int(value)
+
+    async def _build_web_osgym_generation_inputs(
+        self,
+        agent_data: AgentData,
+    ) -> tuple[list[int], list[Any] | None, Any | None, bool]:
+        if not self._web_osgym_window_enabled():
+            return agent_data.prompt_ids, agent_data.image_data, agent_data.video_data, False
+
+        steps = agent_data.extra_fields.get("web_osgym_steps") or []
+        if not steps:
+            return agent_data.prompt_ids, agent_data.image_data, agent_data.video_data, False
+
+        try:
+            prompt_window = build_web_osgym_prompt_window(
+                base_messages=getattr(agent_data, "_web_osgym_base_messages", agent_data.messages),
+                images=agent_data.image_data,
+                steps=steps,
+                history_n=self._web_osgym_window_history_n(),
+                max_images_per_sample=self._web_osgym_window_max_images_per_sample(),
+            )
+        except ValueError as exc:
+            agent_data.metrics["web_osgym/window_fallback_count"] = (
+                agent_data.metrics.get("web_osgym/window_fallback_count", 0) + 1
+            )
+            logger.warning("Falling back to full Web/OSGym prompt window: %s", exc)
+            return agent_data.prompt_ids, agent_data.image_data, agent_data.video_data, False
+
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        prompt_ids = await self.apply_chat_template(
+            prompt_window.messages,
+            tools=schemas,
+            images=prompt_window.images,
+            videos=None,
+        )
+        agent_data.metrics["web_osgym/window_active"] = 1
+        agent_data.metrics["web_osgym/window_step_count"] = len(prompt_window.selected_steps)
+        agent_data.metrics["web_osgym/window_image_count"] = len(prompt_window.images)
+        return prompt_ids, prompt_window.images, None, True
 
     @staticmethod
     def _write_trace_image(trace_dir: Path, image: Any, image_name: str) -> dict[str, Any] | None:
@@ -247,6 +304,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             request_id=uuid4().hex,
             tools_kwargs=kwargs.get("tools_kwargs", {}),
         )
+        agent_data._web_osgym_base_messages = deepcopy(messages)
 
         extra_info = kwargs.get("extra_info", {}) or {}
         tool_selection = extra_info.get("tool_selection")
@@ -370,11 +428,46 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         sampling_params: dict[str, Any],
         ignore_termination: bool = False,
     ) -> AgentState:
-        next_state = await super()._handle_generating_state(
-            agent_data,
-            sampling_params,
-            ignore_termination=ignore_termination,
+        generation_prompt_ids, generation_images, generation_videos, window_used = (
+            await self._build_web_osgym_generation_inputs(agent_data)
         )
+        with simple_timer("generate_sequences", agent_data.metrics):
+            output: TokenOutput = await self.server_manager.generate(
+                request_id=agent_data.request_id,
+                prompt_ids=generation_prompt_ids,
+                sampling_params=sampling_params,
+                image_data=generation_images,
+                video_data=generation_videos,
+            )
+        if agent_data.metrics.get("num_preempted") is None:
+            agent_data.metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
+        else:
+            agent_data.metrics["num_preempted"] += output.num_preempted if output.num_preempted is not None else 0
+
+        self._merge_generation_extra_fields(agent_data, output.extra_fields)
+
+        agent_data.assistant_turns += 1
+        agent_data.response_ids = output.token_ids
+        agent_data.prompt_ids += agent_data.response_ids
+        agent_data.response_mask += [1] * len(agent_data.response_ids)
+        if output.log_probs:
+            agent_data.response_logprobs += output.log_probs
+
+        if output.routed_experts is not None and not window_used:
+            agent_data.routed_experts = output.routed_experts
+
+        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            next_state = AgentState.TERMINATED
+        elif self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            next_state = AgentState.TERMINATED
+        elif self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            next_state = AgentState.TERMINATED
+        else:
+            active_tools = getattr(agent_data, "_active_tools", self.tools)
+            tools = [tool.tool_schema for tool in active_tools.values()]
+            _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+            next_state = AgentState.PROCESSING_TOOLS if agent_data.tool_calls else AgentState.TERMINATED
+
         if next_state == AgentState.TERMINATED and "web_osgym_reward_score" not in agent_data.extra_fields:
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
         return next_state

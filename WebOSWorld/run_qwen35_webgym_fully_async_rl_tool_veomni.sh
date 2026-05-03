@@ -14,6 +14,7 @@ ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_as
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
+WEB_OSGYM_UNIT_TRACE=1 \
 WEB_OSGYM_TOOL_TRACE_DIR="${ROLLOUT_DATA_DIR}/webgym_tool_trace" \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
@@ -22,7 +23,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.prompt_key=prompt \
     data.truncation=error \
     data.max_prompt_length=2048 \
-    data.max_response_length=16384 \
+    data.max_response_length=128000 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=64 \
     data.train_batch_size=0 \
@@ -44,11 +45,11 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
-    actor_rollout_ref.actor.veomni.param_offload=True \
-    actor_rollout_ref.actor.veomni.optimizer_offload=True \
+    actor_rollout_ref.actor.veomni.param_offload=False \
+    actor_rollout_ref.actor.veomni.optimizer_offload=False \
     actor_rollout_ref.actor.veomni.enable_full_shard=True \
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=2 \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
@@ -81,11 +82,14 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=50 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=50 \
+    actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable=True \
+    actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n=5 \
+    actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample=6 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=32 \
+    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=16 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/reward_fn_webgym_rl.py \
     reward.custom_reward_function.name=compute_score_webgym_rl \
@@ -105,7 +109,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     rollout.total_rollout_steps=51200 \
     trainer.total_epochs=10 \
     async_training.staleness_threshold=0.5 \
-    async_training.trigger_parameter_sync_step=4 \
+    async_training.trigger_parameter_sync_step=2 \
     async_training.require_batches=1 \
     async_training.partial_rollout=True \
     async_training.use_trainer_do_validate=False \

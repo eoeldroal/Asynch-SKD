@@ -164,6 +164,14 @@ class WebOsGymLoopMixin:
         agent_data.extra_fields["web_osgym_reward_fetched"] = True
         agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
         agent_data.extra_fields["web_osgym_reward_score"] = float(reward)
+        reward_extra_info = agent_data.extra_fields.get("reward_extra_info") or {}
+        if not isinstance(reward_extra_info, dict):
+            reward_extra_info = {}
+        agent_data.extra_fields["reward_extra_info"] = {
+            **reward_extra_info,
+            "web_osgym_reward_score": float(reward),
+            "web_osgym_termination_reason": termination_reason,
+        }
 
     async def _release_web_osgym_session(self, agent_data) -> None:
         instance_id = agent_data.extra_fields.get("web_osgym_instance_id")
