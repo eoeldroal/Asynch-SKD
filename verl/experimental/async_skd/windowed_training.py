@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+from verl.experimental.agent_loop.web_osgym_windowing import contiguous_one_spans, normalize_image_spans
 
 
 @dataclass(frozen=True)
@@ -13,44 +14,6 @@ class WindowedSkdConfig:
     enabled: bool = False
     history_n: int = 5
     max_images_per_sample: int | None = 6
-
-
-def contiguous_one_spans(mask: list[int]) -> list[tuple[int, int]]:
-    spans: list[tuple[int, int]] = []
-    start: int | None = None
-    for idx, value in enumerate(mask):
-        if int(value) == 1 and start is None:
-            start = idx
-        elif int(value) != 1 and start is not None:
-            spans.append((start, idx))
-            start = None
-    if start is not None:
-        spans.append((start, len(mask)))
-    return spans
-
-
-def _normalise_image_spans(value: Any) -> list[dict[str, int | bool]]:
-    if value is None:
-        return []
-    if isinstance(value, np.ndarray):
-        value = value.tolist()
-
-    spans = []
-    for item in value:
-        if not isinstance(item, dict):
-            continue
-        image_start = int(item.get("image_start", 0))
-        image_end = int(item.get("image_end", image_start))
-        spans.append(
-            {
-                "step_idx": int(item.get("step_idx", len(spans) + 1)),
-                "image_start": max(0, image_start),
-                "image_end": max(0, image_end),
-                "terminal": bool(item.get("terminal", False)),
-            }
-        )
-    spans.sort(key=lambda item: int(item["step_idx"]))
-    return spans
 
 
 def _slice_multi_modal_data(
@@ -173,7 +136,7 @@ def build_windowed_agent_loop_outputs(
 
     images = list((output.multi_modal_data or {}).get("images") or [])
     image_by_step: dict[int, int] = {}
-    for item in _normalise_image_spans(output.extra_fields.get("mini_step_image_spans")):
+    for item in normalize_image_spans(output.extra_fields.get("mini_step_image_spans")):
         step_idx = int(item["step_idx"])
         image_start = int(item["image_start"])
         image_end = int(item["image_end"])
