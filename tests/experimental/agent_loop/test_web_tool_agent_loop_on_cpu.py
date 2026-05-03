@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 from PIL import Image
@@ -380,5 +381,68 @@ def test_tool_response_budget_exhaustion_fetches_reward_without_committing_obser
         assert agent_data.response_mask == [1]
         assert agent_data.extra_fields["web_osgym_termination_reason"] == "tool_response_budget_exhausted"
         assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+
+    asyncio.run(_run())
+
+
+def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_path):
+    class _FakeImageObservationTool(_FakeWebTool):
+        async def execute(self, instance_id, parameters, **kwargs):
+            self.executed.append((instance_id, parameters, kwargs))
+            return ToolResponse(
+                text="A11Y_TREE:\nbutton",
+                image=[Image.new("RGB", (3, 2), "red")],
+            ), None, {
+                "terminated": False,
+                "termination_reason": None,
+                "action_count": 1,
+            }
+
+    async def _run():
+        monkeypatch.setenv("WEB_OSGYM_TOOL_TRACE_DIR", str(tmp_path))
+        loop = _make_loop()
+        tool = _FakeImageObservationTool()
+        agent_data = _agent_data(tool)
+        agent_data.prompt_ids = [100]
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"CLICK","x":1,"y":2}]}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.GENERATING
+        event_files = list(tmp_path.glob("events_*.jsonl"))
+        assert len(event_files) == 1
+        event = json.loads(event_files[0].read_text().strip())
+        assert event["session_id"] == 777
+        assert event["task_id"] == "12345"
+        assert event["tool_calls"] == [
+            {
+                "name": "computer",
+                "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                "parsed_arguments": {"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]},
+            }
+        ]
+        assert event["actions"] == [{"action_type": "CLICK", "x": 1, "y": 2}]
+        assert event["result"]["terminated"] is False
+        assert event["observation"]["text"] == "A11Y_TREE:\nbutton"
+        assert event["observation"]["images"][0]["width"] == 3
+        assert event["observation"]["images"][0]["height"] == 2
+        image_path = tmp_path / event["observation"]["images"][0]["path"]
+        assert image_path.exists()
 
     asyncio.run(_run())

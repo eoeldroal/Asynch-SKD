@@ -351,6 +351,7 @@ class WebOsGymTool(BaseTool):
                 "action_count": len(actions),
                 "invalid_action": True,
                 "web_osgym_error_type": error_type,
+                "web_osgym_actions": final_actions,
             }
         state["cursor_x"] = cursor_x
         state["cursor_y"] = cursor_y
@@ -395,6 +396,7 @@ class WebOsGymTool(BaseTool):
             "terminated": terminated,
             "termination_reason": termination_reason,
             "action_count": len(actions),
+            "web_osgym_actions": final_actions,
         }
 
     @rollout_trace_op

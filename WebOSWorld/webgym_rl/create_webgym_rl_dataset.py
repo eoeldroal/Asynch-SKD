@@ -62,7 +62,6 @@ def _prompt(task: dict[str, Any]) -> list[dict[str, str]]:
                 "DOUBLE_CLICK, DRAG_TO, SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, HOTKEY, WAIT, DONE, and FAIL. "
                 "CLICK defaults to button='left' and num_clicks=1. CLICK and DOUBLE_CLICK may omit x/y "
                 "only after the cursor position is known; otherwise provide x/y or call MOVE_TO first. "
-                "Use at most 10 action tool calls in one assistant turn."
                 "When the task is complete, call DONE. If it cannot be completed, call FAIL."
             ),
         },

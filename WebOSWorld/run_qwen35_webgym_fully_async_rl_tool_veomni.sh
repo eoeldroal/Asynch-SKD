@@ -9,9 +9,12 @@ cd /home/sogang_nlpy/verl
 # training and rollout dynamics. Only the task-facing pieces are swapped to
 # WebGym: dataset, reward function, WebOSGym tool config, and agent loop.
 
+ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni
+
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
+WEB_OSGYM_TOOL_TRACE_DIR="${ROLLOUT_DATA_DIR}/webgym_tool_trace" \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
     "data.train_files=['/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl/train.parquet']" \
@@ -76,9 +79,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    actor_rollout_ref.rollout.multi_turn.max_user_turns=4 \
-    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=4 \
-    actor_rollout_ref.rollout.multi_turn.max_tool_response_length=1024 \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=50 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=50 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
@@ -95,7 +97,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.test_freq=-1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_fully_async_qwen35_webgym_tool_veomni/qwen35_9b_fully_async_webgym_tool \
-    trainer.rollout_data_dir=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni \
+    "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}" \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=4 \
     rollout.nnodes=1 \

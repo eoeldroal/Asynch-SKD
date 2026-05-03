@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 from copy import deepcopy
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -73,6 +77,107 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             return {"role": "tool", "content": content}
         return {"role": "tool", "content": tool_response_text or ""}
 
+    @staticmethod
+    def _trace_tool_calls(tool_calls) -> list[dict[str, Any]]:
+        traced = []
+        for tool_call in tool_calls:
+            item = {"name": tool_call.name, "arguments": tool_call.arguments}
+            try:
+                item["parsed_arguments"] = json.loads(tool_call.arguments)
+            except (json.JSONDecodeError, TypeError):
+                item["parsed_arguments"] = None
+            traced.append(item)
+        return traced
+
+    def _trace_actions_from_tool_calls(self, agent_data: AgentData) -> list[dict[str, Any]]:
+        actions = []
+        for tool_call in agent_data.tool_calls:
+            try:
+                tool_args = json.loads(tool_call.arguments)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(tool_args, dict):
+                continue
+            if tool_call.name == self.legacy_bundled_tool_name:
+                raw_actions = tool_args.get("actions")
+                if isinstance(raw_actions, list):
+                    actions.extend(action for action in raw_actions if isinstance(action, dict))
+            else:
+                actions.append({"action_type": tool_call.name, **tool_args})
+        return actions
+
+    @staticmethod
+    def _write_trace_image(trace_dir: Path, image: Any, image_name: str) -> dict[str, Any] | None:
+        if image is None or not hasattr(image, "save"):
+            return None
+        image_dir = trace_dir / "images"
+        image_dir.mkdir(parents=True, exist_ok=True)
+        buffer = BytesIO()
+        image.save(buffer, format="PNG")
+        image_bytes = buffer.getvalue()
+        image_path = image_dir / image_name
+        image_path.write_bytes(image_bytes)
+        width, height = getattr(image, "size", (None, None))
+        return {
+            "path": str(image_path.relative_to(trace_dir)),
+            "width": width,
+            "height": height,
+            "sha256": hashlib.sha256(image_bytes).hexdigest(),
+        }
+
+    def _dump_web_osgym_tool_trace(
+        self, agent_data: AgentData, tool_response, result: dict, image_data: list[Any] | None
+    ):
+        trace_dir_value = os.getenv("WEB_OSGYM_TOOL_TRACE_DIR") or agent_data.extra_fields.get(
+            "web_osgym_tool_trace_dir"
+        )
+        if not trace_dir_value:
+            return
+
+        trace_dir = Path(trace_dir_value)
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        pid = os.getpid()
+        session_id = agent_data.extra_fields.get("web_osgym_session_id")
+        image_records = []
+        for image_index, image in enumerate(image_data or []):
+            image_name = (
+                f"{pid}_{session_id}_a{agent_data.assistant_turns:03d}_"
+                f"u{agent_data.user_turns:03d}_{image_index:02d}.png"
+            )
+            record = self._write_trace_image(trace_dir, image, image_name)
+            if record is not None:
+                image_records.append(record)
+
+        actions = result.get("web_osgym_actions") or self._trace_actions_from_tool_calls(agent_data)
+        event = {
+            "pid": pid,
+            "request_id": agent_data.request_id,
+            "session_id": session_id,
+            "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
+            "instance_id": agent_data.extra_fields.get("web_osgym_instance_id"),
+            "assistant_turn": agent_data.assistant_turns,
+            "user_turn": agent_data.user_turns,
+            "tool_call_count": len(agent_data.tool_calls),
+            "tool_calls": self._trace_tool_calls(agent_data.tool_calls),
+            "actions": actions,
+            "result": {
+                "terminated": result.get("terminated"),
+                "termination_reason": result.get("termination_reason"),
+                "invalid_action": bool(result.get("invalid_action")),
+                "action_count": result.get("action_count"),
+                "error_type": result.get("web_osgym_error_type"),
+            },
+            "observation": {
+                "text": tool_response.text,
+                "text_len": len(tool_response.text or ""),
+                "has_image": bool(image_records),
+                "images": image_records,
+            },
+        }
+        event_path = trace_dir / f"events_{pid}.jsonl"
+        with event_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
     async def _init_web_agent_data(self, **kwargs) -> AgentData:
         messages = list(kwargs["raw_prompt"])
         multi_modal_data = await self.process_vision_info(messages)
@@ -133,6 +238,12 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if result.get("invalid_action"):
             agent_data.metrics["web_osgym/invalid_action"] = 1
 
+        image_data = self._normalize_image_data(tool_response.image)
+        try:
+            self._dump_web_osgym_tool_trace(agent_data, tool_response, result, image_data)
+        except Exception:
+            logger.warning("Failed to dump Web/OSGym tool trace", exc_info=True)
+
         if result.get("terminated"):
             await self._finalize_with_web_osgym_reward(
                 agent_data,
@@ -140,7 +251,6 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             )
             return AgentState.TERMINATED
 
-        image_data = self._normalize_image_data(tool_response.image)
         student_obs = self._split_env_observation(tool_response.text, image_data)
 
         if not student_obs and not image_data:
