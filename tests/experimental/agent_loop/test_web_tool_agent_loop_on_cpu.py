@@ -350,6 +350,8 @@ def test_windowed_generation_uses_harness_prompt_window():
         assert agent_data.metrics["web_osgym/window_active"] == 1
         assert agent_data.metrics["web_osgym/window_step_count"] == 1
         assert agent_data.metrics["web_osgym/window_image_count"] == 1
+        assert agent_data.extra_fields["web_osgym_generation_windows"][0]["image_indices"] == [1]
+        assert agent_data.extra_fields["web_osgym_generation_windows"][0]["selected_step_indices"] == [2]
 
     asyncio.run(_run())
 

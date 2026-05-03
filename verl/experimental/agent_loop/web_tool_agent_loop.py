@@ -254,9 +254,8 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         agent_data.metrics["web_osgym/window_active"] = 1
         agent_data.metrics["web_osgym/window_step_count"] = len(prompt_window.selected_steps)
         agent_data.metrics["web_osgym/window_image_count"] = len(prompt_window.images)
-        image_indices = []
-        for step in prompt_window.selected_steps:
-            image_indices.extend(range(int(step.get("image_start", 0)), int(step.get("image_end", 0))))
+        current_step = prompt_window.selected_steps[-1]
+        image_indices = list(range(int(current_step.get("image_start", 0)), int(current_step.get("image_end", 0))))
         return _WebOsGymGenerationInput(
             prompt_ids,
             prompt_window.images,
