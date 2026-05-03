@@ -727,6 +727,7 @@ def test_finalize_output_records_rollout_backprop_unit_trace():
         "window_history_n": 5,
         "window_max_images_per_sample": 6,
         "window_fallback_count": 0,
+        "generation_window_count": 0,
         "step_count": 1,
         "image_span_count": 1,
     }

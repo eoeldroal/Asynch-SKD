@@ -395,10 +395,10 @@ Current RL comparison:
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n`
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample`
 - The active WebGym fully async RL launcher enables windowed generation with `history_n=5` and `max_images_per_sample=6`.
-- Actor update still consumes the full `AgentLoopOutput` trajectory. This is a deliberate intermediate state for testing benchmark-like rollout behavior before converting completed trajectories into update-time window rows.
+- Actor update now also consumes WebOSGym window rows when `web_osgym_window_enable=True`: each assistant generation records the exact prompt/image slice used at rollout time, and the completed trajectory is expanded into one training row per assistant generation before `_agent_loop_postprocess()`.
 - Do not add a tool-call count cap or `1000x1000` coordinate promise in this prompt pass. The former was a superseded mitigation, and the latter should wait until coordinates are normalized end to end.
 
-In this intermediate RL mode, `max_model_len` and `max_num_batched_tokens` bound the model-facing windowed generation request, while `data.max_response_length` remains the full trajectory output cap used for storage, reward placement, logprob/update tensors, and termination if the trajectory grows too long. A large `data.max_response_length` does not by itself make the model read the full trajectory once windowed generation is active, but it can still increase actor update memory and long-tail trajectory cost.
+In this RL mode, `max_model_len` and `max_num_batched_tokens` bound the model-facing windowed generation request. `data.max_response_length` remains the full trajectory rollout cap and termination budget, but WebOSGym window rows are padded to the maximum target response length in the emitted mini-row batch rather than blindly to the full trajectory cap. A large `data.max_response_length` therefore allows long trajectories without making every update row pay the same padding cost.
 
 For a target mini-step `i`, the windowed student message order should be:
 

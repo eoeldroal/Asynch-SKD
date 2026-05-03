@@ -524,20 +524,17 @@ Implemented:
   - `web_osgym_window_max_images_per_sample`
 - `WebOsGymToolAgentLoop` now uses the prompt-window builder during generation when `web_osgym_window_enable=True`.
 - The active WebGym fully async RL launcher enables this path with `history_n=5` and `max_images_per_sample=6`.
-- The rollout trace now reports whether the model-facing prompt was `windowed_prompt` or `full_accumulated_prompt`, plus the window settings and fallback count.
+- The rollout trace now reports whether the model-facing prompt was `windowed_prompt` or `full_accumulated_prompt`, plus the window settings, fallback count, and recorded generation-window count.
 - WebOSGym reward finalization now also writes `web_osgym_reward_score` and `web_osgym_termination_reason` into `reward_extra_info`, so trainer rollout dumps can show whether a sample ended by `model_done`, `model_fail`, `system_stop`, or `tool_response_budget_exhausted`.
 
-Important boundary:
+Updated boundary:
 
-- Runtime rollout generation is now windowed when the config flag is enabled.
-- Update/backprop is still the full `AgentLoopOutput` trajectory. This is intentionally visible in `web_osgym_unit_trace` as:
+- Runtime rollout generation is windowed when the config flag is enabled.
+- Update/backprop now uses the same generation-window boundary. Each assistant generation records its exact prompt ids and selected image indices, then the completed trajectory is expanded into one `AgentLoopOutput` row per assistant generation before postprocess. This is visible in `web_osgym_unit_trace` as:
   - `rollout_context=windowed_prompt`
-  - `backprop_context=full_agent_loop_output`
-- This is useful for testing benchmark-like rollout behavior immediately, but it is not the final harness-aligned training boundary.
-- `data.max_response_length` remains the full trajectory output cap. With windowed rollout it no longer directly controls the per-step model context; that role is mostly handled by `max_model_len`, `max_num_batched_tokens`, `web_osgym_window_history_n`, and `web_osgym_window_max_images_per_sample`.
+  - `backprop_context=windowed_generation_rows`
+- `data.max_response_length` remains the full trajectory output cap. With windowed rollout/update it no longer directly controls the per-step model context or mini-row padding width; those are handled by `max_model_len`, `max_num_batched_tokens`, `web_osgym_window_history_n`, `web_osgym_window_max_images_per_sample`, and the maximum target response length among emitted window rows.
 
-Next implementation step:
+Remaining follow-up:
 
-- Store per-assistant-turn generation views or emit windowed `AgentLoopOutput` rows so rollout and update use the same prompt/image context.
-- Convert completed trajectories into update-time window rows so rollout and backprop use the same prompt/image context.
 - Keep termination-reason fields in rollout dumps while tuning `max_response_length`, turn caps, and server/session release behavior.

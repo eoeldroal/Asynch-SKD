@@ -776,15 +776,94 @@ class AgentLoopWorker:
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(
                 asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                    self._run_raw_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        raw_outputs = await asyncio.gather(*tasks)
+
+        outputs: list[AgentLoopOutput] = []
+        source_indices: list[int] = []
+        window_metrics: list[dict[str, float]] = []
+        for source_idx, raw_output in enumerate(raw_outputs):
+            windowed_outputs, metrics = self._maybe_window_web_osgym_outputs(raw_output)
+            outputs.extend(windowed_outputs)
+            source_indices.extend([source_idx] * len(windowed_outputs))
+            if metrics:
+                window_metrics.append(metrics)
+
+        expanded_non_tensor_batch = self._expand_input_non_tensor_batch(batch.non_tensor_batch, source_indices)
+        has_window_rows = any(output.extra_fields.get("web_osgym_window_row") for output in outputs)
+        prompt_length_override = int(self.rollout_config.prompt_length)
+        if has_window_rows:
+            prompt_length_override = max(
+                prompt_length_override,
+                max((len(output.prompt_ids) for output in outputs), default=0),
+            )
+        response_length_override = None
+        if has_window_rows:
+            response_length_override = max(1, max((len(output.response_ids) for output in outputs), default=0))
+
+        postprocess_tasks = []
+        validate = batch.meta_info.get("validate", False)
+        for output_item, source_idx in zip(outputs, source_indices, strict=True):
+            kwargs = {key: value[source_idx] for key, value in batch.non_tensor_batch.items()}
+            if prompt_length_override:
+                kwargs["_prompt_length_override"] = prompt_length_override
+            if response_length_override is not None:
+                kwargs["_response_length_override"] = response_length_override
+            postprocess_tasks.append(asyncio.create_task(self._agent_loop_postprocess(output_item, validate, **kwargs)))
+        internal_outputs = await asyncio.gather(*postprocess_tasks)
 
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            internal_outputs,
+            input_non_tensor_batch=expanded_non_tensor_batch,
+            validate=validate,
         )
+        if window_metrics and output.meta_info.get("metrics"):
+            output.meta_info["metrics"][0].update(self._merge_window_metric_dicts(window_metrics))
         return output
+
+    @staticmethod
+    def _expand_input_non_tensor_batch(
+        input_non_tensor_batch: dict[str, np.ndarray],
+        source_indices: list[int],
+    ) -> dict[str, np.ndarray]:
+        expanded: dict[str, np.ndarray] = {}
+        for key, value in input_non_tensor_batch.items():
+            arr = np.empty(len(source_indices), dtype=object)
+            arr[:] = [value[source_idx] for source_idx in source_indices]
+            expanded[key] = arr
+        return expanded
+
+    @staticmethod
+    def _merge_window_metric_dicts(metric_dicts: list[dict[str, float]]) -> dict[str, float]:
+        if not metric_dicts:
+            return {}
+        merged: dict[str, float] = {}
+        for key in metric_dicts[0]:
+            values = [metrics[key] for metrics in metric_dicts if key in metrics]
+            if key.endswith("_max_target_tokens") or key.endswith("_max_images") or key.endswith("_max_prompt_tokens"):
+                merged[key] = float(max(values))
+            elif key.endswith("_num_samples"):
+                merged[key] = float(sum(values))
+            else:
+                merged[key] = float(np.mean(values))
+        return merged
+
+    def _web_osgym_window_update_enabled(self) -> bool:
+        multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
+        return bool(getattr(multi_turn, "web_osgym_window_enable", False))
+
+    def _maybe_window_web_osgym_outputs(
+        self,
+        output: AgentLoopOutput,
+    ) -> tuple[list[AgentLoopOutput], dict[str, float]]:
+        from verl.experimental.agent_loop.web_osgym_windowed_output import build_web_osgym_windowed_agent_loop_outputs
+
+        return build_web_osgym_windowed_agent_loop_outputs(
+            output,
+            enabled=self._web_osgym_window_update_enabled(),
+        )
 
     async def _run_agent_loop(
         self,
@@ -795,6 +874,24 @@ class AgentLoopWorker:
         trace: bool = True,
         **kwargs,
     ) -> _InternalAgentLoopOutput:
+        output = await self._run_raw_agent_loop(
+            sampling_params,
+            trajectory,
+            agent_name=agent_name,
+            trace=trace,
+            **kwargs,
+        )
+        return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+
+    async def _run_raw_agent_loop(
+        self,
+        sampling_params: dict[str, Any],
+        trajectory: dict[str, Any],
+        *,
+        agent_name: str,
+        trace: bool = True,
+        **kwargs,
+    ) -> AgentLoopOutput:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -818,8 +915,7 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, trajectory["validate"], **kwargs)
+            return await agent_loop.run(sampling_params, **kwargs)
 
     def _get_or_create_agent_loop(self, agent_name: str) -> AgentLoopBase:
         assert agent_name in _agent_loop_registry, (
@@ -841,6 +937,7 @@ class AgentLoopWorker:
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         prompt_length = int(kwargs.pop("_prompt_length_override", self.rollout_config.prompt_length))
+        response_length = int(kwargs.pop("_response_length_override", self.rollout_config.response_length))
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
         # Some AgentLoop may have already computed the reward score, e.g SWE-agent.
@@ -880,7 +977,7 @@ class AgentLoopWorker:
         response_output = self.tokenizer.pad(
             {"input_ids": output.response_ids},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -891,7 +988,7 @@ class AgentLoopWorker:
         response_mask_output = self.tokenizer.pad(
             {"input_ids": output.response_mask},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -900,7 +997,7 @@ class AgentLoopWorker:
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            pad_size = response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
