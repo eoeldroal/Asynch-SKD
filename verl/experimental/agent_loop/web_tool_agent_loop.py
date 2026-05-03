@@ -32,6 +32,10 @@ class _WebOsGymGenerationInput:
     window_used: bool
     image_indices: list[int]
     selected_step_indices: list[int]
+    old_summary_turn_indices: list[int]
+    recent_observation_step_indices: list[int]
+    recent_assistant_turn_indices: list[int]
+    text_only_recent_step_count: int
 
 
 @register("web_tool_agent")
@@ -98,12 +102,16 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         phase: str,
         image_start: int,
         image_end: int,
-        text_len: int,
+        text: str | None = None,
+        text_len: int | None = None,
         terminal: bool,
         termination_reason: str | None,
         actions: list[dict[str, Any]] | None,
     ) -> None:
         normalized_actions = [dict(action) for action in (actions or []) if isinstance(action, dict)]
+        step_text = str(text or "")
+        if text_len is None:
+            text_len = len(step_text)
         steps = list(agent_data.extra_fields.get("web_osgym_steps") or [])
         steps.append(
             {
@@ -111,6 +119,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 "assistant_turn": int(agent_data.assistant_turns),
                 "user_turn": int(agent_data.user_turns),
                 "phase": phase,
+                "text": step_text,
                 "text_len": int(text_len),
                 "action_names": [
                     str(action_name)
@@ -129,11 +138,35 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         agent_data.extra_fields["web_osgym_steps"] = steps
         agent_data.extra_fields["mini_step_image_spans"] = build_mini_step_image_spans(steps)
 
+    def _record_web_osgym_assistant_turn(
+        self,
+        agent_data: AgentData,
+        *,
+        observation_step_idx: int,
+        response_start: int,
+        response_end: int,
+        response_text: str,
+        actions: list[dict[str, Any]],
+    ) -> None:
+        turns = list(agent_data.extra_fields.get("web_osgym_assistant_turns") or [])
+        turns.append(
+            {
+                "assistant_turn": len(turns) + 1,
+                "observation_step_idx": int(observation_step_idx),
+                "response_start": int(response_start),
+                "response_end": int(response_end),
+                "response_text": response_text,
+                "actions": [dict(action) for action in actions if isinstance(action, dict)],
+            }
+        )
+        agent_data.extra_fields["web_osgym_assistant_turns"] = turns
+
     def _record_web_osgym_unit_trace(self, agent_data: AgentData) -> None:
         steps = list(agent_data.extra_fields.get("web_osgym_steps") or [])
         image_spans = list(agent_data.extra_fields.get("mini_step_image_spans") or [])
         window_enabled = self._web_osgym_window_enabled()
         generation_windows = list(agent_data.extra_fields.get("web_osgym_generation_windows") or [])
+        latest_window = generation_windows[-1] if generation_windows else {}
         unit_trace = {
             "rollout_context": "windowed_prompt" if window_enabled else "full_accumulated_prompt",
             "backprop_context": "windowed_generation_rows" if window_enabled else "full_agent_loop_output",
@@ -144,6 +177,11 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             "generation_window_count": len(generation_windows),
             "step_count": len(steps),
             "image_span_count": len(image_spans),
+            "window_old_summary_turn_count": len(latest_window.get("old_summary_turn_indices") or []),
+            "window_recent_observation_step_count": len(latest_window.get("recent_observation_step_indices") or []),
+            "window_recent_assistant_turn_count": len(latest_window.get("recent_assistant_turn_indices") or []),
+            "window_text_only_recent_step_count": int(latest_window.get("text_only_recent_step_count", 0)),
+            "window_prompt_image_count": len(latest_window.get("prompt_image_indices") or []),
         }
         agent_data.extra_fields["web_osgym_unit_trace"] = unit_trace
         agent_data.metrics["web_osgym/step_count"] = len(steps)
@@ -207,6 +245,10 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 False,
                 list(range(image_count)),
                 [],
+                [],
+                [],
+                [],
+                0,
             )
 
         steps = agent_data.extra_fields.get("web_osgym_steps") or []
@@ -219,6 +261,10 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 False,
                 list(range(image_count)),
                 [],
+                [],
+                [],
+                [],
+                0,
             )
 
         try:
@@ -226,6 +272,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 base_messages=getattr(agent_data, "_web_osgym_base_messages", agent_data.messages),
                 images=agent_data.image_data,
                 steps=steps,
+                assistant_turns=agent_data.extra_fields.get("web_osgym_assistant_turns"),
                 history_n=self._web_osgym_window_history_n(),
                 max_images_per_sample=self._web_osgym_window_max_images_per_sample(),
             )
@@ -242,6 +289,10 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 False,
                 list(range(image_count)),
                 [],
+                [],
+                [],
+                [],
+                0,
             )
 
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
@@ -254,15 +305,27 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         agent_data.metrics["web_osgym/window_active"] = 1
         agent_data.metrics["web_osgym/window_step_count"] = len(prompt_window.selected_steps)
         agent_data.metrics["web_osgym/window_image_count"] = len(prompt_window.images)
-        current_step = prompt_window.selected_steps[-1]
-        image_indices = list(range(int(current_step.get("image_start", 0)), int(current_step.get("image_end", 0))))
+        agent_data.metrics["web_osgym/window_old_summary_turn_count"] = len(prompt_window.old_summary_turn_indices)
+        agent_data.metrics["web_osgym/window_recent_observation_step_count"] = len(
+            prompt_window.recent_observation_step_indices
+        )
+        agent_data.metrics["web_osgym/window_recent_assistant_turn_count"] = len(
+            prompt_window.recent_assistant_turn_indices
+        )
+        agent_data.metrics["web_osgym/window_text_only_recent_step_count"] = (
+            prompt_window.text_only_recent_step_count
+        )
         return _WebOsGymGenerationInput(
             prompt_ids,
             prompt_window.images,
             None,
             True,
-            image_indices,
+            prompt_window.image_indices,
             [int(step.get("step_idx", 0)) for step in prompt_window.selected_steps],
+            list(prompt_window.old_summary_turn_indices),
+            list(prompt_window.recent_observation_step_indices),
+            list(prompt_window.recent_assistant_turn_indices),
+            int(prompt_window.text_only_recent_step_count),
         )
 
     def _record_web_osgym_generation_window(
@@ -285,12 +348,23 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 "prompt_token_count": len(generation_inputs.prompt_ids),
                 "window_used": bool(generation_inputs.window_used),
                 "image_indices": list(generation_inputs.image_indices),
+                "prompt_image_indices": list(generation_inputs.image_indices),
                 "selected_step_indices": list(generation_inputs.selected_step_indices),
+                "old_summary_turn_indices": list(generation_inputs.old_summary_turn_indices),
+                "recent_observation_step_indices": list(generation_inputs.recent_observation_step_indices),
+                "recent_assistant_turn_indices": list(generation_inputs.recent_assistant_turn_indices),
+                "text_only_recent_step_count": int(generation_inputs.text_only_recent_step_count),
                 "history_n": self._web_osgym_window_history_n(),
                 "max_images_per_sample": self._web_osgym_window_max_images_per_sample(),
             }
         )
         agent_data.extra_fields["web_osgym_generation_windows"] = windows
+
+    def _decode_response_text(self, token_ids: list[int]) -> str:
+        decode = getattr(self.tokenizer, "decode", None)
+        if callable(decode):
+            return str(decode(token_ids, skip_special_tokens=False))
+        return ""
 
     @staticmethod
     def _write_trace_image(trace_dir: Path, image: Any, image_name: str) -> dict[str, Any] | None:
@@ -352,6 +426,13 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 "invalid_action": bool(result.get("invalid_action")),
                 "action_count": result.get("action_count"),
                 "error_type": result.get("web_osgym_error_type"),
+            },
+            "prompt_window": {
+                "prompt_image_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("prompt_image_indices") or []),
+                "old_summary_turn_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("old_summary_turn_indices") or []),
+                "recent_observation_step_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("recent_observation_step_indices") or []),
+                "recent_assistant_turn_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("recent_assistant_turn_indices") or []),
+                "text_only_recent_step_count": int((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("text_only_recent_step_count", 0)),
             },
             "observation": {
                 "text": tool_response.text,
@@ -423,6 +504,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 phase="initial",
                 image_start=image_start,
                 image_end=image_end,
+                text=student_obs,
                 text_len=len(student_obs or ""),
                 terminal=False,
                 termination_reason=None,
@@ -482,6 +564,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             phase="tool_observation",
             image_start=image_start,
             image_end=image_end,
+            text=student_obs,
             text_len=len(student_obs or ""),
             terminal=False,
             termination_reason=None,
@@ -546,6 +629,15 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             active_tools = getattr(agent_data, "_active_tools", self.tools)
             tools = [tool.tool_schema for tool in active_tools.values()]
             _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+            latest_step_idx = int((agent_data.extra_fields.get("web_osgym_steps") or [{}])[-1].get("step_idx", 0))
+            self._record_web_osgym_assistant_turn(
+                agent_data,
+                observation_step_idx=latest_step_idx,
+                response_start=response_start,
+                response_end=len(agent_data.response_mask),
+                response_text=self._decode_response_text(agent_data.response_ids),
+                actions=self._trace_actions_from_tool_calls(agent_data),
+            )
             next_state = AgentState.PROCESSING_TOOLS if agent_data.tool_calls else AgentState.TERMINATED
 
         if next_state == AgentState.TERMINATED and "web_osgym_reward_score" not in agent_data.extra_fields:
