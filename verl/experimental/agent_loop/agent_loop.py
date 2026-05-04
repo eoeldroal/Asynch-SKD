@@ -545,6 +545,11 @@ class AgentLoopBase(ABC):
                 ),
             )
 
+            if images is not None and len(images) == 0:
+                images = None
+            if videos is not None and len(videos) == 0:
+                videos = None
+
             # split the videos and according metadatas
             if videos is not None:
                 videos, video_metadatas = zip(*videos, strict=False)
@@ -1094,6 +1099,10 @@ class AgentLoopWorker:
 
         images = output.multi_modal_data.get("images")
         videos = output.multi_modal_data.get("videos")
+        if images is not None and len(images) == 0:
+            images = None
+        if videos is not None and len(videos) == 0:
+            videos = None
         # split the videos and according metadatas
         if videos is not None:
             videos, video_metadatas = zip(*videos, strict=False)
