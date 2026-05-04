@@ -70,9 +70,30 @@ def _extract_latest_user_instruction(base_messages: Any) -> str:
     return ""
 
 
-def _build_prompt_text(instruction: str, previous_actions: str) -> str:
+def _infer_latest_image_resolution(images: Sequence[Any]) -> tuple[int, int] | None:
+    for image in reversed(images):
+        size = getattr(image, "size", None)
+        if not isinstance(size, tuple) or len(size) != 2:
+            continue
+        width, height = size
+        if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
+            return width, height
+    return None
+
+
+def _coordinate_guidance(images: Sequence[Any]) -> str:
+    guidance = ["All action coordinates use raw screen pixels."]
+    resolution = _infer_latest_image_resolution(images)
+    if resolution is not None:
+        width, height = resolution
+        guidance.append(f"Current screenshot resolution: {width}x{height}.")
+    return " ".join(guidance)
+
+
+def _build_prompt_text(instruction: str, previous_actions: str, prompt_images: Sequence[Any]) -> str:
     return (
-        "Please generate the next move according to the UI screenshot, instruction and previous actions.\n\n"
+        "Please generate the next move according to the UI screenshot, instruction and previous actions.\n"
+        f"{_coordinate_guidance(prompt_images)}\n\n"
         f"Instruction: {instruction}\n\n"
         f"Previous actions:\n{previous_actions}"
     )
@@ -165,21 +186,27 @@ def build_web_osgym_prompt_window(
         if isinstance(message, Mapping) and message.get("role") == "system"
     ]
     instruction = _extract_latest_user_instruction(base_messages)
-    instruction_prompt = _build_prompt_text(instruction, format_previous_actions(old_turns))
 
     image_list = _coerce_list(images)
     prompt_images: list[Any] = []
     prompt_image_indices: list[int] = []
-    messages: list[dict[str, Any]] = list(system_messages)
     text_only_recent_step_count = 0
-
-    for step_index, step in enumerate(selected_steps):
+    for step in selected_steps:
         image_start = int(step["image_start"])
         image_end = int(step["image_end"])
         step_image_indices = list(range(image_start, image_end))
         step_images = [image_list[idx] for idx in step_image_indices]
         prompt_images.extend(step_images)
         prompt_image_indices.extend(step_image_indices)
+
+    instruction_prompt = _build_prompt_text(instruction, format_previous_actions(old_turns), prompt_images)
+    messages: list[dict[str, Any]] = list(system_messages)
+
+    for step_index, step in enumerate(selected_steps):
+        image_start = int(step["image_start"])
+        image_end = int(step["image_end"])
+        step_image_indices = list(range(image_start, image_end))
+        step_images = [image_list[idx] for idx in step_image_indices]
 
         step_text = _step_observation_text(step)
         if not step_images and step_text is None:

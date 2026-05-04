@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+from PIL import Image
 
 from verl.experimental.agent_loop.web_osgym_rl_prompt_window import build_web_osgym_prompt_window
 
@@ -89,7 +90,7 @@ def test_build_web_osgym_prompt_window_emits_live_recent_user_assistant_chain():
                 {"type": "image"},
                 {
                     "type": "text",
-                    "text": "Please generate the next move according to the UI screenshot, instruction and previous actions.\n\nInstruction: Open settings\n\nPrevious actions:\nNone",
+                    "text": "Please generate the next move according to the UI screenshot, instruction and previous actions.\nAll action coordinates use raw screen pixels.\n\nInstruction: Open settings\n\nPrevious actions:\nNone",
                 },
             ],
         },
@@ -242,3 +243,27 @@ def test_build_web_osgym_prompt_window_raises_when_selected_step_has_no_content(
                 }
             ],
         )
+
+
+def test_build_web_osgym_prompt_window_includes_raw_pixel_coordinate_guidance_without_resolution():
+    prompt_window = build_web_osgym_prompt_window(
+        base_messages=[{"role": "user", "content": "Open settings"}],
+        images=["obs-1"],
+        steps=[{"step_idx": 1, "phase": "initial", "image_start": 0, "image_end": 1}],
+        assistant_turns=[],
+    )
+
+    first_text = prompt_window.messages[0]["content"][-1]["text"]
+    assert "All action coordinates use raw screen pixels." in first_text
+
+
+def test_build_web_osgym_prompt_window_includes_current_resolution_when_available():
+    prompt_window = build_web_osgym_prompt_window(
+        base_messages=[{"role": "user", "content": "Open settings"}],
+        images=[Image.new("RGB", (1920, 1080), "white")],
+        steps=[{"step_idx": 1, "phase": "initial", "image_start": 0, "image_end": 1}],
+        assistant_turns=[],
+    )
+
+    first_text = prompt_window.messages[0]["content"][-1]["text"]
+    assert "Current screenshot resolution: 1920x1080." in first_text
