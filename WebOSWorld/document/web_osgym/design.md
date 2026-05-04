@@ -377,6 +377,23 @@ Tool config:
 
 - `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
 
+Prompt files:
+
+- `WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt`
+  - common browser-control prompt used by the student runtime
+- `WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt`
+  - teacher-only additive guidance
+  - SKD teacher messages are built as `student messages + teacher-only system guidance`, not as an independent prompt tree
+
+Launcher prompt arguments:
+
+- `WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni.sh`
+  - positional arg 1: common system prompt txt path
+  - positional arg 2: teacher-only system prompt txt path
+- `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+  - positional arg 1: common system prompt txt path
+  - positional arg 2: accepted for interface symmetry, but unused because fully async RL has no teacher path
+
 ## 20. One-line Summary
 
 Web / OS Gym integration은 `tool_agent`/`skd_agent` 위에 stateful remote environment session을 얹고, screenshot/a11y observation과 final environment reward를 기존 rollout/training path로 전달하는 구조다. SKD 경로는 `web_skd_agent`, 순수 fully async RL 경로는 `web_tool_agent`를 사용하며, async SKD scheduler와 windowed training은 이 Web observation contract를 깨지 않는 범위에서만 sample scheduling과 actor context를 제한한다.

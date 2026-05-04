@@ -10,6 +10,16 @@ cd /home/sogang_nlpy/verl
 # WebGym: dataset, reward function, WebOSGym tool config, and agent loop.
 
 ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni
+WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
+# Accepted for interface symmetry with the SKD launcher; fully async RL does
+# not instantiate a teacher and therefore ignores the teacher-only prompt file.
+WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
+if [ "$#" -ge 1 ]; then
+    shift
+fi
+if [ "$#" -ge 1 ]; then
+    shift
+fi
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -86,7 +96,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n=5 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample=6 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
-    actor_rollout_ref.rollout.multi_turn.system_prompt_path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt \
+    "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \

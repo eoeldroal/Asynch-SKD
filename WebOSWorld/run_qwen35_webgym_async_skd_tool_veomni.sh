@@ -7,6 +7,15 @@ cd /home/sogang_nlpy/verl
 # The decisive stall fix was upgrading cuDNN from 9.10.2 to 9.15.1.9 in the
 # cloned training env; the settings below are the matched runtime profile that
 # was validated after the actor-side multimodal forward stall cleared.
+WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
+WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
+if [ "$#" -ge 1 ]; then
+    shift
+fi
+if [ "$#" -ge 1 ]; then
+    shift
+fi
+
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 VERL_ASYNC_SKD_SLOW_LOOP_MS=10 \
@@ -56,7 +65,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.skd.chunk_size=64 \
     distillation.skd.verify_top_k=2 \
     distillation.skd.max_chunks_per_sample=16 \
-    distillation.skd.teacher_system_prompt_path=null \
+    "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=True \
     distillation.skd.window_history_n=3 \
     distillation.skd.window_max_images_per_sample=4 \
@@ -92,7 +101,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=50 \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=50 \
     actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
-    actor_rollout_ref.rollout.multi_turn.system_prompt_path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt \
+    "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
