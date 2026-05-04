@@ -53,20 +53,7 @@ def select_tasks(
 
 def _prompt(task: dict[str, Any]) -> list[dict[str, str]]:
     instruction = str(task["task_name"])
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are controlling a browser environment. Use the available action tools to interact "
-                "with the page. Supported actions are MOVE_TO, CLICK, MOUSE_DOWN, MOUSE_UP, RIGHT_CLICK, "
-                "DOUBLE_CLICK, DRAG_TO, SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, HOTKEY, WAIT, DONE, and FAIL. "
-                "CLICK defaults to button='left' and num_clicks=1. CLICK and DOUBLE_CLICK may omit x/y "
-                "only after the cursor position is known; otherwise provide x/y or call MOVE_TO first. "
-                "When the task is complete, call DONE. If it cannot be completed, call FAIL."
-            ),
-        },
-        {"role": "user", "content": instruction},
-    ]
+    return [{"role": "user", "content": instruction}]
 
 
 def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> dict[str, Any]:

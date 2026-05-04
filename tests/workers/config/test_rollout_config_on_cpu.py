@@ -40,6 +40,7 @@ def test_rollout_config_accepts_web_osgym_window_fields_from_hydra_overrides():
                 "web_osgym_window_enable": True,
                 "web_osgym_window_history_n": 3,
                 "web_osgym_window_max_images_per_sample": 4,
+                "system_prompt_path": "/tmp/webgym_system_prompt.txt",
             },
         }
     )
@@ -49,3 +50,4 @@ def test_rollout_config_accepts_web_osgym_window_fields_from_hydra_overrides():
     assert rollout_cfg.multi_turn.web_osgym_window_enable is True
     assert rollout_cfg.multi_turn.web_osgym_window_history_n == 3
     assert rollout_cfg.multi_turn.web_osgym_window_max_images_per_sample == 4
+    assert rollout_cfg.multi_turn.system_prompt_path == "/tmp/webgym_system_prompt.txt"

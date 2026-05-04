@@ -209,6 +209,10 @@ multi_turn:
   # Number of repeat rollouts for each sample
   num_repeat_rollouts: null
 
+  # Optional runtime system prompt file for raw-chat rollout datasets. When set,
+  # dataset-side system messages are replaced with this prompt during preprocessing.
+  system_prompt_path: null
+
   # Web/OSGym prompt window controls. These are exposed for RL rollout
   # experiments; the default keeps the historical full accumulated prompt path.
   web_osgym_window_enable: False

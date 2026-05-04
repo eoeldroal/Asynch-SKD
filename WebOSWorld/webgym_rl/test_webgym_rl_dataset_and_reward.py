@@ -17,7 +17,7 @@ def test_build_rows_uses_real_webgym_task_ids_and_prompts():
     assert rows[0]["extra_info"]["tools_kwargs"]["web_osgym"]["create_kwargs"] == {
         "task_id": "form"
     }
-    assert rows[0]["prompt"][1]["content"] == "Fill the form."
+    assert rows[0]["prompt"] == [{"role": "user", "content": "Fill the form."}]
 
 
 def test_compute_score_webgym_rl_prefers_environment_reward():

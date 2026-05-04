@@ -21,6 +21,7 @@ import re
 import traceback
 from collections import defaultdict
 from io import BytesIO
+from pathlib import Path
 from typing import Optional
 
 import datasets
@@ -116,6 +117,8 @@ class RLHFDataset(Dataset):
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
 
         self.tool_config_path = config.get("tool_config_path", None)
+        self.system_prompt_path = config.get("system_prompt_path", None)
+        self.runtime_system_prompt = self._load_runtime_system_prompt()
         self.tool_schemas = None
         if self.tool_config_path:
             try:
@@ -146,6 +149,13 @@ class RLHFDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+
+    def _load_runtime_system_prompt(self) -> str | None:
+        if not self.system_prompt_path:
+            return None
+        prompt_path = Path(self.system_prompt_path).expanduser()
+        prompt_text = prompt_path.read_text(encoding="utf-8").strip()
+        return prompt_text or None
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
@@ -315,7 +325,19 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[key]
+        messages = copy.deepcopy(example[key])
+        if not isinstance(messages, list):
+            messages = list(messages)
+
+        runtime_system_prompt = getattr(self, "runtime_system_prompt", None)
+        if runtime_system_prompt:
+            messages = [
+                message
+                for message in messages
+                if not (isinstance(message, dict) and message.get("role") == "system")
+            ]
+            messages.insert(0, {"role": "system", "content": runtime_system_prompt})
+
         # When concatenating image and video datasets, get will return None for image or video sample
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
