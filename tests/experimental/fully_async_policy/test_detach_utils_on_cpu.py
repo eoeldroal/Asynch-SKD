@@ -14,6 +14,23 @@ class _FakeTokenizer:
     pad_token_id = 0
 
 
+class _FakeTrainerBalance:
+    def __init__(self, dp_size: int):
+        self.dp_size = dp_size
+        self.actor_rollout_wg = object()
+        self.seen_lengths: list[int] = []
+
+    def _get_dp_size(self, worker_group, role: str) -> int:
+        assert worker_group is self.actor_rollout_wg
+        assert role == "actor"
+        return self.dp_size
+
+    def __call__(self, batch: DataProto, metrics) -> None:
+        del metrics
+        self.seen_lengths.append(len(batch))
+        assert len(batch) % self.dp_size == 0
+
+
 def _make_rollout_sample(
     *,
     sample_id: str,
@@ -47,6 +64,8 @@ def _make_rollout_sample(
         non_tensors={
             "min_global_steps": np.array([0], dtype=np.int64),
             "max_global_steps": np.array([0], dtype=np.int64),
+            "uid": np.array([sample_id], dtype=object),
+            "index": np.array([0], dtype=object),
         },
         meta_info={
             "metrics": [
@@ -122,3 +141,26 @@ def test_assemble_batch_from_rollout_samples_repad_optional_seq_tensors():
     assert torch.all(batch.batch["teacher_logprobs"][1, -1] == 0)
     assert torch.all(batch.batch["routed_experts"][1, :2] == 0)
     assert torch.all(batch.batch["routed_experts"][1, -1] == 0)
+
+
+def test_assemble_batch_from_rollout_samples_pads_to_actor_dp_multiple_before_balance():
+    balance = _FakeTrainerBalance(dp_size=2)
+
+    batch = assemble_batch_from_rollout_samples(
+        [
+            _make_rollout_sample(sample_id="s1", prompt_ids=[1, 2, 3], response_ids=[11, 12]),
+            _make_rollout_sample(sample_id="s2", prompt_ids=[4, 5, 6], response_ids=[21, 22]),
+            _make_rollout_sample(sample_id="s3", prompt_ids=[7, 8, 9], response_ids=[31, 32]),
+        ],
+        tokenizer=_FakeTokenizer(),
+        config=None,
+        balance_batch=balance.__call__,
+    )
+
+    assert balance.seen_lengths == [4]
+    assert len(batch) == 4
+    assert batch.non_tensor_batch["uid"][-1].startswith("fully_async_pad_")
+    assert batch.non_tensor_batch["index"][-1] == -1
+    assert torch.all(batch.batch["response_mask"][-1] == 0)
+    assert torch.all(batch.batch["rm_scores"][-1] == 0)
+    assert torch.all(batch.batch["rollout_log_probs"][-1] == 0)

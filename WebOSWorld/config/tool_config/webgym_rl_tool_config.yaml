@@ -11,7 +11,7 @@ tools:
       type: "function"
       function:
         name: "MOVE_TO"
-        description: "Move the cursor to the specified position."
+        description: "Move the cursor to the specified position. x and y must each be a single integer field in the 1000x1000 coordinate system. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
         parameters:
           type: "object"
           additionalProperties: false
@@ -27,7 +27,7 @@ tools:
       type: "function"
       function:
         name: "CLICK"
-        description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position."
+        description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position. If x and y are provided, each must be its own single integer field. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
         parameters:
           type: "object"
           additionalProperties: false
@@ -199,7 +199,7 @@ tools:
       type: "function"
       function:
         name: "HOTKEY"
-        description: "Press the specified key combination."
+        description: "Press the specified key combination. keys must be an array of string key names, for example ['ctrl', 'c']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+c'."
         parameters:
           type: "object"
           additionalProperties: false

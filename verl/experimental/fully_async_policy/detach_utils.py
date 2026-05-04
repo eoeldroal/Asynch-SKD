@@ -16,6 +16,7 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Optional
+import uuid
 
 import numpy as np
 import torch
@@ -174,6 +175,52 @@ def _align_rollout_sample_widths(rollout_samples_batch: list[DataProto], tokeniz
                 )
 
 
+def _infer_required_multiple_from_balance_fn(balance_batch) -> int | None:
+    if balance_batch is None:
+        return None
+    trainer = getattr(balance_batch, "__self__", None)
+    if trainer is None:
+        return None
+
+    get_dp_size = getattr(trainer, "_get_dp_size", None)
+    actor_rollout_wg = getattr(trainer, "actor_rollout_wg", None)
+    if not callable(get_dp_size) or actor_rollout_wg is None:
+        return None
+
+    try:
+        multiple = int(get_dp_size(actor_rollout_wg, "actor"))
+    except Exception:
+        return None
+    return multiple if multiple > 1 else None
+
+
+def _pad_batch_to_required_multiple(batch: DataProto, multiple: int | None) -> DataProto:
+    if multiple is None or multiple <= 1 or len(batch) == 0:
+        return batch
+
+    remainder = len(batch) % multiple
+    if remainder == 0:
+        return batch
+
+    pad_size = multiple - remainder
+    padding = batch.select_idxs([len(batch) - 1]).repeat(pad_size)
+    padding.meta_info = {}
+
+    pad_uids = np.array([f"fully_async_pad_{uuid.uuid4().hex}_{idx}" for idx in range(pad_size)], dtype=object)
+    if "uid" in padding.non_tensor_batch:
+        padding.non_tensor_batch["uid"] = pad_uids.copy()
+    if "index" in padding.non_tensor_batch:
+        padding.non_tensor_batch["index"] = np.array([-1] * pad_size, dtype=object)
+    if "input_pos" in padding.non_tensor_batch:
+        padding.non_tensor_batch["input_pos"] = np.array([-1] * pad_size, dtype=object)
+
+    for key in ("response_mask", "rm_scores", "rollout_log_probs"):
+        if key in padding.batch:
+            padding.batch[key].zero_()
+
+    return DataProto.concat([batch, padding])
+
+
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
@@ -210,6 +257,7 @@ def assemble_batch_from_rollout_samples(
         rollout_samples_batch.append(batch)
     _align_rollout_sample_widths(rollout_samples_batch, tokenizer)
     final_batch = DataProto.concat(rollout_samples_batch)
+    final_batch = _pad_batch_to_required_multiple(final_batch, _infer_required_multiple_from_balance_fn(balance_batch))
 
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():

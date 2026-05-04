@@ -33,7 +33,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.prompt_key=prompt \
     data.truncation=error \
     data.max_prompt_length=2048 \
-    data.max_response_length=128000 \
+    data.max_response_length=64000 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=64 \
     data.train_batch_size=0 \
@@ -55,7 +55,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_high=0.28 \
     actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
     actor_rollout_ref.actor.veomni.param_offload=False \
@@ -71,8 +71,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.90 \
-    actor_rollout_ref.rollout.max_model_len=26625 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=26624 \
+    actor_rollout_ref.rollout.max_model_len=30720 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=30720 \
     actor_rollout_ref.rollout.max_num_seqs=512 \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
@@ -100,7 +100,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=16 \
+    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=32 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/reward_fn_webgym_rl.py \
     reward.custom_reward_function.name=compute_score_webgym_rl \
@@ -113,6 +113,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.resume_mode=disable \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_fully_async_qwen35_webgym_tool_veomni/qwen35_9b_fully_async_webgym_tool \
     "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}" \
+    +ray_kwargs.ray_init.object_store_memory=400000000000 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=4 \
     rollout.nnodes=1 \
