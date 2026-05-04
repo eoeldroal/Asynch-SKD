@@ -57,6 +57,8 @@ class WebOsGymLoopMixin:
             reward=agent_data.extra_fields.get("web_osgym_reward_score"),
             cursor_x=agent_data.extra_fields.get("web_osgym_cursor_x"),
             cursor_y=agent_data.extra_fields.get("web_osgym_cursor_y"),
+            screen_width=agent_data.extra_fields.get("web_osgym_screen_width"),
+            screen_height=agent_data.extra_fields.get("web_osgym_screen_height"),
         )
 
     def _bundle_web_osgym_tool_calls(self, agent_data) -> tuple[dict | None, ToolResponse | None]:
@@ -152,6 +154,11 @@ class WebOsGymLoopMixin:
         agent_data.extra_fields["web_osgym_task_id"] = task_id
         agent_data.extra_fields["web_osgym_session_id"] = session_id
         agent_data.extra_fields["web_osgym_include_a11y"] = include_a11y
+        instance_state = getattr(tool, "_instance_dict", {}).get(instance_id, {})
+        if instance_state.get("screen_width") is not None:
+            agent_data.extra_fields["web_osgym_screen_width"] = instance_state["screen_width"]
+        if instance_state.get("screen_height") is not None:
+            agent_data.extra_fields["web_osgym_screen_height"] = instance_state["screen_height"]
         return start_response
 
     async def _finalize_with_web_osgym_reward(self, agent_data, termination_reason: str) -> None:

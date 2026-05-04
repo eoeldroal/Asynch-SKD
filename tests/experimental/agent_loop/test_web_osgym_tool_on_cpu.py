@@ -400,6 +400,35 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.x, 7)
         self.assertEqual(action.y, 8)
 
+    async def test_tool_execute_restores_screen_dimensions_from_agent_extra_fields(self):
+        seen = {}
+
+        class _AgentData:
+            extra_fields = {
+                "web_osgym_screen_width": 1920,
+                "web_osgym_screen_height": 1080,
+            }
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state(screen_width=None, screen_height=None)
+
+        await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 528, "y": 582}]}, agent_data=_AgentData())
+
+        action = seen["actions"][0]
+        self.assertEqual(action.x, 1014)
+        self.assertEqual(action.y, 629)
+
     async def test_tool_execute_rejects_coordinate_free_double_click_before_cursor_is_known(self):
         class _FakeClient:
             def __init__(self):

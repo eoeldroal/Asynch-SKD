@@ -161,6 +161,21 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         )
         agent_data.extra_fields["web_osgym_assistant_turns"] = turns
 
+    def _update_latest_web_osgym_assistant_turn_actions(
+        self,
+        agent_data: AgentData,
+        *,
+        actions: list[dict[str, Any]],
+    ) -> None:
+        turns = list(agent_data.extra_fields.get("web_osgym_assistant_turns") or [])
+        if not turns:
+            return
+        turns[-1] = {
+            **turns[-1],
+            "actions": [dict(action) for action in actions if isinstance(action, dict)],
+        }
+        agent_data.extra_fields["web_osgym_assistant_turns"] = turns
+
     def _record_web_osgym_unit_trace(self, agent_data: AgentData) -> None:
         steps = list(agent_data.extra_fields.get("web_osgym_steps") or [])
         image_spans = list(agent_data.extra_fields.get("mini_step_image_spans") or [])
@@ -520,6 +535,11 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if result.get("invalid_action"):
             agent_data.metrics["web_osgym/invalid_action"] = 1
 
+        processed_actions = result.get("web_osgym_actions")
+        if processed_actions is None:
+            processed_actions = [] if result.get("invalid_action") else self._trace_actions_from_tool_calls(agent_data)
+        self._update_latest_web_osgym_assistant_turn_actions(agent_data, actions=processed_actions)
+
         image_data = self._normalize_image_data(tool_response.image)
         try:
             self._dump_web_osgym_tool_trace(agent_data, tool_response, result, image_data)
@@ -568,7 +588,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             text_len=len(student_obs or ""),
             terminal=False,
             termination_reason=None,
-            actions=result.get("web_osgym_actions") or self._trace_actions_from_tool_calls(agent_data),
+            actions=processed_actions,
         )
         agent_data.messages.append(message)
         agent_data.prompt_ids += response_ids

@@ -24,6 +24,8 @@ class _FakeTool:
             "request_id": kwargs["request_id"],
             "include_a11y": kwargs["include_a11y"],
             "reward": None,
+            "screen_width": 1920,
+            "screen_height": 1080,
         }
         return "instance-1", ToolResponse(text="initial-observation", image=[Image.new("RGB", (2, 2), "blue")])
 
@@ -55,6 +57,8 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(agent_data.extra_fields["web_osgym_instance_id"], "instance-1")
         self.assertEqual(agent_data.extra_fields["web_osgym_session_id"], 101)
+        self.assertEqual(agent_data.extra_fields["web_osgym_screen_width"], 1920)
+        self.assertEqual(agent_data.extra_fields["web_osgym_screen_height"], 1080)
         self.assertEqual(response.text, "initial-observation")
 
     async def test_start_session_reads_shared_web_osgym_create_kwargs(self):
@@ -135,6 +139,8 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                 "web_osgym_include_a11y": True,
                 "web_osgym_cursor_x": 7,
                 "web_osgym_cursor_y": 8,
+                "web_osgym_screen_width": 1920,
+                "web_osgym_screen_height": 1080,
             }
         )
 
@@ -152,6 +158,8 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                         "reward": None,
                         "cursor_x": 7,
                         "cursor_y": 8,
+                        "screen_width": 1920,
+                        "screen_height": 1080,
                     },
                 )
             ],

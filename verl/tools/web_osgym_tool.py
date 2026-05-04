@@ -294,6 +294,10 @@ class WebOsGymTool(BaseTool):
                 state["cursor_x"] = extra_fields["web_osgym_cursor_x"]
             if state.get("cursor_y") is None and "web_osgym_cursor_y" in extra_fields:
                 state["cursor_y"] = extra_fields["web_osgym_cursor_y"]
+            if state.get("screen_width") is None and "web_osgym_screen_width" in extra_fields:
+                state["screen_width"] = extra_fields["web_osgym_screen_width"]
+            if state.get("screen_height") is None and "web_osgym_screen_height" in extra_fields:
+                state["screen_height"] = extra_fields["web_osgym_screen_height"]
             return extra_fields
         return None
 
@@ -400,6 +404,11 @@ class WebOsGymTool(BaseTool):
             state["screen_width"] = width
         if height is not None:
             state["screen_height"] = height
+        if isinstance(extra_fields, dict):
+            if state.get("screen_width") is not None:
+                extra_fields["web_osgym_screen_width"] = state["screen_width"]
+            if state.get("screen_height") is not None:
+                extra_fields["web_osgym_screen_height"] = state["screen_height"]
         _trace_async_skd(
             "web_tool.image_decode_done",
             agent_request_id=agent_request_id,

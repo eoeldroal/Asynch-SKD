@@ -104,6 +104,17 @@ class _FakeNonTerminalImageObservationTool(_FakeWebTool):
         }
 
 
+class _FakeNonTerminalNormalizedActionTool(_FakeWebTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters, kwargs))
+        return ToolResponse(text="normalized observation"), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": 1,
+            "web_osgym_actions": [{"action_type": "CLICK", "x": 1014, "y": 629, "button": "left", "num_clicks": 1}],
+        }
+
+
 def _make_loop():
     loop = object.__new__(WebOsGymToolAgentLoop)
     loop.tools = {}
@@ -718,6 +729,67 @@ def test_processing_records_non_terminal_image_observation_step():
                 "image_end": 2,
                 "terminal": False,
             },
+        ]
+
+    asyncio.run(_run())
+
+
+def test_processing_updates_previous_action_history_with_postprocessed_actions():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakeNonTerminalNormalizedActionTool()
+        agent_data = _agent_data(tool)
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+                "web_osgym_steps": [
+                    {
+                        "step_idx": 1,
+                        "assistant_turn": 0,
+                        "user_turn": 0,
+                        "phase": "initial",
+                        "text": "",
+                        "text_len": 0,
+                        "action_names": [],
+                        "actions": [],
+                        "image_start": 0,
+                        "image_end": 1,
+                        "terminal": False,
+                        "termination_reason": None,
+                    }
+                ],
+                "web_osgym_assistant_turns": [
+                    {
+                        "assistant_turn": 1,
+                        "observation_step_idx": 1,
+                        "response_start": 0,
+                        "response_end": 3,
+                        "response_text": "A1",
+                        "actions": [{"action_type": "CLICK", "x": "[528, 584]"}],
+                    }
+                ],
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.prompt_ids = [100]
+        agent_data.response_mask = []
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"CLICK","x":"[528, 584]"}]}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.GENERATING
+        assert agent_data.extra_fields["web_osgym_assistant_turns"][-1]["actions"] == [
+            {"action_type": "CLICK", "x": 1014, "y": 629, "button": "left", "num_clicks": 1}
         ]
 
     asyncio.run(_run())
