@@ -623,6 +623,30 @@ class RayPPOTrainer:
             self.config.get("distillation")
         )
 
+    def _uses_single_actor_mini_batch(self) -> bool:
+        return self._uses_async_skd_lookahead_training() or bool(
+            OmegaConf.select(self.config, "actor_rollout_ref.actor.use_single_actor_mini_batch", default=False)
+        )
+
+    def _build_actor_batch_controls(self, batch: DataProto, batch_td) -> dict[str, int]:
+        del batch
+        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+
+        if self._uses_single_actor_mini_batch():
+            global_batch_size = int((batch_td["response_mask"].sum(dim=-1) > 0).sum().item())
+            if global_batch_size <= 0:
+                raise ValueError("Actor update has no non-padding training rows.")
+            return {
+                "global_batch_size": global_batch_size,
+                "num_mini_batch": 1,
+            }
+
+        return {
+            "global_batch_size": ppo_mini_batch_size,
+            "mini_batch_size": ppo_mini_batch_size,
+        }
+
     def _async_skd_base_batch_size(self) -> int:
         return int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
 
@@ -1517,24 +1541,10 @@ class RayPPOTrainer:
         distillation_enabled = is_distillation_enabled(self.config.get("distillation"))
         loss_config = self.distillation_config.distillation_loss if distillation_enabled else None
         distillation_use_topk = loss_config.loss_settings.use_topk if distillation_enabled else False
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle
-        if self._uses_async_skd_lookahead_training():
-            global_batch_size = int((batch_td["response_mask"].sum(dim=-1) > 0).sum().item())
-            if global_batch_size <= 0:
-                raise ValueError("Async SKD actor update has no non-padding training rows.")
-            batch_controls = {
-                "global_batch_size": global_batch_size,
-                "num_mini_batch": 1,
-            }
-        else:
-            batch_controls = {
-                "global_batch_size": ppo_mini_batch_size,
-                "mini_batch_size": ppo_mini_batch_size,
-            }
+        batch_controls = self._build_actor_batch_controls(batch, batch_td)
         tu.assign_non_tensor(
             batch_td,
             calculate_entropy=calculate_entropy,

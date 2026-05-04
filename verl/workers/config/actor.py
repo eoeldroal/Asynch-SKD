@@ -113,6 +113,7 @@ class ActorConfig(BaseConfig):
         ppo_micro_batch_size_per_gpu (Optional[int]): Micro-batch size per GPU for PPO training.
         use_dynamic_bsz (bool): Whether to use dynamic batch sizing.
         ppo_max_token_len_per_gpu (int): Maximum token length per GPU for PPO training.
+        use_single_actor_mini_batch (bool): Whether to treat each actor update batch as a single PPO mini-batch.
         clip_ratio (float): PPO clipping ratio for policy loss.
         clip_ratio_low (float): Lower bound for PPO clipping ratio.
         clip_ratio_high (float): Upper bound for PPO clipping ratio.
@@ -154,6 +155,7 @@ class ActorConfig(BaseConfig):
     use_dynamic_bsz: bool = False
     ppo_max_token_len_per_gpu: int = 16384
     ppo_infer_max_token_len_per_gpu: int = 16384
+    use_single_actor_mini_batch: bool = False
     clip_ratio: float = 0.2
     clip_ratio_low: float = 0.2
     clip_ratio_high: float = 0.2

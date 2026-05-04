@@ -32,6 +32,10 @@ use_dynamic_bsz: false
 # oc.select: the default val for ref.log_prob_max_token_len_per_gpu
 ppo_max_token_len_per_gpu: 16384
 
+# When true, the actor update treats each incoming batch as a single PPO
+# mini-batch and relies on internal dynamic token-based micro-batching.
+use_single_actor_mini_batch: false
+
 # PPO clip ratio
 clip_ratio: 0.2
 
@@ -310,4 +314,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-
