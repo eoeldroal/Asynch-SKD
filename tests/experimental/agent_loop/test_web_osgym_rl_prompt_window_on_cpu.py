@@ -90,7 +90,7 @@ def test_build_web_osgym_prompt_window_emits_live_recent_user_assistant_chain():
                 {"type": "image"},
                 {
                     "type": "text",
-                    "text": "Please generate the next move according to the UI screenshot, instruction and previous actions.\nAll action coordinates use raw screen pixels.\n\nInstruction: Open settings\n\nPrevious actions:\nNone",
+                    "text": "Please generate the next move according to the UI screenshot, instruction and previous actions.\nAll action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner.\n\nInstruction: Open settings\n\nPrevious actions:\nNone",
                 },
             ],
         },
@@ -245,7 +245,7 @@ def test_build_web_osgym_prompt_window_raises_when_selected_step_has_no_content(
         )
 
 
-def test_build_web_osgym_prompt_window_includes_raw_pixel_coordinate_guidance_without_resolution():
+def test_build_web_osgym_prompt_window_includes_relative_coordinate_guidance():
     prompt_window = build_web_osgym_prompt_window(
         base_messages=[{"role": "user", "content": "Open settings"}],
         images=["obs-1"],
@@ -254,10 +254,10 @@ def test_build_web_osgym_prompt_window_includes_raw_pixel_coordinate_guidance_wi
     )
 
     first_text = prompt_window.messages[0]["content"][-1]["text"]
-    assert "All action coordinates use raw screen pixels." in first_text
+    assert "All action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner." in first_text
 
 
-def test_build_web_osgym_prompt_window_includes_current_resolution_when_available():
+def test_build_web_osgym_prompt_window_does_not_include_runtime_resolution_when_available():
     prompt_window = build_web_osgym_prompt_window(
         base_messages=[{"role": "user", "content": "Open settings"}],
         images=[Image.new("RGB", (1920, 1080), "white")],
@@ -266,4 +266,5 @@ def test_build_web_osgym_prompt_window_includes_current_resolution_when_availabl
     )
 
     first_text = prompt_window.messages[0]["content"][-1]["text"]
-    assert "Current screenshot resolution: 1920x1080." in first_text
+    assert "1000x1000" in first_text
+    assert "1920x1080" not in first_text

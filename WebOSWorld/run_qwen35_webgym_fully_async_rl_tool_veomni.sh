@@ -80,8 +80,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    actor_rollout_ref.rollout.multi_turn.max_user_turns=50 \
-    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=50 \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=20 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=20 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable=True \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n=5 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample=6 \

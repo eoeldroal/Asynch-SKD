@@ -70,30 +70,15 @@ def _extract_latest_user_instruction(base_messages: Any) -> str:
     return ""
 
 
-def _infer_latest_image_resolution(images: Sequence[Any]) -> tuple[int, int] | None:
-    for image in reversed(images):
-        size = getattr(image, "size", None)
-        if not isinstance(size, tuple) or len(size) != 2:
-            continue
-        width, height = size
-        if isinstance(width, int) and isinstance(height, int) and width > 0 and height > 0:
-            return width, height
-    return None
-
-
-def _coordinate_guidance(images: Sequence[Any]) -> str:
-    guidance = ["All action coordinates use raw screen pixels."]
-    resolution = _infer_latest_image_resolution(images)
-    if resolution is not None:
-        width, height = resolution
-        guidance.append(f"Current screenshot resolution: {width}x{height}.")
-    return " ".join(guidance)
+def _coordinate_guidance() -> str:
+    return "All action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner."
 
 
 def _build_prompt_text(instruction: str, previous_actions: str, prompt_images: Sequence[Any]) -> str:
+    del prompt_images
     return (
         "Please generate the next move according to the UI screenshot, instruction and previous actions.\n"
-        f"{_coordinate_guidance(prompt_images)}\n\n"
+        f"{_coordinate_guidance()}\n\n"
         f"Instruction: {instruction}\n\n"
         f"Previous actions:\n{previous_actions}"
     )

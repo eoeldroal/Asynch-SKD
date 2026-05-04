@@ -1,5 +1,7 @@
 import unittest
 
+from PIL import Image
+
 from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.tools.web_osgym_tool import WebOsGymTool
 
@@ -54,6 +56,19 @@ def _action_tool_schema(action_name: str, properties: dict | None = None, requir
 
 
 class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _instance_state(**overrides):
+        state = {
+            "task_id": "12345",
+            "request_id": 101,
+            "include_a11y": False,
+            "reward": None,
+            "screen_width": 1000,
+            "screen_height": 1000,
+        }
+        state.update(overrides)
+        return state
+
     def test_tool_schema_preserves_nested_items(self):
         schema = _tool_schema().model_dump(exclude_unset=True, exclude_none=True)
         self.assertIn("items", schema["function"]["parameters"]["properties"]["actions"])
@@ -76,6 +91,23 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool._instance_dict[instance_id]["request_id"], 101)
         self.assertEqual(tool._instance_dict[instance_id]["task_id"], "12345")
 
+    async def test_tool_create_stores_screen_dimensions_from_initial_image(self):
+        class _FakeClient:
+            async def start(self, **kwargs):
+                class _Response:
+                    text = "A11Y_TREE:\nroot"
+                    image = Image.new("RGB", (1920, 1080), "white")
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+
+        instance_id, _ = await tool.create(task_id="12345", request_id=101, include_a11y=True)
+
+        self.assertEqual(tool._instance_dict[instance_id]["screen_width"], 1920)
+        self.assertEqual(tool._instance_dict[instance_id]["screen_height"], 1080)
+
     async def test_tool_execute_uses_same_session_request_id(self):
         seen = {}
 
@@ -91,7 +123,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, reward, metrics = await tool.execute(
             "i1",
@@ -120,7 +152,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         with self.assertLogs("verl.tools.web_osgym_tool", level="INFO") as logs:
             await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]})
@@ -158,7 +190,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
             ),
         )
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, reward, metrics = await tool.execute("i1", {"x": 1, "y": 2})
 
@@ -185,7 +217,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
             tool_schema=_action_tool_schema("DONE"),
         )
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, reward, metrics = await tool.execute("i1", {"actions": [{"action_type": "DONE"}]})
 
@@ -205,7 +237,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         _, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "DONE"}]})
         self.assertTrue(metrics["terminated"])
@@ -226,7 +258,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         await tool.execute(
             "i1",
@@ -257,7 +289,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 10, "y": 20}]})
 
@@ -283,7 +315,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         await tool.execute(
             "i1",
@@ -307,7 +339,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "CLICK"}]})
 
@@ -330,7 +362,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         await tool.execute(
             "i1",
@@ -360,7 +392,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         await tool.execute("i1", {"actions": [{"action_type": "CLICK"}]}, agent_data=_AgentData())
 
@@ -378,7 +410,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "DOUBLE_CLICK"}]})
 
@@ -396,7 +428,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "RIGHT_CLICK", "x": 1, "y": 2}]})
 
@@ -418,7 +450,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, reward, metrics = await tool.execute(
             "i1", {"actions": [{"action_type": "SCROLL", "dx": 0, "dy": -10}]}
@@ -441,7 +473,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, reward, metrics = await tool.execute("i1", {"actions": ["DONE"]})
 
@@ -462,7 +494,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         response, reward, metrics = await tool.execute("i1", ["DONE"])
 
@@ -473,6 +505,53 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metrics["action_count"], 0)
         self.assertFalse(tool.client.action_called)
 
+    async def test_tool_execute_scales_1000_grid_coordinates_to_screen_pixels(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state(screen_width=1920, screen_height=1080)
+
+        await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 528, "y": 582}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.x, 1014)
+        self.assertEqual(action.y, 629)
+
+    async def test_tool_execute_uses_top_left_origin_for_1000_grid(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state(screen_width=1920, screen_height=1080)
+
+        await tool.execute("i1", {"actions": [{"action_type": "MOVE_TO", "x": 0, "y": 0}, {"action_type": "CLICK"}]})
+
+        move_action = seen["actions"][0]
+        click_action = seen["actions"][1]
+        self.assertEqual((move_action.x, move_action.y), (0, 0))
+        self.assertEqual((click_action.x, click_action.y), (0, 0))
+
     async def test_tool_calc_reward_uses_existing_session_request_id(self):
         class _FakeClient:
             async def reward(self, **kwargs):
@@ -482,7 +561,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
         tool.client = _FakeClient()
-        tool._instance_dict["i1"] = {"task_id": "12345", "request_id": 101, "include_a11y": False, "reward": None}
+        tool._instance_dict["i1"] = self._instance_state()
 
         reward = await tool.calc_reward("i1")
         self.assertEqual(reward, 1.0)

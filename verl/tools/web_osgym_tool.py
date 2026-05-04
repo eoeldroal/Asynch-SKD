@@ -42,6 +42,14 @@ def _image_size(image: Any) -> tuple[int | None, int | None]:
     return int(width), int(height)
 
 
+def _scale_relative_coordinate(value: int, screen_extent: int, axis_name: str) -> int:
+    if not 0 <= value <= 999:
+        raise ValueError(f"{axis_name} must be within the 1000x1000 coordinate grid, got {value}")
+    if screen_extent <= 0:
+        raise ValueError(f"screen {axis_name} extent must be positive, got {screen_extent}")
+    return round(value * (screen_extent - 1) / 999)
+
+
 class WebOsGymTool(BaseTool):
     COMPUTER_13_ACTIONS = {
         "MOVE_TO",
@@ -79,6 +87,8 @@ class WebOsGymTool(BaseTool):
         reward: float | None = None,
         cursor_x: int | None = None,
         cursor_y: int | None = None,
+        screen_width: int | None = None,
+        screen_height: int | None = None,
     ) -> None:
         self._instance_dict[instance_id] = {
             "task_id": task_id,
@@ -87,6 +97,8 @@ class WebOsGymTool(BaseTool):
             "reward": reward,
             "cursor_x": cursor_x,
             "cursor_y": cursor_y,
+            "screen_width": screen_width,
+            "screen_height": screen_height,
         }
 
     async def create(
@@ -102,18 +114,32 @@ class WebOsGymTool(BaseTool):
         instance_id = instance_id or str(uuid4())
         include_a11y = self.include_a11y if include_a11y is None else include_a11y
         response = await self.client.start(request_id=request_id, task_id=task_id, include_a11y=include_a11y)
+        screen_width, screen_height = _image_size(response.image)
         self.restore_instance(
             instance_id,
             task_id=task_id,
             request_id=request_id,
             include_a11y=include_a11y,
             reward=None,
+            screen_width=screen_width,
+            screen_height=screen_height,
         )
         image = [response.image] if response.image is not None else None
         response_kwargs = {"text": response.text}
         if image is not None:
             response_kwargs["image"] = image
         return instance_id, ToolResponse(**response_kwargs)
+
+    @staticmethod
+    def _scale_xy_to_screen(state: dict[str, Any], x: int, y: int) -> tuple[int, int]:
+        screen_width = state.get("screen_width")
+        screen_height = state.get("screen_height")
+        if not isinstance(screen_width, int) or not isinstance(screen_height, int):
+            raise ValueError("screen dimensions are unknown; cannot project 1000x1000 coordinates to pixels")
+        return (
+            _scale_relative_coordinate(int(x), screen_width, "x"),
+            _scale_relative_coordinate(int(y), screen_height, "y"),
+        )
 
     @staticmethod
     def _require_coordinates(action: WebOsGymAction, cursor_x: int | None, cursor_y: int | None) -> tuple[int, int]:
@@ -179,7 +205,9 @@ class WebOsGymTool(BaseTool):
             if action_type == "MOVE_TO":
                 x = self._require_field(action, "x")
                 y = self._require_field(action, "y")
-                cursor_x, cursor_y = int(x), int(y)
+                scaled_x, scaled_y = self._scale_xy_to_screen(state, int(x), int(y))
+                payload.update({"x": scaled_x, "y": scaled_y})
+                cursor_x, cursor_y = scaled_x, scaled_y
 
             elif action_type == "CLICK":
                 x, y = self._require_coordinates(action, cursor_x, cursor_y)
@@ -189,13 +217,19 @@ class WebOsGymTool(BaseTool):
                 num_clicks = 1 if action.num_clicks is None else int(action.num_clicks)
                 if num_clicks < 1:
                     raise ValueError(f"CLICK requires num_clicks >= 1, got {num_clicks}")
-                payload.update({"button": "left", "x": x, "y": y, "num_clicks": num_clicks})
-                cursor_x, cursor_y = x, y
+                click_x, click_y = int(x), int(y)
+                if action.x is not None and action.y is not None:
+                    click_x, click_y = self._scale_xy_to_screen(state, click_x, click_y)
+                payload.update({"button": "left", "x": click_x, "y": click_y, "num_clicks": num_clicks})
+                cursor_x, cursor_y = click_x, click_y
 
             elif action_type == "DOUBLE_CLICK":
                 x, y = self._require_coordinates(action, cursor_x, cursor_y)
-                payload.update({"x": x, "y": y})
-                cursor_x, cursor_y = x, y
+                click_x, click_y = int(x), int(y)
+                if action.x is not None and action.y is not None:
+                    click_x, click_y = self._scale_xy_to_screen(state, click_x, click_y)
+                payload.update({"x": click_x, "y": click_y})
+                cursor_x, cursor_y = click_x, click_y
 
             elif action_type == "SCROLL":
                 self._require_field(action, "dx")
@@ -362,6 +396,10 @@ class WebOsGymTool(BaseTool):
         decoded_image = response.image
         image_ms = (time.monotonic() - image_t0) * 1000
         width, height = _image_size(decoded_image)
+        if width is not None:
+            state["screen_width"] = width
+        if height is not None:
+            state["screen_height"] = height
         _trace_async_skd(
             "web_tool.image_decode_done",
             agent_request_id=agent_request_id,
