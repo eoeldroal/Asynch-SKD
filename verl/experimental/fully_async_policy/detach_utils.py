@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from verl import DataProto
 from verl.trainer.ppo.ray_trainer import compute_response_mask
@@ -90,6 +91,89 @@ def addition_process(output: DataProto):
     return output
 
 
+def _pad_tensor_along_dim(
+    tensor: torch.Tensor,
+    *,
+    dim: int,
+    left_pad: int = 0,
+    right_pad: int = 0,
+    pad_value: int | float = 0,
+) -> torch.Tensor:
+    if left_pad == 0 and right_pad == 0:
+        return tensor
+    dim = dim if dim >= 0 else tensor.dim() + dim
+    tensor_last = torch.movedim(tensor, dim, -1)
+    tensor_last = F.pad(tensor_last, (left_pad, right_pad), value=pad_value)
+    return torch.movedim(tensor_last, -1, dim)
+
+
+def _align_rollout_sample_widths(rollout_samples_batch: list[DataProto], tokenizer) -> None:
+    if len(rollout_samples_batch) <= 1:
+        return
+
+    pad_token_id = getattr(tokenizer, "pad_token_id", 0)
+    if pad_token_id is None:
+        pad_token_id = 0
+
+    target_prompt_width = max(int(batch.batch["prompts"].shape[1]) for batch in rollout_samples_batch if batch.batch is not None)
+    target_response_width = max(
+        int(batch.batch["responses"].shape[1]) for batch in rollout_samples_batch if batch.batch is not None
+    )
+
+    for batch in rollout_samples_batch:
+        if batch.batch is None:
+            continue
+
+        prompt_width = int(batch.batch["prompts"].shape[1])
+        response_width = int(batch.batch["responses"].shape[1])
+        prompt_pad = target_prompt_width - prompt_width
+        response_pad = target_response_width - response_width
+        if prompt_pad == 0 and response_pad == 0:
+            continue
+
+        batch.batch["prompts"] = _pad_tensor_along_dim(
+            batch.batch["prompts"],
+            dim=-1,
+            left_pad=prompt_pad,
+            pad_value=pad_token_id,
+        )
+        batch.batch["responses"] = _pad_tensor_along_dim(
+            batch.batch["responses"],
+            dim=-1,
+            right_pad=response_pad,
+            pad_value=pad_token_id,
+        )
+
+        for key in ("response_mask", "rollout_log_probs", "rm_scores"):
+            if key in batch.batch.keys():
+                batch.batch[key] = _pad_tensor_along_dim(
+                    batch.batch[key],
+                    dim=-1,
+                    right_pad=response_pad,
+                    pad_value=0,
+                )
+
+        for key, pad_value in (("input_ids", pad_token_id), ("attention_mask", 0), ("position_ids", 0)):
+            if key in batch.batch.keys():
+                batch.batch[key] = _pad_tensor_along_dim(
+                    batch.batch[key],
+                    dim=-1,
+                    left_pad=prompt_pad,
+                    right_pad=response_pad,
+                    pad_value=pad_value,
+                )
+
+        for key, pad_value in (("teacher_ids", pad_token_id), ("teacher_logprobs", 0), ("routed_experts", 0)):
+            if key in batch.batch.keys():
+                batch.batch[key] = _pad_tensor_along_dim(
+                    batch.batch[key],
+                    dim=1,
+                    left_pad=prompt_pad,
+                    right_pad=response_pad,
+                    pad_value=pad_value,
+                )
+
+
 def assemble_batch_from_rollout_samples(
     rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
 ) -> DataProto:
@@ -124,6 +208,7 @@ def assemble_batch_from_rollout_samples(
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
         rollout_samples_batch.append(batch)
+    _align_rollout_sample_widths(rollout_samples_batch, tokenizer)
     final_batch = DataProto.concat(rollout_samples_batch)
 
     # Calculate response_mask (if not present)
