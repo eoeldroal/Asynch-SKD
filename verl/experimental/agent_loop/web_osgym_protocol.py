@@ -38,6 +38,30 @@ class WebOsGymResponse(BaseModel):
         return Image.open(BytesIO(base64.b64decode(self.image_b64))).convert("RGB")
 
 
+class WebOsGymRemoteError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        op: str,
+        session_id: int,
+        task_id: str,
+        error_type: str | None = None,
+        message: str | None = None,
+    ):
+        self.op = op
+        self.session_id = session_id
+        self.task_id = task_id
+        self.error_type = error_type
+        self.message = message
+
+        parts = [f"Web/OSGym {op} failed", f"session_id={session_id}", f"task_id={task_id!r}"]
+        if error_type:
+            parts.append(f"error_type={error_type}")
+        if message:
+            parts.append(f"message={message}")
+        super().__init__(", ".join(parts))
+
+
 class WebOsGymClient:
     def __init__(self, base_url: str, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
@@ -64,8 +88,20 @@ class WebOsGymClient:
             response.raise_for_status()
         return self._parse_response(response.json())
 
+    @staticmethod
+    def _raise_for_error_status(response: WebOsGymResponse, *, op: str) -> None:
+        if response.status == "ok":
+            return
+        raise WebOsGymRemoteError(
+            op=op,
+            session_id=response.session_id,
+            task_id=response.task_id,
+            error_type=response.error_type,
+            message=response.message,
+        )
+
     async def start(self, *, request_id: int, task_id: str, include_a11y: bool) -> WebOsGymResponse:
-        return await self._post(
+        response = await self._post(
             {
                 "session_id": request_id,
                 "task_id": task_id,
@@ -73,6 +109,8 @@ class WebOsGymClient:
                 "include_a11y": include_a11y,
             }
         )
+        self._raise_for_error_status(response, op="start")
+        return response
 
     async def action(
         self,
@@ -94,5 +132,12 @@ class WebOsGymClient:
 
     async def reward(self, *, request_id: int, task_id: str) -> float:
         response = await self._post({"session_id": request_id, "task_id": task_id, "op": "reward"})
-        assert response.reward is not None
+        self._raise_for_error_status(response, op="reward")
+        if response.reward is None:
+            raise WebOsGymRemoteError(
+                op="reward",
+                session_id=response.session_id,
+                task_id=response.task_id,
+                message="Server returned status='ok' but missing reward.",
+            )
         return float(response.reward)

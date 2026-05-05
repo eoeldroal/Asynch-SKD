@@ -2,6 +2,7 @@ import unittest
 
 from PIL import Image
 
+from verl.experimental.agent_loop.web_osgym_protocol import WebOsGymRemoteError
 from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.tools.web_osgym_tool import WebOsGymTool
 
@@ -107,6 +108,25 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(tool._instance_dict[instance_id]["screen_width"], 1920)
         self.assertEqual(tool._instance_dict[instance_id]["screen_height"], 1080)
+
+    async def test_tool_create_does_not_restore_instance_when_start_fails(self):
+        class _FakeClient:
+            async def start(self, **kwargs):
+                raise WebOsGymRemoteError(
+                    op="start",
+                    session_id=101,
+                    task_id="12345",
+                    error_type="gateway_busy",
+                    message="Timed out waiting for gateway capacity.",
+                )
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+
+        with self.assertRaises(WebOsGymRemoteError):
+            await tool.create(task_id="12345", request_id=101, include_a11y=True)
+
+        self.assertEqual(tool._instance_dict, {})
 
     async def test_tool_execute_uses_same_session_request_id(self):
         seen = {}

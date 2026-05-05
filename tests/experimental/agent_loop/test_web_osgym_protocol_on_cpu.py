@@ -7,6 +7,7 @@ from PIL import Image
 from verl.experimental.agent_loop.web_osgym_protocol import (
     WebOsGymAction,
     WebOsGymClient,
+    WebOsGymRemoteError,
 )
 
 
@@ -107,6 +108,47 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen["payload"]["task_id"], "12345")
         self.assertEqual(seen["payload"]["actions"][0]["action_type"], "CLICK")
 
+    async def test_start_raises_on_error_status(self):
+        payload = {
+            "session_id": 101,
+            "task_id": "12345",
+            "status": "error",
+            "error_type": "gateway_busy",
+            "message": "Timed out waiting for gateway capacity.",
+        }
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return payload
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, timeout):
+                return _FakeResponse()
+
+        from verl.experimental.agent_loop import web_osgym_protocol
+
+        original = web_osgym_protocol.httpx.AsyncClient
+        web_osgym_protocol.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            client = WebOsGymClient(base_url="http://env")
+            with self.assertRaises(WebOsGymRemoteError) as ctx:
+                await client.start(request_id=101, task_id="12345", include_a11y=True)
+        finally:
+            web_osgym_protocol.httpx.AsyncClient = original
+
+        self.assertIn("start", str(ctx.exception))
+        self.assertIn("gateway_busy", str(ctx.exception))
+        self.assertIn("12345", str(ctx.exception))
+
     async def test_reward_reuses_same_session_request_id(self):
         class _FakeResponse:
             def raise_for_status(self):
@@ -137,3 +179,76 @@ class TestWebOsGymProtocol(unittest.IsolatedAsyncioTestCase):
             web_osgym_protocol.httpx.AsyncClient = original
 
         self.assertEqual(reward, 1.0)
+
+    async def test_reward_raises_on_error_status(self):
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "session_id": 101,
+                    "task_id": "12345",
+                    "status": "error",
+                    "error_type": "fail_request_handle",
+                    "message": "Session 101 does not exist",
+                }
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, timeout):
+                return _FakeResponse()
+
+        from verl.experimental.agent_loop import web_osgym_protocol
+
+        original = web_osgym_protocol.httpx.AsyncClient
+        web_osgym_protocol.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            client = WebOsGymClient(base_url="http://env")
+            with self.assertRaises(WebOsGymRemoteError) as ctx:
+                await client.reward(request_id=101, task_id="12345")
+        finally:
+            web_osgym_protocol.httpx.AsyncClient = original
+
+        self.assertIn("reward", str(ctx.exception))
+        self.assertIn("fail_request_handle", str(ctx.exception))
+
+    async def test_reward_raises_when_ok_response_omits_reward(self):
+        class _FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "session_id": 101,
+                    "task_id": "12345",
+                    "status": "ok",
+                }
+
+        class _FakeAsyncClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json, timeout):
+                return _FakeResponse()
+
+        from verl.experimental.agent_loop import web_osgym_protocol
+
+        original = web_osgym_protocol.httpx.AsyncClient
+        web_osgym_protocol.httpx.AsyncClient = _FakeAsyncClient
+        try:
+            client = WebOsGymClient(base_url="http://env")
+            with self.assertRaises(WebOsGymRemoteError) as ctx:
+                await client.reward(request_id=101, task_id="12345")
+        finally:
+            web_osgym_protocol.httpx.AsyncClient = original
+
+        self.assertIn("missing reward", str(ctx.exception))
