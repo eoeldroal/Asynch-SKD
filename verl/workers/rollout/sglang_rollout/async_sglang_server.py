@@ -457,6 +457,18 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
+        _trace_async_skd(
+            "sglang.launch_server_args",
+            replica_rank=self.replica_rank,
+            node_rank=self.node_rank,
+            requested_grammar_backend=args.get("grammar_backend"),
+            server_args_grammar_backend=getattr(server_args, "grammar_backend", None),
+            attention_backend=args.get("attention_backend"),
+            mm_attention_backend=args.get("mm_attention_backend"),
+            base_gpu_id=self.base_gpu_id,
+            tp_size=args.get("tp_size"),
+            dp_size=args.get("dp_size"),
+        )
         # For SGLang main branch or version >= 0.5.10
         # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
         if version.parse(sglang.__version__) >= version.parse("0.5.10"):

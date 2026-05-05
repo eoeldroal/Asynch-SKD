@@ -12,12 +12,15 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
+from verl.experimental.agent_loop.qwen_coder_structured_output import build_qwen_coder_structured_tag_json
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.web_osgym_rl_prompt_window import build_web_osgym_prompt_window
 from verl.experimental.agent_loop.web_osgym_windowing import build_mini_step_image_spans
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
+from verl.utils.chat_template import apply_chat_template
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
+from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -27,6 +30,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 @dataclass(frozen=True)
 class _WebOsGymGenerationInput:
     prompt_ids: list[int]
+    server_prompt_ids: list[int] | None
     images: list[Any] | None
     videos: Any | None
     window_used: bool
@@ -247,14 +251,89 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         value = getattr(multi_turn, "web_osgym_window_max_images_per_sample", 6)
         return None if value is None else int(value)
 
+    def _build_generation_sampling_params(
+        self,
+        base_sampling_params: dict[str, Any],
+        active_tool_schemas: list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        params = dict(base_sampling_params)
+        rollout_custom = getattr(self.rollout_config, "custom", None) or {}
+        structured_output_enabled = bool(rollout_custom.get("enable_qwen3_coder_structured_output", False))
+        if self.rollout_config.name != "sglang":
+            return params
+        if self.tool_parser_name != "qwen3_coder":
+            return params
+        if not structured_output_enabled:
+            return params
+        if not active_tool_schemas:
+            return params
+        params["structural_tag"] = build_qwen_coder_structured_tag_json(active_tool_schemas)
+        return params
+
+    def _should_use_server_prompt_ids(self, images: list[Any] | None) -> bool:
+        return (
+            self.rollout_config.name == "sglang"
+            and not getattr(self.rollout_config, "skip_tokenizer_init", False)
+            and bool(images)
+        )
+
+    async def _apply_server_chat_template(self, messages: list[dict], tools: list[dict] | None = None) -> list[int]:
+        tokenized = await self.loop.run_in_executor(
+            None,
+            lambda: apply_chat_template(
+                self.tokenizer,
+                messages,
+                tools=tools,
+                add_generation_prompt=True,
+                tokenize=True,
+                **self.apply_chat_template_kwargs,
+            ),
+        )
+        return normalize_token_ids(tokenized)
+
+    async def _build_server_prompt_ids(
+        self,
+        *,
+        messages: list[dict],
+        images: list[Any] | None,
+        tools: list[dict] | None,
+    ) -> list[int] | None:
+        if not self._should_use_server_prompt_ids(images):
+            return None
+        server_prompt_ids = await self._apply_server_chat_template(messages, tools=tools)
+        if not server_prompt_ids:
+            raise ValueError("Server prompt ids unexpectedly empty for multimodal SGLang generation")
+        return server_prompt_ids
+
+    @staticmethod
+    def _validate_server_prompt_contract(
+        local_prompt_ids: list[int],
+        server_prompt_ids: list[int] | None,
+        images: list[Any] | None,
+    ) -> None:
+        if server_prompt_ids is None:
+            return
+        if not images:
+            raise ValueError("server_prompt_ids should only be used for multimodal generation inputs")
+        if not local_prompt_ids:
+            raise ValueError("Local prompt ids unexpectedly empty while server prompt ids are active")
+
     async def _build_web_osgym_generation_inputs(
         self,
         agent_data: AgentData,
     ) -> _WebOsGymGenerationInput:
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         if not self._web_osgym_window_enabled():
             image_count = len(agent_data.image_data or [])
+            server_prompt_ids = await self._build_server_prompt_ids(
+                messages=agent_data.messages,
+                images=agent_data.image_data,
+                tools=schemas,
+            )
+            self._validate_server_prompt_contract(agent_data.prompt_ids, server_prompt_ids, agent_data.image_data)
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
+                server_prompt_ids,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -269,8 +348,15 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         steps = agent_data.extra_fields.get("web_osgym_steps") or []
         if not steps:
             image_count = len(agent_data.image_data or [])
+            server_prompt_ids = await self._build_server_prompt_ids(
+                messages=agent_data.messages,
+                images=agent_data.image_data,
+                tools=schemas,
+            )
+            self._validate_server_prompt_contract(agent_data.prompt_ids, server_prompt_ids, agent_data.image_data)
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
+                server_prompt_ids,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -297,8 +383,15 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             )
             logger.warning("Falling back to full Web/OSGym prompt window: %s", exc)
             image_count = len(agent_data.image_data or [])
+            server_prompt_ids = await self._build_server_prompt_ids(
+                messages=agent_data.messages,
+                images=agent_data.image_data,
+                tools=schemas,
+            )
+            self._validate_server_prompt_contract(agent_data.prompt_ids, server_prompt_ids, agent_data.image_data)
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
+                server_prompt_ids,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -310,13 +403,18 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 0,
             )
 
-        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         prompt_ids = await self.apply_chat_template(
             prompt_window.messages,
             tools=schemas,
             images=prompt_window.images,
             videos=None,
         )
+        server_prompt_ids = await self._build_server_prompt_ids(
+            messages=prompt_window.messages,
+            images=prompt_window.images,
+            tools=schemas,
+        )
+        self._validate_server_prompt_contract(prompt_ids, server_prompt_ids, prompt_window.images)
         agent_data.metrics["web_osgym/window_active"] = 1
         agent_data.metrics["web_osgym/window_step_count"] = len(prompt_window.selected_steps)
         agent_data.metrics["web_osgym/window_image_count"] = len(prompt_window.images)
@@ -332,6 +430,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         )
         return _WebOsGymGenerationInput(
             prompt_ids,
+            server_prompt_ids,
             prompt_window.images,
             None,
             True,
@@ -606,12 +705,15 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         ignore_termination: bool = False,
     ) -> AgentState:
         generation_inputs = await self._build_web_osgym_generation_inputs(agent_data)
+        active_tool_schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        effective_sampling_params = self._build_generation_sampling_params(sampling_params, active_tool_schemas)
+        request_prompt_ids = generation_inputs.server_prompt_ids or generation_inputs.prompt_ids
         response_start = len(agent_data.response_mask)
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
                 request_id=agent_data.request_id,
-                prompt_ids=generation_inputs.prompt_ids,
-                sampling_params=sampling_params,
+                prompt_ids=request_prompt_ids,
+                sampling_params=effective_sampling_params,
                 image_data=generation_inputs.images,
                 video_data=generation_inputs.videos,
             )
