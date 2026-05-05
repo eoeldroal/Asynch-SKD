@@ -1,0 +1,201 @@
+_web_osgym_config: &web_osgym_config
+  type: native
+  base_url: "http://127.0.0.1:18000"
+  timeout: 60.0
+  include_a11y: false
+
+tools:
+  - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
+    config: *web_osgym_config
+    tool_schema:
+      type: "function"
+      function:
+        name: "computer"
+        description: ""
+        parameters:
+          type: "object"
+          additionalProperties: false
+          properties:
+            actions:
+              type: "array"
+              minItems: 1
+              maxItems: 10
+              items:
+                oneOf:
+                  - type: "object"
+                    description: "Move the cursor to the specified position. x and y must each be a single integer field in the 1000x1000 coordinate system. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["MOVE_TO"]
+                      x:
+                        type: "integer"
+                      y:
+                        type: "integer"
+                    required: ["action_type", "x", "y"]
+                  - type: "object"
+                    description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position. If x and y are provided, each must be its own single integer field. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["CLICK"]
+                      button:
+                        type: "string"
+                        enum: ["left", "middle", "right"]
+                      x:
+                        type: "integer"
+                      y:
+                        type: "integer"
+                      num_clicks:
+                        type: "integer"
+                        minimum: 1
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Press the left button if the button not specified, otherwise press the specified button."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["MOUSE_DOWN"]
+                      button:
+                        type: "string"
+                        enum: ["left", "middle", "right"]
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Release the left button if the button not specified, otherwise release the specified button."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["MOUSE_UP"]
+                      button:
+                        type: "string"
+                        enum: ["left", "middle", "right"]
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Right click at the current position if x and y are not specified, otherwise right click at the specified position."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["RIGHT_CLICK"]
+                      x:
+                        type: "integer"
+                      y:
+                        type: "integer"
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Double click at the current position if x and y are not specified, otherwise double click at the specified position."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["DOUBLE_CLICK"]
+                      x:
+                        type: "integer"
+                      y:
+                        type: "integer"
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Drag the cursor to the specified position with the left button pressed."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["DRAG_TO"]
+                      x:
+                        type: "integer"
+                      y:
+                        type: "integer"
+                    required: ["action_type", "x", "y"]
+                  - type: "object"
+                    description: "Scroll the mouse wheel up/down, or left/right."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["SCROLL"]
+                      dx:
+                        type: "integer"
+                      dy:
+                        type: "integer"
+                    required: ["action_type", "dx", "dy"]
+                  - type: "object"
+                    description: "Type the specified text."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["TYPING"]
+                      text:
+                        type: "string"
+                    required: ["action_type", "text"]
+                  - type: "object"
+                    description: "Press the specified single key and release it."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["PRESS"]
+                      key:
+                        type: "string"
+                    required: ["action_type", "key"]
+                  - type: "object"
+                    description: "Press the specified single key."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["KEY_DOWN"]
+                      key:
+                        type: "string"
+                    required: ["action_type", "key"]
+                  - type: "object"
+                    description: "Release the specified single key."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["KEY_UP"]
+                      key:
+                        type: "string"
+                    required: ["action_type", "key"]
+                  - type: "object"
+                    description: "Press the specified key combination. keys must be an array of string key names, for example ['ctrl', 'c']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+c'."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["HOTKEY"]
+                      keys:
+                        type: "array"
+                        items:
+                          type: "string"
+                    required: ["action_type", "keys"]
+                  - type: "object"
+                    description: "Wait until the next action."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["WAIT"]
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Decide the task cannot be performed."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["FAIL"]
+                    required: ["action_type"]
+                  - type: "object"
+                    description: "Decide the task is done."
+                    additionalProperties: false
+                    properties:
+                      action_type:
+                        type: "string"
+                        enum: ["DONE"]
+                    required: ["action_type"]
+          required: ["actions"]
