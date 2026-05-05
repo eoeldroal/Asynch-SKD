@@ -305,19 +305,6 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             raise ValueError("Server prompt ids unexpectedly empty for multimodal SGLang generation")
         return server_prompt_ids
 
-    @staticmethod
-    def _validate_server_prompt_contract(
-        local_prompt_ids: list[int],
-        server_prompt_ids: list[int] | None,
-        images: list[Any] | None,
-    ) -> None:
-        if server_prompt_ids is None:
-            return
-        if not images:
-            raise ValueError("server_prompt_ids should only be used for multimodal generation inputs")
-        if not local_prompt_ids:
-            raise ValueError("Local prompt ids unexpectedly empty while server prompt ids are active")
-
     async def _build_web_osgym_generation_inputs(
         self,
         agent_data: AgentData,
@@ -325,15 +312,9 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         if not self._web_osgym_window_enabled():
             image_count = len(agent_data.image_data or [])
-            server_prompt_ids = await self._build_server_prompt_ids(
-                messages=agent_data.messages,
-                images=agent_data.image_data,
-                tools=schemas,
-            )
-            self._validate_server_prompt_contract(agent_data.prompt_ids, server_prompt_ids, agent_data.image_data)
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
-                server_prompt_ids,
+                None,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -348,15 +329,9 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         steps = agent_data.extra_fields.get("web_osgym_steps") or []
         if not steps:
             image_count = len(agent_data.image_data or [])
-            server_prompt_ids = await self._build_server_prompt_ids(
-                messages=agent_data.messages,
-                images=agent_data.image_data,
-                tools=schemas,
-            )
-            self._validate_server_prompt_contract(agent_data.prompt_ids, server_prompt_ids, agent_data.image_data)
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
-                server_prompt_ids,
+                None,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -383,15 +358,9 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             )
             logger.warning("Falling back to full Web/OSGym prompt window: %s", exc)
             image_count = len(agent_data.image_data or [])
-            server_prompt_ids = await self._build_server_prompt_ids(
-                messages=agent_data.messages,
-                images=agent_data.image_data,
-                tools=schemas,
-            )
-            self._validate_server_prompt_contract(agent_data.prompt_ids, server_prompt_ids, agent_data.image_data)
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
-                server_prompt_ids,
+                None,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -414,7 +383,6 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             images=prompt_window.images,
             tools=schemas,
         )
-        self._validate_server_prompt_contract(prompt_ids, server_prompt_ids, prompt_window.images)
         agent_data.metrics["web_osgym/window_active"] = 1
         agent_data.metrics["web_osgym/window_step_count"] = len(prompt_window.selected_steps)
         agent_data.metrics["web_osgym/window_image_count"] = len(prompt_window.images)
@@ -707,7 +675,13 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         generation_inputs = await self._build_web_osgym_generation_inputs(agent_data)
         active_tool_schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         effective_sampling_params = self._build_generation_sampling_params(sampling_params, active_tool_schemas)
-        request_prompt_ids = generation_inputs.server_prompt_ids or generation_inputs.prompt_ids
+        request_prompt_ids = generation_inputs.prompt_ids
+        if generation_inputs.server_prompt_ids is not None:
+            request_prompt_ids = generation_inputs.server_prompt_ids
+        elif generation_inputs.window_used and self._should_use_server_prompt_ids(generation_inputs.images):
+            raise ValueError(
+                "Windowed multimodal SGLang generation expected server prompt ids but none were built."
+            )
         response_start = len(agent_data.response_mask)
         with simple_timer("generate_sequences", agent_data.metrics):
             output: TokenOutput = await self.server_manager.generate(
