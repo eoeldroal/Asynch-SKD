@@ -61,11 +61,13 @@ class WebOsGymLoopMixin:
             screen_height=agent_data.extra_fields.get("web_osgym_screen_height"),
         )
 
-    def _bundle_web_osgym_tool_calls(self, agent_data) -> tuple[dict | None, ToolResponse | None]:
+    def _bundle_web_osgym_tool_calls(self, agent_data, tool_calls=None) -> tuple[dict | None, ToolResponse | None]:
         active_tools = getattr(agent_data, "_active_tools", {})
         actions = []
+        if tool_calls is None:
+            tool_calls = agent_data.tool_calls
 
-        for tool_call in agent_data.tool_calls:
+        for tool_call in tool_calls:
             if tool_call.name not in active_tools:
                 available = list(active_tools.keys())
                 return None, ToolResponse(text=f"Unknown function '{tool_call.name}'. Available tools: {available}")
@@ -92,10 +94,19 @@ class WebOsGymLoopMixin:
                 # Web/OSGym server still receives one ordered actions list.
                 actions.append({"action_type": tool_call.name, **tool_args})
 
-        return {"actions": actions}, None
+        bundled_args = {"actions": actions}
+        tool = self._get_active_tool(agent_data)
+        postprocess_tool_arguments = getattr(tool, "postprocess_tool_arguments", None)
+        if callable(postprocess_tool_arguments):
+            bundled_args = postprocess_tool_arguments(bundled_args)
+        return bundled_args, None
 
     async def _execute_web_osgym_tool_calls(self, agent_data):
-        tool_call = agent_data.tool_calls[0]
+        max_parallel_calls = getattr(self, "max_parallel_calls", None)
+        if not max_parallel_calls:
+            max_parallel_calls = len(agent_data.tool_calls)
+        selected_tool_calls = agent_data.tool_calls[: max_parallel_calls]
+        tool_call = selected_tool_calls[0]
         active_tools = getattr(agent_data, "_active_tools", {})
         if tool_call.name not in active_tools:
             available = list(active_tools.keys())
@@ -107,7 +118,7 @@ class WebOsGymLoopMixin:
             }
         self._ensure_web_osgym_session(agent_data, tool_call.name)
 
-        if len(agent_data.tool_calls) == 1:
+        if len(selected_tool_calls) == 1:
             try:
                 tool_args = json.loads(tool_call.arguments)
             except (json.JSONDecodeError, TypeError) as exc:
@@ -119,10 +130,13 @@ class WebOsGymLoopMixin:
                 }
 
             tool = self._get_active_tool(agent_data, tool_call.name)
+            postprocess_tool_arguments = getattr(tool, "postprocess_tool_arguments", None)
+            if callable(postprocess_tool_arguments):
+                tool_args = postprocess_tool_arguments(tool_args)
             instance_id = agent_data.extra_fields["web_osgym_instance_id"]
             return await tool.execute(instance_id, tool_args, agent_data=agent_data)
 
-        bundled_args, error_response = self._bundle_web_osgym_tool_calls(agent_data)
+        bundled_args, error_response = self._bundle_web_osgym_tool_calls(agent_data, tool_calls=selected_tool_calls)
         if error_response is not None:
             return error_response, None, {
                 "terminated": False,

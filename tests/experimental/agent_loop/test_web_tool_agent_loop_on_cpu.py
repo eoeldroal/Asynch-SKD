@@ -1,5 +1,6 @@
 import asyncio
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 from PIL import Image
@@ -66,6 +67,18 @@ class _FakeWebTool:
     async def release(self, instance_id):
         self.released.append(instance_id)
         self._instance_dict.pop(instance_id, None)
+
+
+class _FakePostprocessingWebTool(_FakeWebTool):
+    def postprocess_tool_arguments(self, parameters):
+        normalized = deepcopy(parameters)
+        actions = normalized.get("actions") or []
+        for action in actions:
+            if action.get("action_type") == "PRESS" and action.get("key") == "enter":
+                action["key"] = "Enter"
+            if action.get("action_type") == "PRESS" and action.get("key") == "esc":
+                action["key"] = "Escape"
+        return normalized
 
 
 class _FakeTerminalObservationTool(_FakeWebTool):
@@ -625,6 +638,108 @@ def test_processing_bundles_multiple_action_named_tool_calls():
         }
         assert agent_data.metrics["web_osgym/action_count"] == 2
         assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
+
+    asyncio.run(_run())
+
+
+def test_processing_postprocesses_single_bundled_computer_tool_call():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakePostprocessingWebTool()
+        agent_data = _agent_data(tool)
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"PRESS","key":"enter"}]}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert tool.executed[0][1] == {"actions": [{"action_type": "PRESS", "key": "Enter"}]}
+
+    asyncio.run(_run())
+
+
+def test_processing_postprocesses_bundled_action_named_tool_calls():
+    async def _run():
+        loop = _make_loop()
+        tool = _FakePostprocessingWebTool()
+        agent_data = _action_agent_data(tool, action_name="PRESS")
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="PRESS", arguments='{"key":"enter"}'),
+            FunctionCall(name="PRESS", arguments='{"key":"esc"}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert tool.executed[0][1] == {
+            "actions": [
+                {"action_type": "PRESS", "key": "Enter"},
+                {"action_type": "PRESS", "key": "Escape"},
+            ]
+        }
+
+    asyncio.run(_run())
+
+
+def test_processing_respects_max_parallel_calls_for_web_osgym_bundling():
+    async def _run():
+        loop = _make_loop()
+        loop.max_parallel_calls = 1
+        tool = _FakeWebTool()
+        agent_data = _action_agent_data(tool, action_name="CLICK")
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": False,
+            }
+        )
+        tool._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": False,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="CLICK", arguments='{"x":1,"y":2}'),
+            FunctionCall(name="CLICK", arguments='{"x":3,"y":4}'),
+        ]
+
+        next_state = await loop._handle_processing_tools_state(agent_data)
+
+        assert next_state == AgentState.TERMINATED
+        assert tool.executed[0][1] == {"x": 1, "y": 2}
+        assert agent_data.metrics["web_osgym/action_count"] == 1
 
     asyncio.run(_run())
 

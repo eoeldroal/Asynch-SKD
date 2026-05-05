@@ -7,6 +7,13 @@ cd /home/sogang_nlpy/verl
 # The decisive stall fix was upgrading cuDNN from 9.10.2 to 9.15.1.9 in the
 # cloned training env; the settings below are the matched runtime profile that
 # was validated after the actor-side multimodal forward stall cleared.
+#
+# The referenced parquet files are the standard SKD copies generated from:
+#   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_kr_sites.json
+# via:
+#   /home/sogang_nlpy/verl/WebOSWorld/webgym_rl/create_webgym_rl_dataset.py
+WEBGYM_SKD_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl_counter
+WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
 WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
 if [ "$#" -ge 1 ]; then
@@ -23,8 +30,8 @@ VERL_SKD_DEBUG=2 \
 VERL_ASYNC_SKD_TRACE=2 \
 python3 -m verl.trainer.main_ppo \
     model_engine=veomni \
-    "data.train_files=['/home/sogang_nlpy/verl/data/webgym_rl_counter/train.parquet']" \
-    "data.val_files=['/home/sogang_nlpy/verl/data/webgym_rl_counter/val.parquet']" \
+    "data.train_files=['${WEBGYM_SKD_DATASET_DIR}/train.parquet']" \
+    "data.val_files=['${WEBGYM_SKD_DATASET_DIR}/val.parquet']" \
     data.return_raw_chat=True \
     data.train_batch_size=16 \
     data.max_prompt_length=2048 \
@@ -100,7 +107,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=50 \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=50 \
-    actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
+    actor_rollout_ref.rollout.multi_turn.max_parallel_calls=5 \
+    "actor_rollout_ref.rollout.multi_turn.tool_config_path=${WEBGYM_TOOL_CONFIG_PATH}" \
     "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.actor.optim.lr=1e-6 \

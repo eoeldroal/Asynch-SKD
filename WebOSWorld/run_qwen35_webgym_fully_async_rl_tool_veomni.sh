@@ -3,23 +3,10 @@ set -xeuo pipefail
 
 cd /home/sogang_nlpy/verl
 
-# Fully async RL run for Qwen3.5 WebGym tool use.
-#
-# This intentionally follows run_qwen35_math_fully_async_rl_tool_fsdp.sh for
-# training and rollout dynamics. Only the task-facing pieces are swapped to
-# WebGym: dataset, reward function, WebOSGym tool config, and agent loop.
-
 ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni
+WEBGYM_ASYNC_RL_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl
+WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
-# Accepted for interface symmetry with the SKD launcher; fully async RL does
-# not instantiate a teacher and therefore ignores the teacher-only prompt file.
-WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
-if [ "$#" -ge 1 ]; then
-    shift
-fi
-if [ "$#" -ge 1 ]; then
-    shift
-fi
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -28,8 +15,8 @@ WEB_OSGYM_UNIT_TRACE=1 \
 WEB_OSGYM_TOOL_TRACE_DIR="${ROLLOUT_DATA_DIR}/webgym_tool_trace" \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
-    "data.train_files=['/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl/train.parquet']" \
-    "data.val_files=['/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl/val.parquet']" \
+    "data.train_files=['${WEBGYM_ASYNC_RL_DATASET_DIR}/train.parquet']" \
+    "data.val_files=['${WEBGYM_ASYNC_RL_DATASET_DIR}/val.parquet']" \
     data.prompt_key=prompt \
     data.truncation=error \
     data.max_prompt_length=2048 \
@@ -57,7 +44,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=20480 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=36864 \
     actor_rollout_ref.actor.use_single_actor_mini_batch=True \
     actor_rollout_ref.actor.veomni.param_offload=False \
     actor_rollout_ref.actor.veomni.optimizer_offload=False \
@@ -66,10 +53,10 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=36864 \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.90 \
     actor_rollout_ref.rollout.max_model_len=61440 \
@@ -84,7 +71,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=30720 \
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=36864 \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
@@ -93,15 +80,16 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=5 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=5 \
+    actor_rollout_ref.rollout.multi_turn.max_parallel_calls=5 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable=True \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n=5 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample=6 \
-    actor_rollout_ref.rollout.multi_turn.tool_config_path=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml \
+    "actor_rollout_ref.rollout.multi_turn.tool_config_path=${WEBGYM_TOOL_CONFIG_PATH}" \
     "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=64 \
+    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=32 \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/reward_fn_webgym_rl.py \
     reward.custom_reward_function.name=compute_score_webgym_rl \
@@ -121,7 +109,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     rollout.n_gpus_per_node=4 \
     rollout.total_rollout_steps=51200 \
     trainer.total_epochs=10 \
-    async_training.staleness_threshold=0.5 \
+    async_training.staleness_threshold=1.0 \
     async_training.trigger_parameter_sync_step=2 \
     async_training.require_batches=1 \
     async_training.partial_rollout=True \
