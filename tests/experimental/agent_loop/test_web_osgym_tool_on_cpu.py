@@ -7,7 +7,26 @@ from verl.tools.schemas import OpenAIFunctionToolSchema
 from verl.tools.web_osgym_tool import WebOsGymTool
 
 
-def _tool_schema() -> OpenAIFunctionToolSchema:
+def _tool_schema(*, min_items: int | None = None, max_items: int | None = None) -> OpenAIFunctionToolSchema:
+    actions_schema = {
+        "type": "array",
+        "description": "One or more Computer 13 actions.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "action_type": {"type": "string", "description": "Computer 13 action type."},
+                "x": {"type": "integer", "description": "Screen x coordinate."},
+                "y": {"type": "integer", "description": "Screen y coordinate."},
+                "text": {"type": "string", "description": "Typing payload."},
+            },
+            "required": ["action_type"],
+        },
+    }
+    if min_items is not None:
+        actions_schema["minItems"] = min_items
+    if max_items is not None:
+        actions_schema["maxItems"] = max_items
+
     return OpenAIFunctionToolSchema.model_validate(
         {
             "type": "function",
@@ -17,20 +36,7 @@ def _tool_schema() -> OpenAIFunctionToolSchema:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "actions": {
-                            "type": "array",
-                            "description": "One or more Computer 13 actions.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "action_type": {"type": "string", "description": "Computer 13 action type."},
-                                    "x": {"type": "integer", "description": "Screen x coordinate."},
-                                    "y": {"type": "integer", "description": "Screen y coordinate."},
-                                    "text": {"type": "string", "description": "Typing payload."},
-                                },
-                                "required": ["action_type"],
-                            },
-                        },
+                        "actions": actions_schema,
                     },
                     "required": ["actions"],
                 },
@@ -320,6 +326,84 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.x, 10)
         self.assertEqual(action.y, 20)
 
+    async def test_tool_execute_normalizes_press_key_alias(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "PRESS", "key": "enter"}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "PRESS")
+        self.assertEqual(action.key, "Enter")
+
+    async def test_tool_execute_normalizes_hotkey_key_aliases(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["ctrl", "right"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Control", "ArrowRight"])
+
+    async def test_action_named_tool_execute_normalizes_press_key_alias(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(
+            config={"base_url": "http://env"},
+            tool_schema=_action_tool_schema(
+                "PRESS",
+                properties={
+                    "key": {"type": "string"},
+                },
+                required=["key"],
+            ),
+        )
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"key": "esc"})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "PRESS")
+        self.assertEqual(action.key, "Escape")
+
     async def test_tool_execute_uses_current_cursor_for_click_without_coordinates(self):
         seen = {}
 
@@ -365,6 +449,36 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("CLICK omitted x/y", response.text)
         self.assertTrue(metrics["invalid_action"])
+        self.assertFalse(tool.client.action_called)
+
+    async def test_tool_execute_rejects_action_bundles_above_schema_max_items(self):
+        class _FakeClient:
+            def __init__(self):
+                self.action_called = False
+
+            async def action(self, **kwargs):
+                self.action_called = True
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema(min_items=1, max_items=2))
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, _, metrics = await tool.execute(
+            "i1",
+            {
+                "actions": [
+                    {"action_type": "WAIT"},
+                    {"action_type": "WAIT"},
+                    {"action_type": "WAIT"},
+                ]
+            },
+        )
+
+        self.assertIn("between 1 and 2 actions", response.text)
+        self.assertIn("got 3", response.text)
+        self.assertIn("No actions were executed", response.text)
+        self.assertTrue(metrics["invalid_action"])
+        self.assertEqual(metrics["action_count"], 0)
         self.assertFalse(tool.client.action_called)
 
     async def test_tool_execute_uses_current_cursor_for_double_click_without_coordinates(self):

@@ -399,6 +399,9 @@ class ToolAgentLoop(AgentLoopBase):
         tool, instance_id = None, None
         try:
             tool = active_tools[tool_name]
+            postprocess_tool_arguments = getattr(tool, "postprocess_tool_arguments", None)
+            if callable(postprocess_tool_arguments):
+                tool_args = postprocess_tool_arguments(tool_args)
             kwargs = tools_kwargs.get(tool_name, {})
             instance_id, _ = await tool.create(create_kwargs=kwargs.get("create_kwargs", {}))
             tool_execution_response, tool_reward, res = await tool.execute(

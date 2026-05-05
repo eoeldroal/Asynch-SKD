@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -48,6 +49,66 @@ def _scale_relative_coordinate(value: int, screen_extent: int, axis_name: str) -
     if screen_extent <= 0:
         raise ValueError(f"screen {axis_name} extent must be positive, got {screen_extent}")
     return round(value * (screen_extent - 1) / 999)
+
+
+_PLAYWRIGHT_KEY_ALIASES = {
+    "enter": "Enter",
+    "return": "Enter",
+    "esc": "Escape",
+    "escape": "Escape",
+    "tab": "Tab",
+    "space": "Space",
+    "spacebar": "Space",
+    "backspace": "Backspace",
+    "delete": "Delete",
+    "del": "Delete",
+    "insert": "Insert",
+    "ins": "Insert",
+    "home": "Home",
+    "end": "End",
+    "pageup": "PageUp",
+    "pagedown": "PageDown",
+    "up": "ArrowUp",
+    "down": "ArrowDown",
+    "left": "ArrowLeft",
+    "right": "ArrowRight",
+    "ctrl": "Control",
+    "control": "Control",
+    "alt": "Alt",
+    "option": "Alt",
+    "shift": "Shift",
+    "cmd": "Meta",
+    "command": "Meta",
+    "meta": "Meta",
+}
+
+
+def _normalize_playwright_key_alias(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    stripped = value.strip()
+    if not stripped:
+        return value
+    return _PLAYWRIGHT_KEY_ALIASES.get(stripped.lower(), value)
+
+
+def _normalize_web_osgym_action_payload(raw_action: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = dict(raw_action)
+    action_type = normalized.get("action_type")
+    if action_type in {"PRESS", "KEY_DOWN", "KEY_UP"} and "key" in normalized:
+        normalized["key"] = _normalize_playwright_key_alias(normalized.get("key"))
+    elif action_type == "HOTKEY" and isinstance(normalized.get("keys"), list):
+        normalized["keys"] = [_normalize_playwright_key_alias(key) for key in normalized["keys"]]
+    return normalized
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class WebOsGymTool(BaseTool):
@@ -187,6 +248,58 @@ class WebOsGymTool(BaseTool):
                     f"{self.name}.{parameter_name} must be one of {enum_values}, got {value!r}"
                 )
 
+    def _get_action_count_bounds(self) -> tuple[int | None, int | None]:
+        if self._is_action_named_tool():
+            return None, None
+        actions_schema = self.tool_schema.function.parameters.properties.get("actions")
+        if actions_schema is None:
+            return None, None
+        schema_extra = getattr(actions_schema, "model_extra", None) or {}
+        min_items = _coerce_optional_int(schema_extra.get("minItems"))
+        max_items = _coerce_optional_int(schema_extra.get("maxItems"))
+        return min_items, max_items
+
+    def _validate_action_count(self, action_count: int) -> None:
+        min_items, max_items = self._get_action_count_bounds()
+        if min_items is None and max_items is None:
+            if action_count < 1:
+                raise ValueError("Web/OSGym bundled action tool requires a non-empty actions list")
+            return
+
+        min_ok = min_items is None or action_count >= min_items
+        max_ok = max_items is None or action_count <= max_items
+        if min_ok and max_ok:
+            return
+
+        if min_items is not None and max_items is not None:
+            range_text = f"between {min_items} and {max_items}"
+        elif min_items is not None:
+            range_text = f"at least {min_items}"
+        else:
+            range_text = f"at most {max_items}"
+        raise ValueError(
+            f"Web/OSGym bundled action tool requires {range_text} actions, got {action_count}. "
+            "No actions were executed."
+        )
+
+    def postprocess_tool_arguments(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(parameters, Mapping):
+            return parameters
+
+        normalized = deepcopy(dict(parameters))
+        if self._is_action_named_tool():
+            normalized_action = _normalize_web_osgym_action_payload({"action_type": self.name, **normalized})
+            normalized_action.pop("action_type", None)
+            return normalized_action
+
+        raw_actions = normalized.get("actions")
+        if not isinstance(raw_actions, list):
+            return normalized
+        normalized["actions"] = [
+            _normalize_web_osgym_action_payload(action) if isinstance(action, Mapping) else action for action in raw_actions
+        ]
+        return normalized
+
     def _normalize_actions(
         self, actions: list[WebOsGymAction], state: dict[str, Any]
     ) -> tuple[list[WebOsGymAction], int | None, int | None]:
@@ -256,8 +369,9 @@ class WebOsGymTool(BaseTool):
     def _parse_raw_actions(
         self, raw_actions: Any, state: dict[str, Any]
     ) -> tuple[list[WebOsGymAction], int | None, int | None]:
-        if not isinstance(raw_actions, list) or not raw_actions:
-            raise ValueError("Web/OSGym bundled action tool requires a non-empty actions list")
+        if not isinstance(raw_actions, list):
+            raise ValueError("Web/OSGym bundled action tool requires an actions list")
+        self._validate_action_count(len(raw_actions))
 
         actions = []
         for index, raw_action in enumerate(raw_actions):
@@ -266,7 +380,7 @@ class WebOsGymTool(BaseTool):
                     f"Web/OSGym actions[{index}] must be an object matching the action schema, "
                     f"got {type(raw_action).__name__}"
                 )
-            actions.append(WebOsGymAction(**raw_action))
+            actions.append(WebOsGymAction(**_normalize_web_osgym_action_payload(raw_action)))
 
         terminal_actions = [action for action in actions if action.action_type in {"DONE", "FAIL"}]
         if terminal_actions and len(actions) != 1:

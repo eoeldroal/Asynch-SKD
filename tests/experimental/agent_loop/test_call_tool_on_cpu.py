@@ -57,6 +57,17 @@ class FakeTool:
         pass
 
 
+class FakePostprocessingTool(FakeTool):
+    """A fake tool that postprocesses arguments before execution."""
+
+    def postprocess_tool_arguments(self, parameters):
+        actions = parameters.get("actions") or []
+        for action in actions:
+            if action.get("action_type") == "PRESS" and action.get("key") == "enter":
+                action["key"] = "Enter"
+        return parameters
+
+
 class FakeFailingTool(FakeTool):
     """A fake tool that raises during execute."""
 
@@ -136,6 +147,18 @@ class TestCallToolErrorHandling(unittest.IsolatedAsyncioTestCase):
         assert reward == 0.0
         assert "failing_tool" in response.text
         assert "database connection failed" in response.text
+
+    async def test_call_tool_runs_tool_argument_postprocess_hook(self):
+        """Tool argument postprocessing should run before execute."""
+        tools = {"computer": FakePostprocessingTool("computer")}
+        loop = _make_tool_agent_loop(tools)
+        tool_call = FakeFunctionCall(
+            name="computer",
+            arguments='{"actions":[{"action_type":"PRESS","key":"enter"}]}',
+        )
+        response, reward, _ = await loop._call_tool(tool_call, {}, self.agent_data)
+        assert reward == 1.0
+        assert "Enter" in response.text
 
 
 if __name__ == "__main__":
