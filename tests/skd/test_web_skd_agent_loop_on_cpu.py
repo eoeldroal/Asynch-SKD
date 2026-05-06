@@ -100,6 +100,7 @@ def _build_loop():
     loop.prompt_length = 64
     loop.tool_parser_name = "qwen3_coder"
     loop.processor = None
+    loop.apply_chat_template_kwargs = {}
 
     async def _fake_apply_server_chat_template(messages, **kwargs):
         return [21, 22]
@@ -251,6 +252,8 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             return [11, 12] + [90] * (3 * len(images))
 
         async def _fake_apply_server_chat_template(messages, **kwargs):
+            if messages and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 21, 22]
             return [21, 22]
 
         loop.apply_chat_template = _fake_apply_chat_template
@@ -273,10 +276,10 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 "web_osgym_instance_id": "instance-1",
                 "web_osgym_task_id": "12345",
                 "web_osgym_session_id": 101,
-                "web_osgym_include_a11y": True,
-                "teacher_prompt_ids": [1, 2, 3],
-                "teacher_server_prompt_ids": [1, 2, 3],
-                "server_prompt_ids": [1, 2, 3],
+                    "web_osgym_include_a11y": True,
+                    "teacher_prompt_ids": [1, 2, 3],
+                    "teacher_server_prompt_ids": [1, 2, 3],
+                    "server_prompt_ids": [1, 2, 3],
                 "teacher_sglang_prefix_surplus": 0,
                 "teacher_ids_list": [],
                 "teacher_logprobs_list": [],
@@ -531,7 +534,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(begin_event["tool_calls_len"], 2)
         self.assertEqual(begin_event["tool_call_names"], ["CLICK", "CLICK"])
 
-    async def test_processing_tools_requires_existing_server_prompt_stream(self):
+    async def test_processing_tools_rebuilds_server_prompt_stream_from_current_messages(self):
         loop = _build_loop()
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
 
@@ -559,7 +562,6 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 "web_osgym_session_id": 101,
                 "web_osgym_include_a11y": True,
                 "teacher_prompt_ids": [1, 2, 3],
-                "teacher_server_prompt_ids": [1, 2, 3],
                 "teacher_ids_list": [],
                 "teacher_logprobs_list": [],
                 "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
@@ -576,10 +578,13 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             )()
         ]
 
-        with self.assertRaisesRegex(ValueError, "server_prompt_ids"):
-            await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
-    async def test_processing_tools_requires_teacher_streams_before_committing_bundle(self):
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [21, 22])
+        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [21, 22])
+
+    async def test_processing_tools_rebuilds_teacher_prompt_streams_for_image_boundary(self):
         loop = _build_loop()
         loop.tools = {"computer": _ImageFakeTool()}
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
@@ -624,19 +629,13 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 },
             )()
         ]
-        before_messages = deepcopy(agent_data.messages)
-        before_prompt_ids = list(agent_data.prompt_ids)
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
-        with self.assertRaisesRegex(ValueError, "teacher_server_prompt_ids"):
-            await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
-
-        self.assertEqual(agent_data.messages, before_messages)
-        self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
-        self.assertEqual(agent_data.response_mask, [])
-        self.assertEqual(agent_data.image_data, [])
-        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [1, 2, 3])
-        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3])
-        self.assertEqual(agent_data.extra_fields["web_osgym_teacher_messages"], [{"role": "user", "content": "task"}])
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [21, 22])
+        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [21, 22])
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 11, 12])
+        self.assertEqual(agent_data.image_data, ["image-1"])
 
     async def test_processing_tools_discards_whole_observation_bundle_on_response_cutoff(self):
         loop = _build_loop()
@@ -808,6 +807,8 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                     "web_osgym_task_id": "12345",
                     "web_osgym_session_id": 101,
                     "web_osgym_include_a11y": True,
+                    "teacher_prompt_ids": [],
+                    "web_osgym_teacher_messages": [],
                 }
             )
 
@@ -863,11 +864,11 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_server_template(messages, tools=None, remove_system_prompt=False):
             del tools, remove_system_prompt
-            if messages and messages[0]["role"] == "tool":
-                content = messages[0]["content"]
+            if messages and messages[-1]["role"] == "tool":
+                content = messages[-1]["content"]
                 if any(item.get("type") == "text" for item in content):
-                    return [91, 92]
-                return [81, 82]
+                    return [1, 2, 3, 91, 92]
+                return [1, 2, 3, 81, 82]
             return [41]
 
         async def _never_overflow(*args, **kwargs):
@@ -945,8 +946,8 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_server_template(messages, tools=None, remove_system_prompt=False):
             del tools, remove_system_prompt
-            if messages and messages[0]["role"] == "tool":
-                return [81, 82]
+            if messages and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 81, 82]
             return [91]
 
         async def _never_overflow(*args, **kwargs):

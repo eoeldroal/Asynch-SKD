@@ -239,6 +239,7 @@ def make_skd_loop(
     loop.max_assistant_turns = None
     loop.max_user_turns = None
     loop.processor = None
+    loop.apply_chat_template_kwargs = {}
     return loop
 
 
@@ -268,6 +269,7 @@ def make_web_skd_loop(
     loop.max_assistant_turns = None
     loop.max_user_turns = None
     loop.processor = None
+    loop.apply_chat_template_kwargs = {}
     return loop
 
 
@@ -786,6 +788,16 @@ async def test_web_skd_image_generation_keeps_input_ids_request_view():
     async def _skip_reward(*args, **kwargs):
         del args, kwargs
 
+    async def _recompute_student(agent_data_arg, messages):
+        del agent_data_arg, messages
+        return [1, 2, 3]
+
+    async def _recompute_teacher(agent_data_arg, teacher_messages):
+        del agent_data_arg, teacher_messages
+        return [1, 2, 3]
+
+    loop._recompute_server_prompt_ids = _recompute_student
+    loop._recompute_teacher_server_prompt_ids = _recompute_teacher
     loop._finalize_with_web_osgym_reward = _skip_reward
 
     state = await loop._handle_generating_state(
@@ -803,26 +815,30 @@ async def test_web_skd_image_generation_keeps_input_ids_request_view():
 
 
 @pytest.mark.asyncio
-async def test_web_skd_teacher_verify_uses_tracked_streams_without_recompute():
+async def test_web_skd_teacher_verify_rebuilds_request_views_from_current_messages():
     loop = make_web_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
     agent_data = make_agent_data([1, 2, 3])
     agent_data.image_data = ["image-1"]
     agent_data.extra_fields.update(
         {
-            "server_prompt_ids": [1, 2, 3],
             "teacher_prompt_ids": [1, 2, 3, 900, 901],
-            "teacher_server_prompt_ids": [1, 2, 3],
-            "teacher_sglang_prefix_surplus": 2,
-            "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            "server_prompt_ids": [999],
+            "teacher_server_prompt_ids": [888],
+            "teacher_sglang_prefix_surplus": 0,
+            "web_osgym_teacher_messages": [{"role": "user", "content": "task"}, {"role": "tool", "content": [{"type": "image"}]}],
         }
     )
 
-    async def _boom(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("verify-time teacher recompute must not run under ids-only contract")
+    async def _recompute_student(agent_data_arg, messages):
+        del agent_data_arg, messages
+        return [1, 2, 3]
 
-    loop._recompute_teacher_prompt_ids = _boom
-    loop._recompute_teacher_server_prompt_ids = _boom
+    async def _recompute_teacher(agent_data_arg, teacher_messages):
+        del agent_data_arg, teacher_messages
+        return [1, 2, 3]
+
+    loop._recompute_server_prompt_ids = _recompute_student
+    loop._recompute_teacher_server_prompt_ids = _recompute_teacher
 
     state = await loop._handle_generating_state(
         agent_data,
@@ -832,6 +848,8 @@ async def test_web_skd_teacher_verify_uses_tracked_streams_without_recompute():
     )
 
     assert state == AgentState.GENERATING
+    student_call = loop.server_manager.call_log[0]
+    assert student_call["prompt_ids"] == [1, 2, 3]
     teacher_call = loop.teacher_server_manager.call_log[0]
     assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
     assert teacher_call["expected_mm_prefix_surplus"] == 2
@@ -851,8 +869,20 @@ async def test_web_skd_teacher_verification_span_stays_stable_across_image_tool_
             "teacher_prompt_ids": [1, 2, 3, 71, 72, 73, 74],
             "teacher_server_prompt_ids": list(original_teacher_server_prompt_ids),
             "teacher_sglang_prefix_surplus": 2,
+            "web_osgym_teacher_messages": [{"role": "user", "content": "question"}, {"role": "tool", "content": [{"type": "image"}]}],
         }
     )
+
+    async def _recompute_student(agent_data_arg, messages):
+        del agent_data_arg, messages
+        return [1, 2, 3, 81, 82]
+
+    async def _recompute_teacher(agent_data_arg, teacher_messages):
+        del agent_data_arg, teacher_messages
+        return list(original_teacher_server_prompt_ids)
+
+    loop._recompute_server_prompt_ids = _recompute_student
+    loop._recompute_teacher_server_prompt_ids = _recompute_teacher
 
     state = await loop._handle_generating_state(
         agent_data,
