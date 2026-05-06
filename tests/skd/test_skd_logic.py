@@ -783,6 +783,11 @@ async def test_web_skd_image_generation_keeps_input_ids_request_view():
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
 
+    async def _skip_reward(*args, **kwargs):
+        del args, kwargs
+
+    loop._finalize_with_web_osgym_reward = _skip_reward
+
     state = await loop._handle_generating_state(
         agent_data,
         {"max_tokens": 8},
@@ -831,6 +836,43 @@ async def test_web_skd_teacher_verify_uses_tracked_streams_without_recompute():
     assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
     assert teacher_call["expected_mm_prefix_surplus"] == 2
     assert teacher_call["expected_logprob_rows"] == 2
+    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+
+
+@pytest.mark.asyncio
+async def test_web_skd_teacher_verification_span_stays_stable_across_image_tool_boundary():
+    loop = make_web_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3, 61, 62, 63, 64])
+    agent_data.image_data = ["image-1"]
+    original_teacher_server_prompt_ids = [1, 2, 3, 91, 92]
+    agent_data.extra_fields.update(
+        {
+            "server_prompt_ids": [1, 2, 3, 81, 82],
+            "teacher_prompt_ids": [1, 2, 3, 71, 72, 73, 74],
+            "teacher_server_prompt_ids": list(original_teacher_server_prompt_ids),
+            "teacher_sglang_prefix_surplus": 2,
+        }
+    )
+
+    state = await loop._handle_generating_state(
+        agent_data,
+        {"max_tokens": 2},
+        ignore_termination=False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert state == AgentState.GENERATING
+    student_call = loop.server_manager.call_log[0]
+    assert student_call["prompt_ids"] == [1, 2, 3, 81, 82]
+    assert student_call["image_data"] == ["image-1"]
+    teacher_call = loop.teacher_server_manager.call_log[0]
+    assert teacher_call["sequence_ids"] == original_teacher_server_prompt_ids + [10, 11]
+    assert teacher_call["logprob_start_len"] == 6
+    assert teacher_call["expected_mm_prefix_surplus"] == 2
+    assert teacher_call["expected_logprob_rows"] == 2
+    assert teacher_call["chunk"] == [10, 11]
+    assert agent_data.extra_fields["teacher_server_prompt_ids"] == original_teacher_server_prompt_ids + [10, 11]
+    assert agent_data.extra_fields["teacher_sglang_prefix_surplus"] == 2
     assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
 
 

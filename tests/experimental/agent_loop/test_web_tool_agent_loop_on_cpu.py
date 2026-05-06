@@ -8,7 +8,7 @@ from PIL import Image
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.tool_parser import FunctionCall
-from verl.experimental.agent_loop.web_tool_agent_loop import WebOsGymToolAgentLoop
+from verl.experimental.agent_loop.web_tool_agent_loop import WebOsGymToolAgentLoop, _WebOsGymGenerationInput
 from verl.tools.schemas import ToolResponse
 from verl.workers.rollout.replica import TokenOutput
 
@@ -325,6 +325,8 @@ def test_windowed_generation_uses_harness_prompt_window():
     async def _run():
         loop = _make_loop()
         loop.rollout_config = SimpleNamespace(
+            name="vllm",
+            custom={},
             multi_turn=SimpleNamespace(
                 web_osgym_window_enable=True,
                 web_osgym_window_history_n=1,
@@ -402,6 +404,81 @@ def test_windowed_generation_uses_harness_prompt_window():
         assert window["text_only_recent_step_count"] == 0
         assert agent_data.extra_fields["web_osgym_assistant_turns"][-1]["observation_step_idx"] == 2
         assert agent_data.extra_fields["web_osgym_assistant_turns"][-1]["response_text"] == "A2"
+
+    asyncio.run(_run())
+
+
+def test_generation_uses_compact_server_prompt_ids_for_image_bearing_sglang_requests():
+    class _FakeServerManager:
+        def __init__(self):
+            self.calls = []
+
+        async def generate(self, **kwargs):
+            self.calls.append(kwargs)
+            return TokenOutput(
+                token_ids=[201],
+                log_probs=[-0.1],
+                num_preempted=0,
+                stop_reason=None,
+                extra_fields={"global_steps": 0},
+            )
+
+    class _FakeToolParser:
+        async def extract_tool_calls(self, response_ids, tools):
+            del response_ids, tools
+            return "", []
+
+    async def _run():
+        loop = _make_loop()
+        loop.tool_parser_name = "noop"
+        loop.rollout_config = SimpleNamespace(
+            name="sglang",
+            skip_tokenizer_init=False,
+            custom={},
+            multi_turn=SimpleNamespace(
+                web_osgym_window_enable=True,
+                web_osgym_window_history_n=1,
+                web_osgym_window_max_images_per_sample=6,
+            ),
+        )
+        loop.server_manager = _FakeServerManager()
+        loop.tool_parser = _FakeToolParser()
+
+        expanded_prompt_ids = [301, 302, 303, 304]
+        compact_prompt_ids = [41, 42]
+
+        async def _fake_build_generation_inputs(agent_data):
+            del agent_data
+            return _WebOsGymGenerationInput(
+                prompt_ids=expanded_prompt_ids,
+                server_prompt_ids=compact_prompt_ids,
+                images=["image-1"],
+                videos=None,
+                window_used=True,
+                image_indices=[0],
+                selected_step_indices=[1],
+                old_summary_turn_indices=[],
+                recent_observation_step_indices=[1],
+                recent_assistant_turn_indices=[],
+                text_only_recent_step_count=0,
+            )
+
+        loop._build_web_osgym_generation_inputs = _fake_build_generation_inputs
+
+        agent_data = _agent_data(_FakeWebTool())
+        agent_data.prompt_ids = [100]
+        agent_data.extra_fields["web_osgym_reward_score"] = 0.0
+
+        state = await loop._handle_generating_state(agent_data, {})
+
+        assert state == AgentState.TERMINATED
+        generate_call = loop.server_manager.calls[0]
+        assert generate_call["prompt_ids"] == compact_prompt_ids
+        assert generate_call["image_data"] == ["image-1"]
+        assert agent_data.extra_fields["web_osgym_generation_windows"][0]["prompt_ids"] == expanded_prompt_ids
+        assert agent_data.extra_fields["web_osgym_generation_windows"][0]["window_used"] is True
+        assert agent_data.prompt_ids == [100, 201]
+        assert agent_data.response_mask == [1]
 
     asyncio.run(_run())
 
