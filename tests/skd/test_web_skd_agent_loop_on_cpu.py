@@ -409,6 +409,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
     async def test_processing_tools_bundles_multiple_action_named_tool_calls(self):
         loop = _build_loop()
+        loop.max_parallel_calls = 2
         tool = _ActionFakeTool()
         loop.tools = {"CLICK": tool}
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
@@ -816,6 +817,91 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(state, AgentState.TERMINATED)
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+
+    async def test_student_observation_commit_appends_compact_delta_ids_for_image_boundary(self):
+        loop = _build_loop()
+        loop.loop = __import__("asyncio").get_running_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        loop.teacher_server_manager = None
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-student-image-boundary",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = {"computer": _ImageFakeTool()}
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "task-1",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+            }
+        )
+
+        async def _fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, tools=None):
+            del videos, remove_system_prompt, tools
+            if messages and messages[0]["role"] == "tool" and images:
+                content = messages[0]["content"]
+                if any(item.get("type") == "text" for item in content):
+                    return [71, 72, 73, 74]
+                return [61, 62, 63, 64]
+            return [51, 52]
+
+        async def _fake_server_template(messages, tools=None, remove_system_prompt=False):
+            del tools, remove_system_prompt
+            if messages and messages[0]["role"] == "tool":
+                content = messages[0]["content"]
+                if any(item.get("type") == "text" for item in content):
+                    return [91, 92]
+                return [81, 82]
+            return [41]
+
+        async def _never_overflow(*args, **kwargs):
+            del args, kwargs
+            return False
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_server_template
+        loop._terminate_if_teacher_prefix_overflows = _never_overflow
+
+        agent_data.tool_calls = [
+            type(
+                "ToolCall",
+                (),
+                {"name": "computer", "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}'},
+            )()
+        ]
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.messages[-1], {"role": "tool", "content": [{"type": "image"}]})
+        self.assertEqual(agent_data.image_data, ["image-1"])
+        self.assertEqual(agent_data.prompt_ids, [1, 2, 3, 61, 62, 63, 64])
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [1, 2, 3, 81, 82])
+        self.assertEqual(agent_data.response_mask, [0, 0, 0, 0])
+        self.assertEqual(agent_data.user_turns, 1)
+        self.assertEqual(
+            agent_data.extra_fields["mini_step_image_spans"],
+            [{"step_idx": 1, "image_start": 0, "image_end": 1, "terminal": False}],
+        )
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 71, 72, 73, 74])
+        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [1, 2, 3, 91, 92])
+        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 2)
 
     async def test_teacher_observation_commit_appends_canonical_delta_ids(self):
         loop = _build_loop()
