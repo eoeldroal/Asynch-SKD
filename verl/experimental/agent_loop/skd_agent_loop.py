@@ -447,13 +447,6 @@ class SkdAgentLoop(ToolAgentLoop):
         if clear_response_ids:
             agent_data.response_ids = []
 
-    def _compose_turn_prompt_ids(self, committed_prompt_ids: list[int], turn_tokens: list[int]) -> list[int]:
-        if not turn_tokens:
-            return list(committed_prompt_ids)
-        if committed_prompt_ids[-len(turn_tokens) :] == turn_tokens:
-            return list(committed_prompt_ids)
-        return list(committed_prompt_ids) + list(turn_tokens)
-
     def _commit_pending_turn_state(
         self,
         agent_data: AgentData,
@@ -967,12 +960,9 @@ class SkdAgentLoop(ToolAgentLoop):
         committed_teacher_server_prompt_ids = agent_data.extra_fields.setdefault(
             "teacher_server_prompt_ids", list(committed_teacher_prompt_ids)
         )
-        teacher_prompt_ids = self._compose_turn_prompt_ids(committed_teacher_prompt_ids, turn_response_ids)
-        server_prompt_ids = self._compose_turn_prompt_ids(committed_server_prompt_ids, turn_response_ids)
-        teacher_server_prompt_ids = self._compose_turn_prompt_ids(
-            committed_teacher_server_prompt_ids,
-            turn_response_ids,
-        )
+        teacher_prompt_ids = list(committed_teacher_prompt_ids) + list(turn_response_ids)
+        server_prompt_ids = list(committed_server_prompt_ids) + list(turn_response_ids)
+        teacher_server_prompt_ids = list(committed_teacher_server_prompt_ids) + list(turn_response_ids)
 
         # Debug: token-level alignment logging for first N samples
         SkdAgentLoop._debug_sample_count += 1
@@ -1450,13 +1440,7 @@ class SkdAgentLoop(ToolAgentLoop):
                 finalize_assistant_turn=True,
             )
             turn_response_ids = list(agent_data.response_ids)
-        elif termination_reason in forced_cutoff_reasons:
-            self._commit_pending_turn_state(
-                agent_data,
-                turn_state,
-                pending_chunks=pending_turn_chunks,
-                finalize_assistant_turn=False,
-            )
+        else:
             turn_response_ids = list(agent_data.response_ids)
 
         # Compute accept rate metric
