@@ -194,6 +194,27 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             teacher_sglang_prefix_surplus,
         )
 
+    async def _build_student_request_prompt_ids(
+        self,
+        agent_data: AgentData,
+        turn_state: SkdTurnChunkState,
+    ) -> list[int]:
+        student_request_prompt_ids, _, _, _ = await self._build_request_prompt_views_from_turn_state(
+            agent_data,
+            turn_state,
+        )
+        return student_request_prompt_ids
+
+    async def _build_teacher_verify_request_view(
+        self,
+        agent_data: AgentData,
+        turn_state: SkdTurnChunkState,
+    ) -> tuple[list[int], list[int], int]:
+        _, teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await self._build_request_prompt_views_from_turn_state(agent_data, turn_state)
+        )
+        return teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
+
     def _resolve_request_prompt_inputs_from_agent_state(
         self,
         agent_data: AgentData,

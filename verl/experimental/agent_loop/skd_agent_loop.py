@@ -475,22 +475,17 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data: AgentData,
         turn_state: SkdTurnChunkState,
     ) -> tuple[list[int], list[int], list[int], int]:
-        turn_tokens = list(turn_state.tokens)
-        committed_teacher_prompt_ids = agent_data.extra_fields.setdefault("teacher_prompt_ids", list(agent_data.prompt_ids))
-        committed_server_prompt_ids = agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids))
-        committed_teacher_server_prompt_ids = agent_data.extra_fields.setdefault(
-            "teacher_server_prompt_ids",
-            list(committed_teacher_prompt_ids),
+        student_request_prompt_ids = await self._build_student_request_prompt_ids(
+            agent_data,
+            turn_state,
         )
-        has_teacher_multimodal = bool(_safe_len(agent_data.image_data) or _safe_len(agent_data.video_data))
-        teacher_sglang_prefix_surplus = _teacher_sglang_prefix_surplus_from_fields(
-            agent_data.extra_fields,
-            has_multimodal=has_teacher_multimodal,
+        teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await self._build_teacher_verify_request_view(agent_data, turn_state)
         )
         return (
-            list(committed_server_prompt_ids) + turn_tokens,
-            list(committed_teacher_prompt_ids) + turn_tokens,
-            list(committed_teacher_server_prompt_ids) + turn_tokens,
+            student_request_prompt_ids,
+            teacher_prompt_ids,
+            teacher_server_prompt_ids,
             teacher_sglang_prefix_surplus,
         )
 
@@ -499,20 +494,19 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data: AgentData,
         turn_state: SkdTurnChunkState,
     ) -> list[int]:
-        student_request_prompt_ids, _, _, _ = await self._build_request_prompt_views_from_turn_state(
-            agent_data,
-            turn_state,
-        )
-        return student_request_prompt_ids
+        return list(agent_data.prompt_ids) + list(turn_state.tokens)
 
     async def _build_teacher_verify_request_view(
         self,
         agent_data: AgentData,
         turn_state: SkdTurnChunkState,
     ) -> tuple[list[int], list[int], int]:
-        _, teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
-            await self._build_request_prompt_views_from_turn_state(agent_data, turn_state)
-        )
+        committed_teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
+        if committed_teacher_prompt_ids is None:
+            committed_teacher_prompt_ids = agent_data.prompt_ids
+        teacher_prompt_ids = list(committed_teacher_prompt_ids) + list(turn_state.tokens)
+        teacher_server_prompt_ids = list(teacher_prompt_ids)
+        teacher_sglang_prefix_surplus = max(len(teacher_prompt_ids) - len(teacher_server_prompt_ids), 0)
         return teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
 
     def _commit_pending_turn_state(

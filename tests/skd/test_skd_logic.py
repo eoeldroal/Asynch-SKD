@@ -1070,18 +1070,18 @@ def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
 
 
 @pytest.mark.asyncio
-async def test_skd_request_views_derive_from_committed_state_and_pending_turn():
+async def test_teacher_verify_uses_current_prefix_state():
     loop = make_skd_loop(student_chunks=[])
-    agent_data = make_agent_data([1, 2, 10])
-    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 10]
-    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 10]
-    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 10]
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.extra_fields["server_prompt_ids"] = [999]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 30, 31]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [888]
     pending_turn = SkdTurnChunkState(
-        tokens=[10],
-        teacher_ids_rows=[[10, 0, 0, 0]],
-        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K],
-        raw_chunk=[10],
-        verified_chunk=[10],
+        tokens=[10, 11],
+        teacher_ids_rows=[[10, 0, 0, 0], [11, 0, 0, 0]],
+        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        raw_chunk=[10, 11],
+        verified_chunk=[10, 11],
     )
 
     student_request_prompt_ids = await loop._build_student_request_prompt_ids(agent_data, pending_turn)
@@ -1089,9 +1089,9 @@ async def test_skd_request_views_derive_from_committed_state_and_pending_turn():
         await loop._build_teacher_verify_request_view(agent_data, pending_turn)
     )
 
-    assert student_request_prompt_ids == [1, 2, 10, 10]
-    assert teacher_prompt_ids == [1, 2, 10, 10]
-    assert teacher_server_prompt_ids == [1, 2, 10, 10]
+    assert student_request_prompt_ids == [1, 2, 3, 10, 11]
+    assert teacher_prompt_ids == [1, 2, 30, 31, 10, 11]
+    assert teacher_server_prompt_ids == [1, 2, 30, 31, 10, 11]
     assert teacher_sglang_prefix_surplus == 0
 
 
