@@ -162,26 +162,26 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         )
         return server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
 
-    async def _refresh_request_prompt_views(
+    def _resolve_request_prompt_inputs_from_agent_state(
         self,
         agent_data: AgentData,
-        *,
-        student_messages: list[dict] | None = None,
-        teacher_messages: list[dict] | None = None,
-        teacher_prompt_ids: list[int] | None = None,
-        image_data: list[Any] | None = None,
-    ) -> None:
-        if student_messages is None:
-            student_messages = list(agent_data.messages)
-        if teacher_messages is None:
-            teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages") or [])
-            if not teacher_messages:
-                teacher_messages = deepcopy(student_messages)
+    ) -> tuple[list[dict], list[dict], list[int], list[Any] | None]:
+        student_messages = list(agent_data.messages)
+        teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages") or [])
+        if not teacher_messages:
+            teacher_messages = deepcopy(student_messages)
         teacher_messages = self._build_teacher_messages(deepcopy(teacher_messages))
-        if teacher_prompt_ids is None:
-            teacher_prompt_ids = self._require_prompt_stream(agent_data, "teacher_prompt_ids")
-        if image_data is None:
-            image_data = agent_data.image_data
+        teacher_prompt_ids = self._require_prompt_stream(agent_data, "teacher_prompt_ids")
+        image_data = agent_data.image_data
+        return student_messages, teacher_messages, teacher_prompt_ids, image_data
+
+    async def _refresh_request_prompt_views_from_agent_state(
+        self,
+        agent_data: AgentData,
+    ) -> None:
+        student_messages, teacher_messages, teacher_prompt_ids, image_data = (
+            self._resolve_request_prompt_inputs_from_agent_state(agent_data)
+        )
 
         server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
             await self._build_request_prompt_views(
@@ -687,7 +687,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         ignore_termination: bool = False,
         stop_after_skd_chunk: bool = False,
     ) -> AgentState:
-        await self._refresh_request_prompt_views(agent_data)
+        await self._refresh_request_prompt_views_from_agent_state(agent_data)
         next_state = await super()._handle_generating_state(
             agent_data,
             sampling_params,

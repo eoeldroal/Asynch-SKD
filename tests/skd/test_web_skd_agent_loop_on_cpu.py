@@ -113,6 +113,31 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
     def test_web_skd_agent_is_still_skd(self):
         self.assertTrue(issubclass(WebSkdAgentLoop, SkdAgentLoop))
 
+    def test_resolve_request_prompt_inputs_from_agent_state_uses_current_state(self):
+        loop = _build_loop()
+        loop.teacher_system_prompt = "teacher-system"
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "student-task"}],
+            image_data=["image-1"],
+            video_data=[],
+            metrics={},
+            request_id="req-resolve",
+            tools_kwargs={},
+        )
+        agent_data.extra_fields["web_osgym_teacher_messages"] = [{"role": "user", "content": "teacher-task"}]
+        agent_data.extra_fields["teacher_prompt_ids"] = [101, 102, 103]
+
+        student_messages, teacher_messages, teacher_prompt_ids, image_data = (
+            loop._resolve_request_prompt_inputs_from_agent_state(agent_data)
+        )
+
+        self.assertEqual(student_messages, [{"role": "user", "content": "student-task"}])
+        self.assertEqual(teacher_messages[0], {"role": "system", "content": "teacher-system"})
+        self.assertEqual(teacher_messages[1], {"role": "user", "content": "teacher-task"})
+        self.assertEqual(teacher_prompt_ids, [101, 102, 103])
+        self.assertEqual(image_data, ["image-1"])
+
     def test_tool_message_has_one_marker_per_image(self):
         loop = _build_loop()
 
