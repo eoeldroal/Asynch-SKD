@@ -72,7 +72,7 @@ def test_compute_teacher_logprobs_rebuilds_skd_rows_to_full_sequence_layout():
     )
 
 
-def test_compute_teacher_logprobs_pads_short_skd_rows_to_response_length():
+def test_compute_teacher_logprobs_rejects_short_skd_rows():
     worker = object.__new__(AgentLoopWorker)
     worker.distillation_enabled = True
 
@@ -81,63 +81,52 @@ def test_compute_teacher_logprobs_pads_short_skd_rows_to_response_length():
         teacher_logprobs_list=[[-1.1, -1.11]],
     )
 
-    asyncio.run(
-        worker._compute_teacher_logprobs(
-            output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
-            validate=False,
+    with pytest.raises(ValueError, match="must exactly match response length"):
+        asyncio.run(
+            worker._compute_teacher_logprobs(
+                output,
+                prompt_ids=output.prompt_ids,
+                response_ids=output.response_ids,
+                validate=False,
+            )
         )
-    )
-
-    assert torch.equal(
-        output.extra_fields["teacher_ids"],
-        torch.tensor(
-            [
-                [0, 0],
-                [0, 0],
-                [11, 111],
-                [0, 0],
-                [0, 0],
-                [0, 0],
-            ],
-            dtype=torch.int32,
-        ),
-    )
-    assert torch.allclose(
-        output.extra_fields["teacher_logprobs"],
-        torch.tensor(
-            [
-                [0.0, 0.0],
-                [0.0, 0.0],
-                [-1.1, -1.11],
-                [0.0, 0.0],
-                [0.0, 0.0],
-                [0.0, 0.0],
-            ]
-        ),
-    )
 
 
-def test_compute_teacher_logprobs_consumes_empty_skd_rows_without_fallback():
+def test_compute_teacher_logprobs_rejects_empty_skd_rows_for_nonempty_response():
     worker = object.__new__(AgentLoopWorker)
     worker.distillation_enabled = True
 
     output = _make_output(teacher_ids_list=[], teacher_logprobs_list=[])
 
-    asyncio.run(
-        worker._compute_teacher_logprobs(
-            output,
-            prompt_ids=output.prompt_ids,
-            response_ids=output.response_ids,
-            validate=False,
+    with pytest.raises(ValueError, match="must exactly match response length"):
+        asyncio.run(
+            worker._compute_teacher_logprobs(
+                output,
+                prompt_ids=output.prompt_ids,
+                response_ids=output.response_ids,
+                validate=False,
+            )
         )
+
+
+def test_compute_teacher_logprobs_rejects_overlong_skd_rows():
+    worker = object.__new__(AgentLoopWorker)
+    worker.distillation_enabled = True
+
+    output = _make_output(
+        teacher_ids_list=[[11, 111], [12, 222], [13, 333], [14, 444]],
+        teacher_logprobs_list=[[-1.1, -1.11], [-1.2, -1.22], [-1.3, -1.33], [-1.4, -1.44]],
     )
 
-    assert "teacher_ids_list" not in output.extra_fields
-    assert "teacher_logprobs_list" not in output.extra_fields
-    assert "teacher_ids" not in output.extra_fields
-    assert "teacher_logprobs" not in output.extra_fields
+    with pytest.raises(ValueError, match="must exactly match response length"):
+        asyncio.run(
+            worker._compute_teacher_logprobs(
+                output,
+                prompt_ids=output.prompt_ids,
+                response_ids=output.response_ids,
+                validate=False,
+            )
+        )
 
 
 def test_compute_teacher_logprobs_rejects_partial_skd_rows():

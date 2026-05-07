@@ -1229,20 +1229,27 @@ class AgentLoopWorker:
                     "SKD teacher row length mismatch: "
                     f"ids={len(teacher_ids_list)}, logprobs={len(teacher_logprobs_list)}."
                 )
-            if not teacher_ids_list:
-                return
-            topk = len(teacher_ids_list[0])
             prompt_len = len(prompt_ids)
             response_len = len(response_ids)
             if prompt_len <= 0:
                 raise ValueError("SKD teacher row adaptation requires a non-empty prompt.")
+            if len(teacher_ids_list) != response_len:
+                raise ValueError(
+                    "SKD teacher rows must exactly match response length before full-sequence adaptation, "
+                    f"teacher_ids={len(teacher_ids_list)}, response_len={response_len}."
+                )
+            if len(teacher_logprobs_list) != response_len:
+                raise ValueError(
+                    "SKD teacher rows must exactly match response length before full-sequence adaptation, "
+                    f"teacher_logprobs={len(teacher_logprobs_list)}, response_len={response_len}."
+                )
+            if response_len == 0:
+                return
+            topk = len(teacher_ids_list[0])
             zero_ids = [0] * topk
             zero_logprobs = [0.0] * topk
-            response_teacher_ids = [list(row) for row in teacher_ids_list[:response_len]]
-            response_teacher_logprobs = [list(row) for row in teacher_logprobs_list[:response_len]]
-            while len(response_teacher_ids) < response_len:
-                response_teacher_ids.append(list(zero_ids))
-                response_teacher_logprobs.append(list(zero_logprobs))
+            response_teacher_ids = [list(row) for row in teacher_ids_list]
+            response_teacher_logprobs = [list(row) for row in teacher_logprobs_list]
 
             full_ids = [list(zero_ids) for _ in range(prompt_len - 1)]
             full_logprobs = [list(zero_logprobs) for _ in range(prompt_len - 1)]
