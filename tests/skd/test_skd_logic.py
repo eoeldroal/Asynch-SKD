@@ -611,12 +611,19 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
 
     assert next_state == AgentState.GENERATING
     assert loop._can_export_partial_state(agent_data, next_state)
-    assert agent_data.prompt_ids == [1, 2, 3, 10, 11]
+    assert agent_data.prompt_ids == [1, 2, 3]
     assert agent_data.response_ids == [10, 11]
-    assert agent_data.response_mask == [1, 1]
+    assert agent_data.response_mask == []
     assert agent_data.assistant_turns == 0
     assert agent_data.extra_fields["skd_termination_reason"] == "committed_unit_boundary"
     assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
     assert_skd_alignment(agent_data)
 
     partial = loop._export_partial_state(
@@ -697,6 +704,13 @@ async def test_skd_chunks_do_not_commit_prompt_state_before_eos():
     assert next_state == AgentState.GENERATING
     assert agent_data.response_ids == [10, 11]
     assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
     after_commit_state = {
         "prompt_ids": list(agent_data.prompt_ids),
         "server_prompt_ids": list(agent_data.extra_fields["server_prompt_ids"]),
@@ -1063,7 +1077,14 @@ async def test_skd_export_allows_closed_tool_call_without_eos_as_generation_pref
     )
     assert partial.agent_state == AgentState.GENERATING.value
     assert partial.response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]
-    assert partial.response_mask == [1, 1, 1]
+    assert partial.response_mask == []
+    assert partial.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [OPEN_TOOL, 11, CLOSE_TOOL],
+        "teacher_ids_rows": [[OPEN_TOOL, 0, 0, 0], [11, 0, 0, 0], [CLOSE_TOOL, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K, [-3.0] * LOSS_TOP_K],
+        "raw_chunk": [OPEN_TOOL, 11, CLOSE_TOOL],
+        "verified_chunk": [OPEN_TOOL, 11, CLOSE_TOOL],
+    }
     assert_skd_alignment(agent_data)
 
 
@@ -1240,15 +1261,22 @@ async def test_skd_run_until_exportable_boundary_fresh_returns_partial():
     assert result.logical_step == 12
     assert result.source_type == "lookahead"
     assert result.agent_state == AgentState.GENERATING.value
-    assert result.prompt_ids == [1, 2, 3, 10, 11]
+    assert result.prompt_ids == [1, 2, 3]
     assert result.response_ids == [10, 11]
-    assert result.response_mask == [1, 1]
+    assert result.response_mask == []
     assert result.assistant_turns == 0
     assert result.tools_kwargs == {"session": "abc"}
     assert result.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
+    assert result.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
     assert result.extra_fields["raw_prompt"] == [{"role": "user", "content": "question"}]
-    assert result.extra_fields["teacher_ids_list"] == [[10, 0, 0, 0], [11, 0, 0, 0]]
-    assert result.extra_fields["teacher_logprobs_list"] == [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K]
+    assert result.extra_fields["teacher_ids_list"] == []
+    assert result.extra_fields["teacher_logprobs_list"] == []
     assert loop.teacher_server_manager.released_request_ids == []
 
 
@@ -1262,28 +1290,36 @@ async def test_skd_run_until_exportable_boundary_resume_partial_keeps_teacher_re
         request_id="req-resume-boundary",
         tools_kwargs={},
         messages=[{"role": "user", "content": "question"}],
-        prompt_ids=[1, 2, 3, 10],
-        teacher_prompt_ids=[1, 2, 3, 10],
+        prompt_ids=[1, 2, 3],
+        teacher_prompt_ids=[1, 2, 3],
         response_ids=[10],
-        response_mask=[1],
+        response_mask=[],
         response_logprobs=[],
         assistant_turns=0,
         user_turns=0,
         rollout_birth_version=7,
         rollout_min_version=7,
         rollout_max_version=7,
-        committed_gen_chunks=1,
+        committed_gen_chunks=0,
         committed_env_units=0,
-        committed_prefix_tokens=1,
+        committed_prefix_tokens=0,
         metrics={},
         extra_fields={
-            "teacher_prompt_ids": [1, 2, 3, 10],
-            "teacher_ids_list": [[10, 0, 0, 0]],
-            "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
+            "teacher_prompt_ids": [1, 2, 3],
+            "teacher_ids_list": [],
+            "teacher_logprobs_list": [],
             "skd_pending_turn_response_ids": [10],
-            "skd_committed_gen_chunks": 1,
+            "skd_pending_turn_state": {
+                "tokens": [10],
+                "teacher_ids_rows": [[10, 0, 0, 0]],
+                "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
+                "raw_chunk": [10],
+                "verified_chunk": [10],
+            },
+            "skd_pending_turn_chunks": 1,
+            "skd_committed_gen_chunks": 0,
             "skd_committed_env_units": 0,
-            "skd_committed_prefix_tokens": 1,
+            "skd_committed_prefix_tokens": 0,
             "rollout_birth_version": 7,
             "rollout_min_version": 7,
             "rollout_max_version": 7,
@@ -1311,8 +1347,18 @@ async def test_skd_run_until_exportable_boundary_resume_partial_keeps_teacher_re
 
     assert isinstance(result, SkdPartialState)
     assert result.extra_fields["teacher_replica_id"] == "teacher-replica-1"
-    assert result.extra_fields["teacher_ids_list"] == [[10, 0, 0, 0], [20, 0, 0, 0]]
-    assert result.extra_fields["teacher_logprobs_list"] == [[-1.0] * LOSS_TOP_K, [-1.0] * LOSS_TOP_K]
+    assert result.prompt_ids == [1, 2, 3]
+    assert result.response_ids == [10, 20]
+    assert result.response_mask == []
+    assert result.extra_fields["teacher_ids_list"] == []
+    assert result.extra_fields["teacher_logprobs_list"] == []
+    assert result.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 20],
+        "teacher_ids_rows": [[10, 0, 0, 0], [20, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-1.0] * LOSS_TOP_K],
+        "raw_chunk": [20],
+        "verified_chunk": [20],
+    }
     assert loop.teacher_server_manager.released_request_ids == []
 
 
@@ -1406,28 +1452,36 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
         request_id="req-resume-boundary",
         tools_kwargs={},
         messages=[{"role": "user", "content": "question"}],
-        prompt_ids=[1, 2, 3, 10, 11],
-        teacher_prompt_ids=[1, 2, 3, 10, 11],
+        prompt_ids=[1, 2, 3],
+        teacher_prompt_ids=[1, 2, 3],
         response_ids=[10, 11],
-        response_mask=[1, 1],
+        response_mask=[],
         response_logprobs=[],
         assistant_turns=0,
         user_turns=0,
         rollout_birth_version=7,
         rollout_min_version=7,
         rollout_max_version=7,
-        committed_gen_chunks=1,
+        committed_gen_chunks=0,
         committed_env_units=0,
-        committed_prefix_tokens=2,
+        committed_prefix_tokens=0,
         metrics={},
         extra_fields={
-            "teacher_prompt_ids": [1, 2, 3, 10, 11],
-            "teacher_ids_list": [[10, 0, 0, 0], [11, 0, 0, 0]],
-            "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+            "teacher_prompt_ids": [1, 2, 3],
+            "teacher_ids_list": [],
+            "teacher_logprobs_list": [],
             "skd_pending_turn_response_ids": [10, 11],
-            "skd_committed_gen_chunks": 1,
+            "skd_pending_turn_state": {
+                "tokens": [10, 11],
+                "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+                "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+                "raw_chunk": [10, 11],
+                "verified_chunk": [10, 11],
+            },
+            "skd_pending_turn_chunks": 1,
+            "skd_committed_gen_chunks": 0,
             "skd_committed_env_units": 0,
-            "skd_committed_prefix_tokens": 2,
+            "skd_committed_prefix_tokens": 0,
             "rollout_birth_version": 7,
             "rollout_min_version": 7,
             "rollout_max_version": 7,

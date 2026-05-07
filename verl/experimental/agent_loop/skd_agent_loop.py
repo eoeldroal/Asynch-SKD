@@ -55,6 +55,8 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _SKD_DEBUG = int(os.getenv("VERL_SKD_DEBUG", "0"))
 _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
 _SKD_PENDING_TURN_RESPONSE_IDS = "skd_pending_turn_response_ids"
+_SKD_PENDING_TURN_STATE = "skd_pending_turn_state"
+_SKD_PENDING_TURN_CHUNKS = "skd_pending_turn_chunks"
 
 
 def _trace_async_skd(stage: str, **fields: Any) -> None:
@@ -83,6 +85,38 @@ class SkdTeacherLogprobRange:
     sglang_logprob_start_len: int
     expected_logprob_rows: int
     teacher_sglang_prefix_surplus: int
+
+
+@dataclass
+class SkdTurnChunkState:
+    """Mutable assistant-turn buffer kept outside the committed rollout state."""
+
+    tokens: list[int]
+    teacher_ids_rows: list[list[int]]
+    teacher_logprobs_rows: list[list[float]]
+    raw_chunk: list[int]
+    verified_chunk: list[int]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "tokens": list(self.tokens),
+            "teacher_ids_rows": [list(row) for row in self.teacher_ids_rows],
+            "teacher_logprobs_rows": [list(row) for row in self.teacher_logprobs_rows],
+            "raw_chunk": list(self.raw_chunk),
+            "verified_chunk": list(self.verified_chunk),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any] | None) -> "SkdTurnChunkState":
+        if payload is None:
+            return cls(tokens=[], teacher_ids_rows=[], teacher_logprobs_rows=[], raw_chunk=[], verified_chunk=[])
+        return cls(
+            tokens=list(payload.get("tokens", [])),
+            teacher_ids_rows=[list(row) for row in payload.get("teacher_ids_rows", [])],
+            teacher_logprobs_rows=[list(row) for row in payload.get("teacher_logprobs_rows", [])],
+            raw_chunk=list(payload.get("raw_chunk", [])),
+            verified_chunk=list(payload.get("verified_chunk", [])),
+        )
 
 
 def _build_teacher_logprob_range(
@@ -335,6 +369,123 @@ class SkdAgentLoop(ToolAgentLoop):
         teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(count)])
         teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(count)])
 
+    def _get_pending_turn_state(self, agent_data: AgentData) -> SkdTurnChunkState:
+        payload = agent_data.extra_fields.get(_SKD_PENDING_TURN_STATE)
+        if payload is None and agent_data.extra_fields.get(_SKD_PENDING_TURN_RESPONSE_IDS):
+            pending_tokens = list(agent_data.extra_fields.get(_SKD_PENDING_TURN_RESPONSE_IDS, []))
+            pending_count = len(pending_tokens)
+            teacher_ids_rows = list(agent_data.extra_fields.get("teacher_ids_list", []))[-pending_count:]
+            teacher_logprobs_rows = list(agent_data.extra_fields.get("teacher_logprobs_list", []))[-pending_count:]
+            payload = {
+                "tokens": pending_tokens,
+                "teacher_ids_rows": teacher_ids_rows,
+                "teacher_logprobs_rows": teacher_logprobs_rows,
+            }
+        state = SkdTurnChunkState.from_payload(payload)
+        if len(state.teacher_ids_rows) != len(state.tokens):
+            raise ValueError(
+                "Invalid SKD pending turn state: "
+                f"teacher_ids_rows={len(state.teacher_ids_rows)} tokens={len(state.tokens)}"
+            )
+        if len(state.teacher_logprobs_rows) != len(state.tokens):
+            raise ValueError(
+                "Invalid SKD pending turn state: "
+                f"teacher_logprobs_rows={len(state.teacher_logprobs_rows)} tokens={len(state.tokens)}"
+            )
+        return state
+
+    def _normalize_legacy_pending_turn_restore(self, agent_data: AgentData, turn_state: SkdTurnChunkState) -> int:
+        if _SKD_PENDING_TURN_STATE in agent_data.extra_fields or not turn_state.tokens:
+            return int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
+
+        pending_count = len(turn_state.tokens)
+        if (
+            len(agent_data.response_mask) < pending_count
+            or agent_data.prompt_ids[-pending_count:] != turn_state.tokens
+            or agent_data.response_ids != turn_state.tokens
+        ):
+            return int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
+
+        del agent_data.prompt_ids[-pending_count:]
+        del agent_data.response_mask[-pending_count:]
+        teacher_ids_list = agent_data.extra_fields.get("teacher_ids_list")
+        teacher_logprobs_list = agent_data.extra_fields.get("teacher_logprobs_list")
+        if teacher_ids_list is not None:
+            del teacher_ids_list[-pending_count:]
+        if teacher_logprobs_list is not None:
+            del teacher_logprobs_list[-pending_count:]
+        for field_name in ("teacher_prompt_ids", "server_prompt_ids", "teacher_server_prompt_ids"):
+            prompt_ids = agent_data.extra_fields.get(field_name)
+            if prompt_ids is not None and len(prompt_ids) >= pending_count and prompt_ids[-pending_count:] == turn_state.tokens:
+                del prompt_ids[-pending_count:]
+
+        committed_prefix_tokens = int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0))
+        agent_data.extra_fields["skd_committed_prefix_tokens"] = max(committed_prefix_tokens - pending_count, 0)
+        pending_chunks = int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 1 if pending_count > 0 else 0))
+        committed_gen_chunks = int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0))
+        agent_data.extra_fields["skd_committed_gen_chunks"] = max(committed_gen_chunks - pending_chunks, 0)
+        return pending_chunks
+
+    def _set_pending_turn_state(
+        self,
+        agent_data: AgentData,
+        turn_state: SkdTurnChunkState,
+        *,
+        pending_chunks: int,
+    ) -> None:
+        if turn_state.tokens:
+            agent_data.extra_fields[_SKD_PENDING_TURN_STATE] = turn_state.to_payload()
+            agent_data.extra_fields[_SKD_PENDING_TURN_RESPONSE_IDS] = list(turn_state.tokens)
+            agent_data.extra_fields[_SKD_PENDING_TURN_CHUNKS] = int(pending_chunks)
+            agent_data.response_ids = list(turn_state.tokens)
+            return
+
+        agent_data.extra_fields.pop(_SKD_PENDING_TURN_STATE, None)
+        agent_data.extra_fields.pop(_SKD_PENDING_TURN_RESPONSE_IDS, None)
+        agent_data.extra_fields.pop(_SKD_PENDING_TURN_CHUNKS, None)
+
+    def _compose_turn_prompt_ids(self, committed_prompt_ids: list[int], turn_tokens: list[int]) -> list[int]:
+        if not turn_tokens:
+            return list(committed_prompt_ids)
+        if committed_prompt_ids[-len(turn_tokens) :] == turn_tokens:
+            return list(committed_prompt_ids)
+        return list(committed_prompt_ids) + list(turn_tokens)
+
+    def _finalize_pending_turn_state(self, agent_data: AgentData, turn_state: SkdTurnChunkState, *, pending_chunks: int) -> None:
+        if not turn_state.tokens:
+            self._set_pending_turn_state(agent_data, turn_state, pending_chunks=0)
+            return
+
+        teacher_ids_list = agent_data.extra_fields.setdefault("teacher_ids_list", [])
+        teacher_logprobs_list = agent_data.extra_fields.setdefault("teacher_logprobs_list", [])
+        assert len(turn_state.teacher_ids_rows) == len(turn_state.tokens), (
+            "[SKD] pending teacher_ids_rows must stay token aligned: "
+            f"rows={len(turn_state.teacher_ids_rows)} tokens={len(turn_state.tokens)}"
+        )
+        assert len(turn_state.teacher_logprobs_rows) == len(turn_state.tokens), (
+            "[SKD] pending teacher_logprobs_rows must stay token aligned: "
+            f"rows={len(turn_state.teacher_logprobs_rows)} tokens={len(turn_state.tokens)}"
+        )
+
+        agent_data.prompt_ids.extend(turn_state.tokens)
+        agent_data.response_mask.extend([1] * len(turn_state.tokens))
+        teacher_ids_list.extend([list(row) for row in turn_state.teacher_ids_rows])
+        teacher_logprobs_list.extend([list(row) for row in turn_state.teacher_logprobs_rows])
+        for field_name in ("teacher_prompt_ids", "server_prompt_ids", "teacher_server_prompt_ids"):
+            prompt_ids = agent_data.extra_fields.get(field_name)
+            if prompt_ids is not None:
+                prompt_ids.extend(turn_state.tokens)
+        agent_data.response_ids = list(turn_state.tokens)
+        agent_data.assistant_turns += 1
+        self._increment_skd_prefix_stats(agent_data, gen_chunks=pending_chunks, tokens=len(turn_state.tokens))
+        turn_state.tokens = []
+        turn_state.teacher_ids_rows = []
+        turn_state.teacher_logprobs_rows = []
+        turn_state.raw_chunk = []
+        turn_state.verified_chunk = []
+        self._set_pending_turn_state(agent_data, turn_state, pending_chunks=0)
+        self._assert_teacher_alignment(agent_data)
+
     def _teacher_max_model_len(self, routing_key: Any = None) -> int | None:
         """Return the configured teacher context limit when the manager exposes it."""
         if self.teacher_server_manager is None:
@@ -567,6 +718,13 @@ class SkdAgentLoop(ToolAgentLoop):
 
         if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
             raise ValueError("Invalid SKD partial state: missing teacher row lists in extra_fields")
+        pending_turn_state = self._get_pending_turn_state(agent_data)
+        pending_chunks = self._normalize_legacy_pending_turn_restore(agent_data, pending_turn_state)
+        self._set_pending_turn_state(
+            agent_data,
+            pending_turn_state,
+            pending_chunks=pending_chunks,
+        )
         self._assert_teacher_alignment(agent_data)
         _trace_async_skd(
             "loop.restore_partial_state",
@@ -784,15 +942,22 @@ class SkdAgentLoop(ToolAgentLoop):
         # Initialize teacher logprobs accumulation lists in extra_fields
         teacher_ids_list = agent_data.extra_fields.setdefault("teacher_ids_list", [])
         teacher_logprobs_list = agent_data.extra_fields.setdefault("teacher_logprobs_list", [])
-        teacher_prompt_ids = agent_data.extra_fields.setdefault("teacher_prompt_ids", list(agent_data.prompt_ids))
+        committed_teacher_prompt_ids = agent_data.extra_fields.setdefault("teacher_prompt_ids", list(agent_data.prompt_ids))
 
-        # Track response_ids for the current assistant turn.  In the normal
-        # path this stays local until the turn finishes.  In pause-aware
-        # lookahead mode it must survive export/restore across chunk boundaries.
-        turn_response_ids = list(agent_data.extra_fields.get(_SKD_PENDING_TURN_RESPONSE_IDS, []))
-        server_prompt_ids = agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids))
-        teacher_server_prompt_ids = agent_data.extra_fields.setdefault(
-            "teacher_server_prompt_ids", list(teacher_prompt_ids)
+        # Keep the unfinished assistant turn outside the committed rollout
+        # state so partial export/restore can carry it directly.
+        turn_state = self._get_pending_turn_state(agent_data)
+        pending_turn_chunks = int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
+        turn_response_ids = list(turn_state.tokens)
+        committed_server_prompt_ids = agent_data.extra_fields.setdefault("server_prompt_ids", list(agent_data.prompt_ids))
+        committed_teacher_server_prompt_ids = agent_data.extra_fields.setdefault(
+            "teacher_server_prompt_ids", list(committed_teacher_prompt_ids)
+        )
+        teacher_prompt_ids = self._compose_turn_prompt_ids(committed_teacher_prompt_ids, turn_response_ids)
+        server_prompt_ids = self._compose_turn_prompt_ids(committed_server_prompt_ids, turn_response_ids)
+        teacher_server_prompt_ids = self._compose_turn_prompt_ids(
+            committed_teacher_server_prompt_ids,
+            turn_response_ids,
         )
 
         # Debug: token-level alignment logging for first N samples
@@ -806,7 +971,8 @@ class SkdAgentLoop(ToolAgentLoop):
         # === SKD chunk loop ===
         with simple_timer("skd_generate", agent_data.metrics):
             while True:
-                remaining_budget = self.response_length - len(agent_data.response_mask)
+                current_response_len = len(agent_data.response_mask) + len(turn_response_ids)
+                remaining_budget = self.response_length - current_response_len
                 if remaining_budget <= 0:
                     termination_reason = "budget_exhausted"
                     break
@@ -933,14 +1099,6 @@ class SkdAgentLoop(ToolAgentLoop):
                             teacher_replica_id=teacher_replica_id,
                             teacher_routing_key=teacher_routing_key,
                         )
-                    teacher_prompt_ids = agent_data.extra_fields.setdefault(
-                        "teacher_prompt_ids",
-                        list(agent_data.prompt_ids),
-                    )
-                    teacher_server_prompt_ids = agent_data.extra_fields.setdefault(
-                        "teacher_server_prompt_ids",
-                        list(teacher_prompt_ids),
-                    )
                     has_teacher_multimodal = bool(
                         _safe_len(agent_data.image_data) or _safe_len(agent_data.video_data)
                     )
@@ -1146,12 +1304,12 @@ class SkdAgentLoop(ToolAgentLoop):
                         f"teacher_seq_len={len(verify_sequence)} "
                         f"chunk_len={len(chunk)} accepted={acc} rejected={1 if rejection_pos is not None else 0} "
                         f"new_tokens={len(new_tokens)} "
-                        f"prompt_len={chunk_start} total_resp={len(agent_data.response_mask)+len(new_tokens)} "
+                        f"prompt_len={chunk_start} total_resp={len(agent_data.response_mask) + len(turn_response_ids) + len(new_tokens)} "
                         f"req={agent_data.request_id}",
                         stacklevel=1,
                     )
 
-                # Update agent_data (same pattern as ToolAgentLoop L244-246)
+                # Keep verified chunk state turn-local until EOS finalization.
                 commit_t0 = time.monotonic()
                 _trace_async_skd(
                     "loop.chunk_commit_begin",
@@ -1162,19 +1320,11 @@ class SkdAgentLoop(ToolAgentLoop):
                     prompt_len_before=len(agent_data.prompt_ids),
                     teacher_rows=int(teacher_ids.shape[0]),
                 )
-                agent_data.prompt_ids += new_tokens
                 server_prompt_ids += new_tokens
                 teacher_prompt_ids += new_tokens
                 teacher_server_prompt_ids += new_tokens
-                agent_data.response_mask += [1] * len(new_tokens)
-                turn_response_ids.extend(new_tokens)
-                agent_data.response_ids = list(turn_response_ids)
-                agent_data.extra_fields[_SKD_PENDING_TURN_RESPONSE_IDS] = list(turn_response_ids)
-                agent_data.extra_fields["server_prompt_ids"] = list(server_prompt_ids)
-                agent_data.extra_fields["teacher_server_prompt_ids"] = list(teacher_server_prompt_ids)
-
-                # Accumulate teacher targets only for the committed rollout path.
-                # In delta mode, local row k already corresponds to committed token k.
+                pending_teacher_id_rows = []
+                pending_teacher_logprob_rows = []
                 for k in range(len(new_tokens)):
                     teacher_idx = k
                     assert 0 <= teacher_idx < teacher_ids.shape[0], (
@@ -1190,24 +1340,30 @@ class SkdAgentLoop(ToolAgentLoop):
                         "[SKD] teacher_logprobs row width "
                         f"{len(teacher_logprob_row)} != configured topk {self.loss_top_k}"
                     )
-                    teacher_ids_list.append(teacher_id_row)
-                    teacher_logprobs_list.append(teacher_logprob_row)
+                    pending_teacher_id_rows.append(teacher_id_row)
+                    pending_teacher_logprob_rows.append(teacher_logprob_row)
 
-                self._assert_teacher_alignment(agent_data)
-                self._increment_skd_prefix_stats(agent_data, gen_chunks=1, tokens=len(new_tokens))
+                turn_response_ids.extend(new_tokens)
+                turn_state.tokens = list(turn_response_ids)
+                turn_state.teacher_ids_rows.extend(pending_teacher_id_rows)
+                turn_state.teacher_logprobs_rows.extend(pending_teacher_logprob_rows)
+                turn_state.raw_chunk = list(chunk)
+                turn_state.verified_chunk = list(new_tokens)
+                pending_turn_chunks += 1
+                self._set_pending_turn_state(agent_data, turn_state, pending_chunks=pending_turn_chunks)
                 commit_ms = (time.monotonic() - commit_t0) * 1000
                 _trace_async_skd(
                     "loop.chunk_commit_state_done",
                     request_id=agent_data.request_id,
                     chunk_idx=skd_metrics["chunk_count"],
                     elapsed_ms=round(commit_ms, 1),
-                    response_len=len(agent_data.response_mask),
+                    response_len=len(agent_data.response_mask) + len(turn_response_ids),
                     prompt_len=len(agent_data.prompt_ids),
                     server_prompt_len=len(server_prompt_ids),
                     teacher_prompt_len=len(teacher_prompt_ids),
                     teacher_server_prompt_len=len(teacher_server_prompt_ids),
-                    teacher_rows_accumulated=len(teacher_ids_list),
-                    teacher_logprobs_accumulated=len(teacher_logprobs_list),
+                    teacher_rows_accumulated=len(teacher_ids_list) + len(turn_state.teacher_ids_rows),
+                    teacher_logprobs_accumulated=len(teacher_logprobs_list) + len(turn_state.teacher_logprobs_rows),
                 )
                 emit_async_skd_event(
                     "chunk_commit",
@@ -1219,7 +1375,7 @@ class SkdAgentLoop(ToolAgentLoop):
                     accepted=len(new_tokens) - (1 if rejection_pos is not None else 0),
                     rejected=1 if rejection_pos is not None else 0,
                     new_tokens=len(new_tokens),
-                    response_len=len(agent_data.response_mask),
+                    response_len=len(agent_data.response_mask) + len(turn_response_ids),
                     committed_gen_chunks=int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0)),
                     committed_prefix_tokens=int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0)),
                 )
@@ -1228,7 +1384,7 @@ class SkdAgentLoop(ToolAgentLoop):
                     request_id=agent_data.request_id,
                     teacher_replica_id=agent_data.extra_fields.get("teacher_replica_id"),
                     teacher_routing_key=agent_data.extra_fields.get("teacher_routing_key"),
-                    response_len=len(agent_data.response_mask),
+                    response_len=len(agent_data.response_mask) + len(turn_response_ids),
                     committed_gen_chunks=int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0)),
                     committed_prefix_tokens=int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0)),
                     termination_reason=termination_reason,
@@ -1259,9 +1415,9 @@ class SkdAgentLoop(ToolAgentLoop):
         sample_elapsed_ms = (time.monotonic() - sample_start_time) * 1000
         agent_data.extra_fields["skd_termination_reason"] = termination_reason
 
-        # Store response_ids for this turn (used by tool_parser)
-        agent_data.response_ids = turn_response_ids
-        agent_data.extra_fields.pop(_SKD_PENDING_TURN_RESPONSE_IDS, None)
+        # Keep the unfinished turn available for resume/export and delay any
+        # committed rollout mutation until the turn has actually ended.
+        self._set_pending_turn_state(agent_data, turn_state, pending_chunks=pending_turn_chunks)
 
         # Update extra_fields (first time only, same pattern as ToolAgentLoop L235-241)
         if chunk_output is not None and not agent_data.extra_fields.get("max_global_steps"):
@@ -1271,8 +1427,9 @@ class SkdAgentLoop(ToolAgentLoop):
         if chunk_output is not None and chunk_output.routed_experts is not None:
             agent_data.routed_experts = chunk_output.routed_experts
 
-        if turn_response_ids:
-            agent_data.assistant_turns += 1
+        if termination_reason == "eos":
+            self._finalize_pending_turn_state(agent_data, turn_state, pending_chunks=pending_turn_chunks)
+            turn_response_ids = list(agent_data.response_ids)
 
         # Compute accept rate metric
         total = skd_metrics["accept_count"] + skd_metrics["reject_count"]
@@ -1294,11 +1451,13 @@ class SkdAgentLoop(ToolAgentLoop):
             f"teacher={skd_metrics['teacher_verify_ms']:.0f}ms "
             f"total={sample_elapsed_ms:.0f}ms "
             f"prompt={initial_prompt_len} "
-            f"teacher_logprobs_accumulated={len(teacher_ids_list)}",
+            f"teacher_logprobs_accumulated={len(teacher_ids_list) + len(turn_state.teacher_ids_rows)}",
             stacklevel=1,
         )
 
         # Check termination conditions (same as ToolAgentLoop L253-259)
+        if termination_reason != "eos":
+            return AgentState.GENERATING
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             return AgentState.TERMINATED
         if termination_reason == "teacher_context_exhausted":
