@@ -551,20 +551,26 @@ async def test_rejection_at_first_token_discards_suffix():
     assert next_state == AgentState.TERMINATED
     assert not loop._can_export_partial_state(agent_data, next_state)
     assert agent_data.response_ids == [100]
-    assert agent_data.prompt_ids == [1, 2, 3, 100]
-    assert agent_data.response_mask == [1]
-    assert teacher_rows(agent_data) == [[100, 101, 102, 0]]
-    assert 777 not in agent_data.prompt_ids
-    assert 20 not in agent_data.prompt_ids
-    assert 30 not in agent_data.prompt_ids
+    assert agent_data.prompt_ids == [1, 2, 3]
+    assert agent_data.response_mask == []
+    assert teacher_rows(agent_data) == []
+    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [100]
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [100],
+        "teacher_ids_rows": [[100, 101, 102, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
+        "raw_chunk": [777, 20, 30],
+        "verified_chunk": [100],
+    }
+    assert 777 not in agent_data.response_ids
+    assert 20 not in agent_data.response_ids
+    assert 30 not in agent_data.response_ids
     assert agent_data.metrics["skd"]["reject_count"] == 1
     assert agent_data.metrics["skd"]["accept_count"] == 0
     assert_skd_alignment(agent_data)
-    assert_committed_tokens_inside_teacher_topk(agent_data)
     assert agent_data.extra_fields["skd_termination_reason"] == "max_chunks"
-    assert agent_data.extra_fields["skd_committed_gen_chunks"] == 1
-    assert agent_data.extra_fields["skd_committed_env_units"] == 0
-    assert agent_data.extra_fields["skd_committed_prefix_tokens"] == 1
+    assert agent_data.extra_fields.get("skd_committed_env_units", 0) == 0
+    assert agent_data.extra_fields.get("skd_committed_prefix_tokens", 0) == 0
     assert agent_data.extra_fields["rollout_min_version"] == 7
     assert agent_data.extra_fields["rollout_max_version"] == 7
 
@@ -1061,6 +1067,79 @@ def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
     assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3, 70, 71]
     assert agent_data.extra_fields["teacher_prompt_ids"] == [1, 2, 3, 70, 71]
     assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3, 70, 71]
+
+
+@pytest.mark.asyncio
+async def test_skd_request_views_derive_from_committed_state_and_pending_turn():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 10])
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 10]
+    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 10]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 10]
+    pending_turn = SkdTurnChunkState(
+        tokens=[10],
+        teacher_ids_rows=[[10, 0, 0, 0]],
+        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K],
+        raw_chunk=[10],
+        verified_chunk=[10],
+    )
+
+    student_request_prompt_ids = await loop._build_student_request_prompt_ids(agent_data, pending_turn)
+    teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+        await loop._build_teacher_verify_request_view(agent_data, pending_turn)
+    )
+
+    assert student_request_prompt_ids == [1, 2, 10, 10]
+    assert teacher_prompt_ids == [1, 2, 10, 10]
+    assert teacher_server_prompt_ids == [1, 2, 10, 10]
+    assert teacher_sglang_prefix_surplus == 0
+
+
+@pytest.mark.asyncio
+async def test_web_skd_request_views_rebuild_compact_ids_then_extend_pending_turn():
+    loop = make_web_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields.update(
+        {
+            "teacher_prompt_ids": [1, 2, 3, 900, 901],
+            "server_prompt_ids": [999],
+            "teacher_server_prompt_ids": [888],
+            "teacher_sglang_prefix_surplus": 0,
+            "web_osgym_teacher_messages": [
+                {"role": "user", "content": "task"},
+                {"role": "tool", "content": [{"type": "image"}]},
+            ],
+        }
+    )
+    pending_turn = SkdTurnChunkState(
+        tokens=[10, 11],
+        teacher_ids_rows=[[10, 0, 0, 0], [11, 0, 0, 0]],
+        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        raw_chunk=[10, 11],
+        verified_chunk=[10, 11],
+    )
+
+    async def _recompute_student(agent_data_arg, messages):
+        del agent_data_arg, messages
+        return [1, 2, 3]
+
+    async def _recompute_teacher(agent_data_arg, teacher_messages):
+        del agent_data_arg, teacher_messages
+        return [1, 2, 3]
+
+    loop._recompute_server_prompt_ids = _recompute_student
+    loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+
+    student_request_prompt_ids = await loop._build_student_request_prompt_ids(agent_data, pending_turn)
+    teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+        await loop._build_teacher_verify_request_view(agent_data, pending_turn)
+    )
+
+    assert student_request_prompt_ids == [1, 2, 3, 10, 11]
+    assert teacher_prompt_ids == [1, 2, 3, 900, 901, 10, 11]
+    assert teacher_server_prompt_ids == [1, 2, 3, 10, 11]
+    assert teacher_sglang_prefix_surplus == 2
 
 
 def test_build_teacher_logprob_range_multimodal_scalar_shifts_start():
@@ -1810,6 +1889,17 @@ async def test_web_skd_image_generation_appends_suffix_to_server_prompt_ids_with
     agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
+
+    async def _recompute_student(agent_data_arg, messages):
+        del agent_data_arg, messages
+        return [1, 2, 3]
+
+    async def _recompute_teacher(agent_data_arg, teacher_messages):
+        del agent_data_arg, teacher_messages
+        return [1, 2, 3]
+
+    loop._recompute_server_prompt_ids = _recompute_student
+    loop._recompute_teacher_server_prompt_ids = _recompute_teacher
 
     next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
 

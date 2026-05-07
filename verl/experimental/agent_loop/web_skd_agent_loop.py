@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, _safe_len, _trace_async_skd
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState, _safe_len, _trace_async_skd
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.utils.chat_template import apply_chat_template
@@ -161,6 +161,32 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             image_data,
         )
         return server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
+
+    async def _build_request_prompt_views_from_turn_state(
+        self,
+        agent_data: AgentData,
+        turn_state: SkdTurnChunkState,
+    ) -> tuple[list[int], list[int], list[int], int]:
+        student_messages, teacher_messages, committed_teacher_prompt_ids, image_data = (
+            self._resolve_request_prompt_inputs_from_agent_state(agent_data)
+        )
+        server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await self._build_request_prompt_views(
+                agent_data,
+                student_messages=student_messages,
+                teacher_messages=teacher_messages,
+                teacher_prompt_ids=committed_teacher_prompt_ids,
+                image_data=image_data,
+            )
+        )
+        turn_tokens = list(turn_state.tokens)
+        teacher_prompt_ids = list(committed_teacher_prompt_ids) + turn_tokens
+        return (
+            list(server_prompt_ids) + turn_tokens,
+            teacher_prompt_ids,
+            list(teacher_server_prompt_ids) + turn_tokens,
+            teacher_sglang_prefix_surplus,
+        )
 
     def _resolve_request_prompt_inputs_from_agent_state(
         self,
