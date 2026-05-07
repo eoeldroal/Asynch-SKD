@@ -385,6 +385,8 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_apply_chat_template(messages, **kwargs):
             images = kwargs.get("images") or []
+            if len(messages) == 2 and messages[0] == {"role": "user", "content": "task"} and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 11, 12] + [90] * (3 * len(images))
             return [11, 12] + [90] * (3 * len(images))
 
         async def _fake_apply_server_chat_template(messages, **kwargs):
@@ -1017,6 +1019,11 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, tools=None):
             del videos, remove_system_prompt, tools
+            if len(messages) == 2 and messages[0] == {"role": "user", "content": "task"} and messages[-1]["role"] == "tool" and images:
+                content = messages[-1]["content"]
+                if any(item.get("type") == "text" for item in content):
+                    return [1, 2, 3, 71, 72, 73, 74]
+                return [1, 2, 3, 61, 62, 63, 64]
             if messages and messages[0]["role"] == "tool" and images:
                 content = messages[0]["content"]
                 if any(item.get("type") == "text" for item in content):
@@ -1245,6 +1252,11 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, tools=None):
             del videos, remove_system_prompt, tools
+            if len(messages) == 2 and messages[0] == {"role": "user", "content": "task"} and messages[-1]["role"] == "tool" and images:
+                content = messages[-1]["content"]
+                if any(item.get("type") == "text" for item in content):
+                    return [1, 2, 3, 71, 72, 73, 74]
+                return [1, 2, 3, 61, 62, 63, 64]
             if messages and messages[0]["role"] == "tool" and images:
                 content = messages[0]["content"]
                 if any(item.get("type") == "text" for item in content):
@@ -1336,6 +1348,8 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         async def _fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, tools=None):
             del videos, remove_system_prompt, tools
+            if len(messages) == 2 and messages[0] == {"role": "user", "content": "task"} and messages[-1]["role"] == "tool" and images:
+                return [1, 2, 3, 71, 72, 73, 74]
             if messages and messages[0]["role"] == "tool" and images:
                 return [71, 72, 73, 74]
             return [61, 62]

@@ -991,8 +991,13 @@ async def test_web_skd_image_generation_keeps_input_ids_request_view():
         del agent_data_arg, teacher_messages
         return [1, 2, 3]
 
+    async def _recompute_teacher_expanded(agent_data_arg, teacher_messages, image_data):
+        del agent_data_arg, teacher_messages, image_data
+        return [1, 2, 3]
+
     loop._recompute_server_prompt_ids = _recompute_student
     loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+    loop._recompute_teacher_prompt_ids = _recompute_teacher_expanded
     loop._finalize_with_web_osgym_reward = _skip_reward
 
     state = await loop._handle_generating_state(
@@ -1032,8 +1037,13 @@ async def test_web_skd_teacher_verify_rebuilds_request_views_from_current_messag
         del agent_data_arg, teacher_messages
         return [1, 2, 3]
 
+    async def _recompute_teacher_expanded(agent_data_arg, teacher_messages, image_data):
+        del agent_data_arg, teacher_messages, image_data
+        return [1, 2, 3, 41, 42]
+
     loop._recompute_server_prompt_ids = _recompute_student
     loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+    loop._recompute_teacher_prompt_ids = _recompute_teacher_expanded
 
     state = await loop._handle_generating_state(
         agent_data,
@@ -1083,8 +1093,13 @@ async def test_web_skd_teacher_verification_span_stays_stable_across_image_tool_
         del agent_data_arg, teacher_messages
         return list(original_teacher_server_prompt_ids)
 
+    async def _recompute_teacher_expanded(agent_data_arg, teacher_messages, image_data):
+        del agent_data_arg, teacher_messages, image_data
+        return [1, 2, 3, 71, 72, 73, 74]
+
     loop._recompute_server_prompt_ids = _recompute_student
     loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+    loop._recompute_teacher_prompt_ids = _recompute_teacher_expanded
 
     state = await loop._handle_generating_state(
         agent_data,
@@ -1222,8 +1237,13 @@ async def test_web_skd_request_views_rebuild_compact_ids_then_extend_pending_tur
         del agent_data_arg, teacher_messages
         return [1, 2, 3]
 
+    async def _recompute_teacher_expanded(messages, **kwargs):
+        del messages, kwargs
+        return [1, 2, 3, 41, 42]
+
     loop._recompute_server_prompt_ids = _recompute_student
     loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+    loop.apply_chat_template = _recompute_teacher_expanded
 
     student_request_prompt_ids = await loop._build_student_request_prompt_ids(agent_data, pending_turn)
     teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
@@ -1231,8 +1251,58 @@ async def test_web_skd_request_views_rebuild_compact_ids_then_extend_pending_tur
     )
 
     assert student_request_prompt_ids == [1, 2, 3, 10, 11]
-    assert teacher_prompt_ids == [1, 2, 3, 900, 901, 10, 11]
+    assert teacher_prompt_ids == [1, 2, 3, 41, 42, 10, 11]
     assert teacher_server_prompt_ids == [1, 2, 3, 10, 11]
+    assert teacher_sglang_prefix_surplus == 2
+
+
+@pytest.mark.asyncio
+async def test_web_skd_request_views_rebuild_teacher_prefix_for_single_pending_token():
+    loop = make_web_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.image_data = ["image-1"]
+    agent_data.extra_fields.update(
+        {
+            "teacher_prompt_ids": [1, 2, 3, 900, 901],
+            "server_prompt_ids": [999],
+            "teacher_server_prompt_ids": [888],
+            "teacher_sglang_prefix_surplus": 0,
+            "web_osgym_teacher_messages": [
+                {"role": "user", "content": "task"},
+                {"role": "tool", "content": [{"type": "image"}]},
+            ],
+        }
+    )
+    pending_turn = SkdTurnChunkState(
+        tokens=[10],
+        teacher_ids_rows=[[10, 0, 0, 0]],
+        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K],
+        raw_chunk=[10],
+        verified_chunk=[10],
+    )
+
+    async def _recompute_student(agent_data_arg, messages):
+        del agent_data_arg, messages
+        return [1, 2, 3]
+
+    async def _recompute_teacher(agent_data_arg, teacher_messages):
+        del agent_data_arg, teacher_messages
+        return [1, 2, 3]
+
+    async def _recompute_teacher_expanded(messages, **kwargs):
+        del messages, kwargs
+        return [1, 2, 3, 41, 42]
+
+    loop._recompute_server_prompt_ids = _recompute_student
+    loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+    loop.apply_chat_template = _recompute_teacher_expanded
+
+    teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+        await loop._build_teacher_verify_request_view(agent_data, pending_turn)
+    )
+
+    assert teacher_prompt_ids == [1, 2, 3, 41, 42, 10]
+    assert teacher_server_prompt_ids == [1, 2, 3, 10]
     assert teacher_sglang_prefix_surplus == 2
 
 
@@ -2040,8 +2110,13 @@ async def test_web_skd_image_generation_appends_suffix_to_server_prompt_ids_with
         del agent_data_arg, teacher_messages
         return [1, 2, 3]
 
+    async def _recompute_teacher_expanded(agent_data_arg, teacher_messages, image_data):
+        del agent_data_arg, teacher_messages, image_data
+        return [1, 2, 3]
+
     loop._recompute_server_prompt_ids = _recompute_student
     loop._recompute_teacher_server_prompt_ids = _recompute_teacher
+    loop._recompute_teacher_prompt_ids = _recompute_teacher_expanded
 
     next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
 

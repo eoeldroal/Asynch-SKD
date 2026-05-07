@@ -163,6 +163,20 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         return await self._apply_server_chat_template(teacher_messages, tools=schemas)
 
+    async def _recompute_teacher_prompt_ids(
+        self,
+        agent_data: AgentData,
+        teacher_messages: list[dict],
+        image_data: list[Any] | None,
+    ) -> list[int]:
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        return await self.apply_chat_template(
+            teacher_messages,
+            tools=schemas,
+            images=image_data,
+            videos=agent_data.video_data,
+        )
+
     async def _build_request_prompt_views(
         self,
         agent_data: AgentData,
@@ -186,17 +200,23 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         agent_data: AgentData,
         turn_state: SkdTurnChunkState,
     ) -> tuple[list[int], list[int], list[int], int]:
-        student_messages, teacher_messages, committed_teacher_prompt_ids, image_data = (
+        student_messages, teacher_messages, _committed_teacher_prompt_ids, image_data = (
             self._resolve_request_prompt_inputs_from_agent_state(agent_data)
         )
-        server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
-            await self._build_request_prompt_views(
-                agent_data,
-                student_messages=student_messages,
-                teacher_messages=teacher_messages,
-                teacher_prompt_ids=committed_teacher_prompt_ids,
-                image_data=image_data,
-            )
+        server_prompt_ids = await self._recompute_server_prompt_ids(agent_data, student_messages)
+        committed_teacher_prompt_ids = await self._recompute_teacher_prompt_ids(
+            agent_data,
+            teacher_messages,
+            image_data,
+        )
+        teacher_server_prompt_ids = await self._recompute_teacher_server_prompt_ids(
+            agent_data,
+            teacher_messages,
+        )
+        teacher_sglang_prefix_surplus = self._multimodal_prefix_surplus_delta(
+            committed_teacher_prompt_ids,
+            teacher_server_prompt_ids,
+            image_data,
         )
         turn_tokens = list(turn_state.tokens)
         teacher_prompt_ids = list(committed_teacher_prompt_ids) + turn_tokens
