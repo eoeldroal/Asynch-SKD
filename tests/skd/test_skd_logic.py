@@ -667,6 +667,24 @@ async def test_skd_chunks_do_not_commit_prompt_state_before_eos():
     agent_data = make_agent_data([1, 2, 3])
     agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_ids_list"] = []
+    agent_data.extra_fields["teacher_logprobs_list"] = []
+    agent_data.extra_fields["skd_committed_gen_chunks"] = 0
+    agent_data.extra_fields["skd_committed_env_units"] = 0
+    agent_data.extra_fields["skd_committed_prefix_tokens"] = 0
+
+    before_commit_state = {
+        "prompt_ids": list(agent_data.prompt_ids),
+        "server_prompt_ids": list(agent_data.extra_fields["server_prompt_ids"]),
+        "teacher_prompt_ids": list(agent_data.extra_fields["teacher_prompt_ids"]),
+        "teacher_server_prompt_ids": list(agent_data.extra_fields["teacher_server_prompt_ids"]),
+        "response_mask": list(agent_data.response_mask),
+        "teacher_ids_list": list(agent_data.extra_fields["teacher_ids_list"]),
+        "teacher_logprobs_list": list(agent_data.extra_fields["teacher_logprobs_list"]),
+        "skd_committed_gen_chunks": agent_data.extra_fields["skd_committed_gen_chunks"],
+        "skd_committed_env_units": agent_data.extra_fields["skd_committed_env_units"],
+        "skd_committed_prefix_tokens": agent_data.extra_fields["skd_committed_prefix_tokens"],
+    }
 
     next_state = await SkdAgentLoop._handle_generating_state(
         loop,
@@ -679,10 +697,19 @@ async def test_skd_chunks_do_not_commit_prompt_state_before_eos():
     assert next_state == AgentState.GENERATING
     assert agent_data.response_ids == [10, 11]
     assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
-    assert agent_data.prompt_ids == [1, 2, 3]
-    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3]
-    assert agent_data.extra_fields["teacher_prompt_ids"] == [1, 2, 3]
-    assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3]
+    after_commit_state = {
+        "prompt_ids": list(agent_data.prompt_ids),
+        "server_prompt_ids": list(agent_data.extra_fields["server_prompt_ids"]),
+        "teacher_prompt_ids": list(agent_data.extra_fields["teacher_prompt_ids"]),
+        "teacher_server_prompt_ids": list(agent_data.extra_fields["teacher_server_prompt_ids"]),
+        "response_mask": list(agent_data.response_mask),
+        "teacher_ids_list": list(agent_data.extra_fields["teacher_ids_list"]),
+        "teacher_logprobs_list": list(agent_data.extra_fields["teacher_logprobs_list"]),
+        "skd_committed_gen_chunks": agent_data.extra_fields["skd_committed_gen_chunks"],
+        "skd_committed_env_units": agent_data.extra_fields["skd_committed_env_units"],
+        "skd_committed_prefix_tokens": agent_data.extra_fields["skd_committed_prefix_tokens"],
+    }
+    assert after_commit_state == before_commit_state
 
 
 @pytest.mark.asyncio
@@ -1069,6 +1096,12 @@ async def test_skd_closed_tool_call_without_eos_does_not_invoke_tool_parser():
 
 @pytest.mark.asyncio
 async def test_skd_max_chunks_cutoff_flushes_turn_buffer_without_tool_processing():
+    class _ParserMustNotRun:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            raise AssertionError(
+                f"tool parser must not run at max-chunks cutoff: response_ids={response_ids!r}, tools={tools!r}"
+            )
+
     loop = make_skd_loop(
         student_chunks=[
             [TOOL_CALL_A, TOOL_CALL_B, 33],
@@ -1078,6 +1111,7 @@ async def test_skd_max_chunks_cutoff_flushes_turn_buffer_without_tool_processing
         ],
         max_chunks=1,
     )
+    loop.tool_parser = _ParserMustNotRun()
     agent_data = make_agent_data([1, 2, 3])
 
     next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
@@ -1085,7 +1119,6 @@ async def test_skd_max_chunks_cutoff_flushes_turn_buffer_without_tool_processing
     assert next_state == AgentState.TERMINATED
     assert agent_data.extra_fields["skd_termination_reason"] == "max_chunks"
     assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
-    assert agent_data.tool_calls == []
     assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
 
 
