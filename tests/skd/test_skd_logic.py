@@ -1315,6 +1315,34 @@ async def test_skd_max_chunks_cutoff_keeps_turn_buffer_uncommitted():
 
 
 @pytest.mark.asyncio
+async def test_skd_empty_chunk_terminates_without_pending_turn_state():
+    class _ParserMustNotRun:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            raise AssertionError(
+                f"tool parser must not run on empty chunk termination: response_ids={response_ids!r}, tools={tools!r}"
+            )
+
+    loop = make_skd_loop(student_chunks=[[]])
+    loop.tool_parser = _ParserMustNotRun()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    assert next_state == AgentState.TERMINATED
+    assert agent_data.extra_fields["skd_termination_reason"] == "empty_chunk"
+    assert agent_data.prompt_ids == [1, 2, 3]
+    assert agent_data.response_ids == []
+    assert agent_data.response_mask == []
+    assert agent_data.assistant_turns == 0
+    assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
+    assert "skd_pending_turn_state" not in agent_data.extra_fields
+    assert "skd_pending_turn_chunks" not in agent_data.extra_fields
+    assert teacher_rows(agent_data) == []
+    assert teacher_logprobs(agent_data) == []
+    assert loop.teacher_server_manager.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_skd_run_preserves_forced_cutoff_pending_turn_in_final_output():
     class _ParserMustNotRun:
         async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):

@@ -1485,7 +1485,7 @@ class SkdAgentLoop(ToolAgentLoop):
         if chunk_output is not None and chunk_output.routed_experts is not None:
             agent_data.routed_experts = chunk_output.routed_experts
 
-        forced_cutoff_reasons = {"budget_exhausted", "max_chunks", "teacher_context_exhausted"}
+        forced_cutoff_reasons = {"budget_exhausted", "empty_chunk", "max_chunks", "teacher_context_exhausted"}
         if termination_reason == "eos":
             self._commit_pending_turn_state(
                 agent_data,
