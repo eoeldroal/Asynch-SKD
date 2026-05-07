@@ -34,6 +34,8 @@ Session identity:
 
 ## 3. State Mapping
 
+바깥 상태 전이는 계속 `ToolAgentLoop`-compatible 하게 유지한다. 즉 top-level state machine은 여전히 `PENDING -> GENERATING -> PROCESSING_TOOLS -> TERMINATED`를 사용한다. 다만 canonical committed state에는 **완료된 assistant turn**과 **이미 commit된 observation bundle**만 들어가고, 진행 중인 assistant turn은 `GENERATING` 안의 turn-local state로 따로 든다.
+
 ### PENDING
 
 `PENDING`은 environment `start` 단계다.
@@ -52,6 +54,8 @@ Session identity:
 
 모델이 다음 `computer` tool call을 생성한다.
 
+이 상태는 단순히 "다음 토큰을 prompt 뒤에 바로 append하는 단계"가 아니다. `GENERATING`은 현재 assistant turn의 turn-local chunk buffer를 소유한다. SKD에서 teacher verification을 통과한 chunk라도 assistant turn이 아직 끝나지 않았다면 committed rollout에는 올리지 않고, 현재 turn-local buffer에만 유지한다.
+
 모델은 Web/OSGym protocol JSON을 직접 생성하지 않는다. 모델-facing schema는 다음 형태다.
 
 ```json
@@ -61,6 +65,8 @@ Session identity:
   ]
 }
 ```
+
+request-time compact prompt view도 long-lived truth가 아니다. student / teacher request에 보내는 compact prompt ids는 항상 **committed state + 현재 pending turn state**를 합쳐서 만든 request-time view로 취급한다.
 
 ### PROCESSING_TOOLS
 
@@ -77,6 +83,13 @@ Session identity:
 ### TERMINATED
 
 더 이상 action을 생성하지 않는다. 종료 시에는 reward를 회수해 `AgentLoopOutput.reward_score`로 넘긴다.
+
+중요한 종료 규칙:
+
+- `EOS`는 현재 pending assistant turn을 committed canonical state로 승격(promote)한다.
+- 그 뒤에만 tool parsing을 수행해 `PROCESSING_TOOLS`로 갈지, 그대로 종료할지 결정한다.
+- 반대로 budget exhaustion / empty chunk / max chunk / teacher context exhaustion 같은 forced cutoff는 pending assistant turn을 canonical prompt state로 commit하지 않는다.
+- 이 경우 final output은 turn-local final text를 flush해서 사용자-visible response에는 포함하되, tool parsing 없이 종료한다.
 
 ## 4. Observation Policy
 
@@ -129,18 +142,21 @@ Protocol wire format은 base64 PNG다.
 WebSKD는 local expanded ids와 SGLang request ids를 분리한다.
 
 - canonical local state
-  - `prompt_ids`
-  - `teacher_prompt_ids`
+  - `prompt_ids`: 완료된 assistant turn과 commit된 observation bundle만 반영한 committed student state
+  - `teacher_prompt_ids`: 같은 committed boundary의 teacher view
 - request boundary view
   - `server_prompt_ids`
   - `teacher_server_prompt_ids`
+
+현재 assistant turn이 진행 중이면 여기에 turn-local pending tokens가 따로 붙는다. 즉 request-time view는 `committed prompt ids + pending assistant turn tokens`로 계산되고, pending turn 자체는 committed canonical state와 같은 것으로 취급하지 않는다.
 
 image가 포함되면 local ids에는 image expansion이 반영될 수 있다. 따라서 image-bearing Qwen3 / Qwen3.5 request에서 local ids를 raw-image SGLang boundary로 직접 보내면 안 된다.
 
 현재 구현 원칙은 다음과 같다.
 
 - local state는 expanded ids를 유지한다.
-- SGLang에 보낼 compact ids는 **현재 messages / teacher messages / image_data** 기준으로 다시 만든다.
+- committed canonical state는 완료된 assistant turn과 committed observation bundle만 저장한다.
+- SGLang에 보낼 compact ids는 request 시점의 committed state에 현재 pending turn state를 합쳐서 만든다.
 - compact ids는 long-lived truth라기보다 request-time snapshot이다.
 - 다만 active SKD chunk loop와 partial resume 동안에는 같은 request를 이어 가기 위해 compact snapshot을 compatibility state로 잠깐 유지한다.
 
@@ -162,6 +178,8 @@ Web observation은 다음 canonical state를 함께 바꾼다.
 - `teacher_sglang_prefix_surplus`
 
 이 상태는 모두 성공한 뒤 한 번에 commit되어야 한다. 일부만 commit되면 carryover, cutoff, teacher verification에서 상태가 깨진다.
+
+여기서 tool-result observation은 항상 하나의 atomic commit unit이다. screenshot이 있든 없든, environment/tool 결과는 "다음 turn이 읽는 observation bundle 하나"로 commit되거나 아예 commit되지 않아야 한다.
 
 중요한 점은 image-bearing boundary를 compact delta append로 넘기지 않는다는 것이다. 새 image가 붙으면 compact request snapshot은 이전 값에 suffix를 더하지 않고, **현재 canonical state에서 다시 계산**한다.
 
