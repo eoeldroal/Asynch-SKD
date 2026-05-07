@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Iterable
-
 import torch
 
 from verl.protocol import DataProto
+
+
+def require_prompt_batch(batch: DataProto, *, context_name: str) -> None:
+    if batch.batch is None:
+        raise ValueError(f"Cannot align {context_name}: batch tensor payload is missing.")
+    if "prompts" not in batch.batch:
+        raise ValueError(f"Cannot align {context_name}: batch requires 'prompts'.")
 
 
 def left_pad_dim(tensor: torch.Tensor, dim: int, pad_size: int, value: int | float) -> torch.Tensor:
@@ -30,8 +35,7 @@ def pad_batch_prompt_width(
     pad_token_id: int,
     context_name: str,
 ) -> DataProto:
-    if batch.batch is None or "prompts" not in batch.batch:
-        return batch
+    require_prompt_batch(batch, context_name=context_name)
     prompt_width = int(batch.batch["prompts"].size(1))
     pad_size = target_prompt_width - prompt_width
     if pad_size <= 0:
@@ -60,7 +64,7 @@ def pad_batch_prompt_width(
                 f"width={tensor.size(-1)} expected={old_seq_width}"
             )
         batch.batch["position_ids"] = left_pad_dim(tensor, tensor.dim() - 1, pad_size, 0)
-    for key, value in (("teacher_ids", pad_token_id), ("teacher_logprobs", 0.0)):
+    for key, value in (("teacher_ids", pad_token_id), ("teacher_logprobs", 0.0), ("routed_experts", 0)):
         if key in batch.batch:
             tensor = batch.batch[key]
             if int(tensor.size(1)) != old_seq_width:
@@ -81,14 +85,10 @@ def align_prompt_width_for_concat(
 ) -> list[DataProto]:
     if not batches:
         return batches
+    for batch in batches:
+        require_prompt_batch(batch, context_name=context_name)
     if target_prompt_width is None:
-        prompt_widths = [
-            int(batch.batch["prompts"].size(1))
-            for batch in batches
-            if batch.batch is not None and "prompts" in batch.batch
-        ]
-        if not prompt_widths:
-            return batches
+        prompt_widths = [int(batch.batch["prompts"].size(1)) for batch in batches]
         target_prompt_width = max(prompt_widths)
     return [
         pad_batch_prompt_width(

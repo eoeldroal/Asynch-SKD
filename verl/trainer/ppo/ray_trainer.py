@@ -34,7 +34,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.experimental.async_skd.batch_alignment import align_prompt_width_for_concat
+from verl.experimental.async_skd.batch_alignment import align_prompt_width_for_concat, require_prompt_batch
 from verl.experimental.async_skd.metadata import align_non_tensor_keys_for_concat, sync_output_non_tensor_with_input
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -259,6 +259,8 @@ def _assemble_async_skd_training_batch(
 
     base_input_batch = _expand_input_to_output(base_input_batch, base_output_batch)
     base_input_batch = _sync_input_prompt_with_output(base_input_batch, base_output_batch)
+    require_prompt_batch(base_input_batch, context_name="async-SKD training input")
+    require_prompt_batch(base_output_batch, context_name="async-SKD training output")
 
     promoted_available = async_skd_data_source.promoted_count()
     take_count = promoted_available
@@ -1694,6 +1696,11 @@ class RayPPOTrainer:
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
+                        if async_skd_data_source is not None:
+                            raise ValueError(
+                                "Async-SKD training batch must include response_mask before reward/advantage "
+                                "preparation; recomputing it from attention_mask would lose tool/user span boundaries."
+                            )
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,

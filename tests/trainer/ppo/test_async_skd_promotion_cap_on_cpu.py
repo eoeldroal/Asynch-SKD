@@ -250,6 +250,52 @@ def test_async_skd_training_batch_aligns_prompt_width_before_promoted_concat():
     merged_input.union(merged_output)
 
 
+def test_async_skd_training_batch_aligns_routed_experts_before_promoted_concat():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    promoted_input = _single_sample_batch("promoted-0", 0, prompt_width=2)
+    promoted_output = _single_sample_batch("promoted-0", 10, prompt_width=5)
+    promoted_output.batch["routed_experts"] = torch.full((1, 7, 1, 1), 4, dtype=torch.long)
+    source._reserved_input_batches["promoted-0"] = promoted_input
+    source.record_promoted([_completed("promoted-0", promoted_output)])
+
+    base_input_batch = _single_sample_batch("base-0", 1000, prompt_width=2)
+    base_output_batch = _single_sample_batch("base-0", 2000, prompt_width=2)
+    base_output_batch.batch["routed_experts"] = torch.full((1, 4, 1, 1), 3, dtype=torch.long)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=1,
+        pad_token_id=99,
+    )
+
+    assert merged_output.batch["routed_experts"].shape == (2, 7, 1, 1)
+    assert merged_output.batch["routed_experts"][0, :3].eq(0).all()
+    assert merged_output.batch["routed_experts"][0, 3:].eq(3).all()
+    assert merged_output.batch["routed_experts"][1].eq(4).all()
+
+
+def test_async_skd_training_batch_rejects_missing_prompts_before_concat():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    base_input_batch = _single_sample_batch("base-0", 1000)
+    base_output_batch = _single_sample_batch("base-0", 2000)
+    del base_output_batch.batch["prompts"]
+
+    with pytest.raises(ValueError, match="requires 'prompts'"):
+        _assemble_async_skd_training_batch(
+            base_input_batch,
+            base_output_batch,
+            async_skd_data_source=source,
+            validate=False,
+            required_multiple=None,
+            max_promoted_count=0,
+            pad_token_id=0,
+        )
+
+
 def test_async_skd_training_batch_expands_input_to_windowed_output_rows():
     source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
     base_input_batch = _single_sample_batch("base-0", 1000)
@@ -372,11 +418,8 @@ def test_async_skd_training_batch_uses_windowed_prompts_before_union():
 
 def test_async_skd_training_batch_pads_windowed_rows_to_required_multiple():
     source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
-    base_input_batch = DataProto(
-        batch=TensorDict({"dummy_tensor": torch.tensor([[0]], dtype=torch.uint8)}, batch_size=1),
-        non_tensor_batch={"uid": np.array(["base-0"], dtype=object)},
-        meta_info={},
-    )
+    base_input_batch = _single_sample_batch("base-0", 1000, with_teacher=False)
+    base_input_batch.meta_info = {}
     base_output_batch = _windowed_output_batch("base-0", [2000, 2001, 2002])
     base_output_batch.batch["teacher_ids"] = torch.arange(3 * 4 * 2, dtype=torch.long).view(3, 4, 2)
     base_output_batch.batch["teacher_logprobs"] = -torch.arange(3 * 4 * 2, dtype=torch.float32).view(3, 4, 2)

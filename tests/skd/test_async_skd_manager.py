@@ -90,7 +90,7 @@ def _make_output(input_pos: int) -> DataProto:
 
 
 
-def _make_output_with_prompt_width(input_pos: int, prompt_len: int) -> DataProto:
+def _make_output_with_prompt_width(input_pos: int, prompt_len: int, *, with_routed_experts: bool = False) -> DataProto:
     response_len = 3
     seq_len = prompt_len + response_len
     prompts = torch.arange(100 + input_pos, 100 + input_pos + prompt_len, dtype=torch.long).unsqueeze(0)
@@ -99,15 +99,18 @@ def _make_output_with_prompt_width(input_pos: int, prompt_len: int) -> DataProto
     attention_mask = torch.ones(1, seq_len, dtype=torch.long)
     input_ids = torch.cat([prompts, responses], dim=1)
     position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+    tensors = {
+        "prompts": prompts,
+        "responses": responses,
+        "response_mask": response_mask,
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+    }
+    if with_routed_experts:
+        tensors["routed_experts"] = torch.full((1, seq_len, 1, 1), input_pos + 1, dtype=torch.long)
     return DataProto.from_dict(
-        tensors={
-            "prompts": prompts,
-            "responses": responses,
-            "response_mask": response_mask,
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "position_ids": position_ids,
-        },
+        tensors=tensors,
         non_tensors={
             "input_pos": np.array([input_pos], dtype=object),
             "payload": np.array([f"out-{input_pos}"], dtype=object),
@@ -376,3 +379,34 @@ def test_async_skd_manager_finalize_outputs_rejects_missing_pad_token_id():
             _make_output_with_prompt_width(0, 2),
             _make_output_with_prompt_width(1, 5),
         ])
+
+
+def test_async_skd_manager_finalize_outputs_aligns_routed_experts_with_prompt_width():
+    manager, _ = _make_manager()
+
+    outputs = [
+        _make_output_with_prompt_width(0, 2, with_routed_experts=True),
+        _make_output_with_prompt_width(1, 5, with_routed_experts=True),
+    ]
+
+    finalized = manager._finalize_outputs(outputs)
+
+    assert finalized.batch["routed_experts"].shape == (2, 8, 1, 1)
+    assert finalized.batch["routed_experts"][0, :3].eq(0).all()
+    assert finalized.batch["routed_experts"][0, 3:].eq(1).all()
+    assert finalized.batch["routed_experts"][1].eq(2).all()
+
+
+def test_async_skd_manager_finalize_outputs_rejects_missing_prompts():
+    manager, _ = _make_manager()
+    bad_output = DataProto.from_dict(
+        tensors={
+            "responses": torch.tensor([[1, 2, 0]], dtype=torch.long),
+            "response_mask": torch.tensor([[1, 1, 0]], dtype=torch.long),
+        },
+        non_tensors={"input_pos": np.array([0], dtype=object)},
+        meta_info={"metrics": [{"generate_sequences": 1.0, "tool_calls": 0.0, "num_preempted": -1}]},
+    )
+
+    with pytest.raises(ValueError, match="requires 'prompts'"):
+        manager._finalize_outputs([bad_output])
