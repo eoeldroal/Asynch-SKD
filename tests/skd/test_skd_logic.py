@@ -655,6 +655,37 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
 
 
 @pytest.mark.asyncio
+async def test_skd_chunks_do_not_commit_prompt_state_before_eos():
+    loop = make_skd_loop(
+        student_chunks=[
+            [10, 11],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+    )
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
+    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
+
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
+
+    assert next_state == AgentState.GENERATING
+    assert agent_data.response_ids == [10, 11]
+    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
+    assert agent_data.prompt_ids == [1, 2, 3]
+    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3]
+    assert agent_data.extra_fields["teacher_prompt_ids"] == [1, 2, 3]
+    assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3]
+
+
+@pytest.mark.asyncio
 async def test_skd_teacher_request_counts_teacher_only_text_as_server_prefix_not_surplus():
     loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
     agent_data = make_agent_data([1, 2, 3])
@@ -1007,6 +1038,56 @@ async def test_skd_export_allows_closed_tool_call_without_eos_as_generation_pref
     assert partial.response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]
     assert partial.response_mask == [1, 1, 1]
     assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_closed_tool_call_without_eos_keeps_generating_and_does_not_populate_tool_calls():
+    class _ClosedToolParser:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            del tools
+            if response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]:
+                return None, [FakeToolCall(name="lookup", arguments='{"query":"weather"}')]
+            return None, []
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [OPEN_TOOL, 11, CLOSE_TOOL],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+        max_chunks=1,
+    )
+    loop.tokenizer = FakeHermesTokenizer()
+    loop.tool_parser = _ClosedToolParser()
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    assert next_state == AgentState.GENERATING
+    assert agent_data.response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]
+    assert agent_data.tool_calls == []
+
+
+@pytest.mark.asyncio
+async def test_skd_forced_cutoff_flushes_turn_buffer_without_tool_processing():
+    loop = make_skd_loop(
+        student_chunks=[
+            [TOOL_CALL_A, TOOL_CALL_B, 33],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+        max_chunks=1,
+    )
+    agent_data = make_agent_data([1, 2, 3])
+
+    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    assert next_state == AgentState.TERMINATED
+    assert agent_data.extra_fields["skd_termination_reason"] == "max_chunks"
+    assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert agent_data.tool_calls == []
 
 
 @pytest.mark.asyncio

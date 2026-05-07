@@ -732,6 +732,94 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_response_budget_exhausted")
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
 
+    async def test_tool_observation_commit_is_atomic(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _ImageFakeTool()}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, images=None, **kwargs):
+            del kwargs
+            if messages and messages[0]["role"] == "tool" and images:
+                return [11, 12, 13, 14]
+            return [21, 22]
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            del kwargs
+            if messages and messages[-1]["role"] == "tool":
+                return [31, 32]
+            return [41, 42]
+
+        async def _force_teacher_guard(*args, **kwargs):
+            del args, kwargs
+            return True
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+        loop._terminate_if_teacher_prefix_overflows = _force_teacher_guard
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=["initial-image"],
+            video_data=[],
+            metrics={},
+            request_id="req-atomic-guard",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+        agent_data.tool_calls = [
+            type(
+                "Call",
+                (),
+                {
+                    "name": "computer",
+                    "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                },
+            )()
+        ]
+        before_messages = deepcopy(agent_data.messages)
+        before_image_data = deepcopy(agent_data.image_data)
+        before_prompt_ids = list(agent_data.prompt_ids)
+        before_response_mask = list(agent_data.response_mask)
+        before_metrics = deepcopy(agent_data.metrics)
+        before_extra = deepcopy(agent_data.extra_fields)
+
+        state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+        self.assertEqual(state, AgentState.TERMINATED)
+        self.assertEqual(agent_data.messages, before_messages)
+        self.assertEqual(agent_data.image_data, before_image_data)
+        self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
+        self.assertEqual(agent_data.response_mask, before_response_mask)
+        self.assertEqual(agent_data.metrics, before_metrics)
+        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], before_extra["server_prompt_ids"])
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], before_extra["teacher_prompt_ids"])
+        self.assertEqual(
+            agent_data.extra_fields["teacher_server_prompt_ids"],
+            before_extra["teacher_server_prompt_ids"],
+        )
+        self.assertEqual(
+            agent_data.extra_fields["web_osgym_teacher_messages"],
+            before_extra["web_osgym_teacher_messages"],
+        )
+
     async def test_processing_tools_does_not_commit_terminal_action_response_observation(self):
         loop = _build_loop()
         loop.tools = {"computer": _TerminalImageFakeTool()}
