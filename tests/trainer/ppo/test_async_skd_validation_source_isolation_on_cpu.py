@@ -20,6 +20,9 @@ class _TrackingAsyncSkdSource:
     def __init__(self) -> None:
         self.validation_leak_count = 0
 
+    def state_dict(self) -> dict[str, object]:
+        return {"validation_leak_count": self.validation_leak_count}
+
 
 class _ValidationSourceAwareManager:
     def __init__(self, source: _TrackingAsyncSkdSource) -> None:
@@ -151,3 +154,65 @@ def test_validate_restores_training_async_skd_source_after_exception(monkeypatch
     assert exploding_manager.generate_seen_sources == [None]
     assert trainer._async_skd_data_source is source
     assert exploding_manager.current_source is source
+
+
+def test_validate_flushes_lookahead_without_rollout_resume_hooks(monkeypatch):
+    trainer, source, manager = _make_trainer_for_validation_source_isolation()
+    trainer._async_skd_rollout_paused = True
+
+    monkeypatch.setattr(
+        "verl.trainer.ppo.ray_trainer.extract_reward",
+        lambda batch: (torch.ones(len(batch), 1, dtype=torch.float32), {}),
+    )
+
+    trainer._validate()
+
+    assert manager.flush_seen_sources == [source]
+    assert trainer._async_skd_rollout_paused is True
+
+
+class _TrainDataloaderStub:
+    def state_dict(self) -> dict[str, object]:
+        return {"cursor": 3}
+
+
+class _ActorRolloutWorkerGroupStub:
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def save_checkpoint(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def test_save_checkpoint_flushes_lookahead_before_serializing_async_skd_source(monkeypatch, tmp_path):
+    trainer, source, manager = _make_trainer_for_validation_source_isolation()
+    trainer.global_steps = 7
+    trainer.use_critic = False
+    trainer.actor_rollout_wg = _ActorRolloutWorkerGroupStub()
+    trainer.train_dataloader = _TrainDataloaderStub()
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "default_local_dir": str(tmp_path),
+                "default_hdfs_dir": None,
+            },
+            "actor_rollout_ref": {
+                "actor": {
+                    "checkpoint": {},
+                }
+            },
+        }
+    )
+
+    saved_payload: dict[str, object] = {}
+
+    def _capture_save(payload, path):
+        saved_payload["payload"] = payload
+        saved_payload["path"] = path
+
+    monkeypatch.setattr("torch.save", _capture_save)
+
+    trainer._save_checkpoint()
+
+    assert manager.flush_seen_sources == [source]
+    assert saved_payload["payload"]["async_skd_data_source_state_dict"] == source.state_dict()

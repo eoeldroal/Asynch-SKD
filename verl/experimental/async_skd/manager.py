@@ -170,7 +170,12 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         }
 
     @auto_await
-    async def generate_sequences(self, prompts: DataProto) -> DataProto:
+    async def generate_sequences(
+        self,
+        prompts: DataProto,
+        *,
+        flush_lookahead_before_return: bool = False,
+    ) -> DataProto:
         mode = self._async_skd_mode()
         if mode in {"sync", "disabled", "none"}:
             return await super().generate_sequences(prompts)
@@ -186,6 +191,8 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         else:
             outputs = await self._generate_sequences_sample_async(prompts)
 
+        if flush_lookahead_before_return:
+            await self.flush_async_skd_lookahead()
         return self._finalize_outputs(outputs)
 
     def _finalize_outputs(self, outputs: list[DataProto]) -> DataProto:
@@ -548,6 +555,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         *,
         fresh_prompts: DataProto | None,
         carryover_partials: list[SkdPartialState],
+        flush_lookahead_before_return: bool = False,
     ) -> DataProto:
         _trace_async_skd(
             "async_skd_manager.generate_with_carryover_begin",
@@ -568,6 +576,9 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         inner_t0 = time.monotonic()
         outputs = await self._generate_sequences_with_carryover(fresh_prompts, carryover_partials)
         inner_ms = (time.monotonic() - inner_t0) * 1000
+
+        if flush_lookahead_before_return:
+            await self.flush_async_skd_lookahead()
 
         finalize_t0 = time.monotonic()
         finalized = self._finalize_outputs(outputs)

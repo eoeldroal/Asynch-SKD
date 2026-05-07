@@ -39,7 +39,7 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     data.train_batch_size=16 \
     data.max_prompt_length=2048 \
-    data.max_response_length=65536 \
+    data.max_response_length=32768 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=64 \
     data.truncation=error \
@@ -75,7 +75,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
     distillation.skd.chunk_size=128 \
     distillation.skd.verify_top_k=5 \
-    distillation.skd.max_chunks_per_sample=512 \
+    distillation.skd.max_chunks_per_sample=256 \
     "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=True \
     distillation.skd.window_history_n=3 \
@@ -134,9 +134,9 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.val_before_train=False \
     trainer.resume_mode=disable \
-    trainer.save_freq=-1 \
+    trainer.save_freq=3 \
     trainer.test_freq=-1 \
-    trainer.total_epochs=1 \
+    trainer.total_epochs=100 \
     trainer.total_training_steps=100 \
     +trainer.use_legacy_worker_impl=disable \
     "$@"

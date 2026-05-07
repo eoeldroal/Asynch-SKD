@@ -182,6 +182,9 @@ def _assemble_async_skd_training_batch(
     if validate or async_skd_data_source is None:
         return base_input_batch, base_output_batch
 
+    def _has_prompt_batch(batch: DataProto) -> bool:
+        return batch.batch is not None and "prompts" in batch.batch
+
     def _align_pairs_for_concat(
         input_batches: list[DataProto], output_batches: list[DataProto]
     ) -> tuple[list[DataProto], list[DataProto]]:
@@ -192,12 +195,18 @@ def _assemble_async_skd_training_batch(
             context_name="async-SKD training output",
             target_prompt_width=target_prompt_width,
         )
-        input_batches = align_prompt_width_for_concat(
-            input_batches,
-            pad_token_id=pad_token_id,
-            context_name="async-SKD training input",
-            target_prompt_width=target_prompt_width,
-        )
+        input_has_prompts = [_has_prompt_batch(batch) for batch in input_batches]
+        if any(input_has_prompts):
+            if not all(input_has_prompts):
+                raise ValueError(
+                    "Cannot align async-SKD training input: mixed prompt tensor presence across input batches."
+                )
+            input_batches = align_prompt_width_for_concat(
+                input_batches,
+                pad_token_id=pad_token_id,
+                context_name="async-SKD training input",
+                target_prompt_width=target_prompt_width,
+            )
         return input_batches, output_batches
 
     def _expand_input_to_output(input_batch: DataProto, output_batch: DataProto) -> DataProto:
@@ -259,7 +268,6 @@ def _assemble_async_skd_training_batch(
 
     base_input_batch = _expand_input_to_output(base_input_batch, base_output_batch)
     base_input_batch = _sync_input_prompt_with_output(base_input_batch, base_output_batch)
-    require_prompt_batch(base_input_batch, context_name="async-SKD training input")
     require_prompt_batch(base_output_batch, context_name="async-SKD training output")
 
     promoted_available = async_skd_data_source.promoted_count()
@@ -580,6 +588,11 @@ class RayPPOTrainer:
         return self._uses_async_skd_lookahead_training() and is_supervised_distillation_only(
             self.config.get("distillation")
         )
+
+    def _sleep_replicas_after_async_skd_step_end(self) -> None:
+        if not hasattr(self, "checkpoint_manager"):
+            raise ValueError("checkpoint_manager must be initialized before sleeping rollout replicas.")
+        self.checkpoint_manager.sleep_replicas()
 
     def _uses_single_actor_mini_batch(self) -> bool:
         return self._uses_async_skd_lookahead_training() or bool(
@@ -1659,10 +1672,11 @@ class RayPPOTrainer:
                             gen_batch_output = self.async_rollout_manager.generate_sequences_with_carryover(
                                 fresh_prompts=fresh_prompts,
                                 carryover_partials=carryover_partials,
+                                flush_lookahead_before_return=True,
                             )
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(fresh_prompts)
-                        self.checkpoint_manager.sleep_replicas()
+                        self._sleep_replicas_after_async_skd_step_end()
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1682,8 +1696,16 @@ class RayPPOTrainer:
                             gen_baseline_batch.meta_info["do_sample"] = False
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
-                            gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-                            self.checkpoint_manager.sleep_replicas()
+                            if async_skd_data_source is not None:
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(
+                                    gen_baseline_batch,
+                                    flush_lookahead_before_return=True,
+                                )
+                            else:
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(
+                                    gen_baseline_batch
+                                )
+                            self._sleep_replicas_after_async_skd_step_end()
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)

@@ -974,3 +974,45 @@ async def test_lookahead_manager_flush_turns_slow_partial_into_carryover():
 
     assert manager.has_async_skd_inflight_lookahead() is False
     assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]
+
+
+def test_sync_generate_sequences_with_carryover_can_flush_lookahead_before_return():
+    manager, _, source = _make_manager(
+        prefetch_limit=1,
+        future_current_work=True,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={
+            "lookahead-100": [_make_partial_sample("lookahead-100")],
+        },
+        base_delays={1: 0.05},
+    )
+
+    output = manager.generate_sequences_with_carryover(
+        fresh_prompts=_make_prompts(2),
+        carryover_partials=[],
+        flush_lookahead_before_return=True,
+    )
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
+    assert manager.has_async_skd_inflight_lookahead() is False
+    assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]
+
+
+def test_sync_generate_sequences_can_flush_lookahead_before_return():
+    manager, _, source = _make_manager(
+        prefetch_limit=1,
+        future_current_work=True,
+        source_items=[("lookahead-100", _make_source_sample(100))],
+        lookahead_results={
+            "lookahead-100": [_make_partial_sample("lookahead-100")],
+        },
+    )
+
+    output = manager.generate_sequences(
+        _make_prompts(2),
+        flush_lookahead_before_return=True,
+    )
+
+    assert output.non_tensor_batch["input_pos"].tolist() == [0, 1]
+    assert manager.has_async_skd_inflight_lookahead() is False
+    assert [partial.sample_id for partial in source.carryover_partials] == ["lookahead-100"]

@@ -56,8 +56,17 @@ def test_distillation_loss_range_handles_padding_only_rows():
 
 
 class _AsyncSkdManagerStub:
+    def __init__(self) -> None:
+        self.last_generate_with_carryover_kwargs = None
+        self.last_generate_kwargs = None
+
     def generate_sequences_with_carryover(self, *args, **kwargs):
-        raise NotImplementedError
+        self.last_generate_with_carryover_kwargs = kwargs
+        return SimpleNamespace(meta_info={"timing": {}})
+
+    def generate_sequences(self, *args, **kwargs):
+        self.last_generate_kwargs = kwargs
+        return SimpleNamespace(meta_info={"timing": {}})
 
     def set_async_skd_data_source(self, *args, **kwargs):
         raise NotImplementedError
@@ -65,11 +74,23 @@ class _AsyncSkdManagerStub:
     def set_async_skd_pad_token_id(self, *args, **kwargs):
         raise NotImplementedError
 
+    def flush_async_skd_lookahead(self):
+        self.flush_calls += 1
+
+
+class _CheckpointManagerStub:
+    def __init__(self) -> None:
+        self.sleep_calls = 0
+
+    def sleep_replicas(self):
+        self.sleep_calls += 1
+
 
 def _make_trainer_for_shortcut(config_dict: dict) -> RayPPOTrainer:
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     trainer.config = OmegaConf.create(config_dict)
     trainer.async_rollout_manager = _AsyncSkdManagerStub()
+    trainer.checkpoint_manager = _CheckpointManagerStub()
     return trainer
 
 
@@ -121,3 +142,61 @@ def test_async_skd_supervised_shortcut_stays_off_when_task_rewards_enabled():
     )
 
     assert trainer._uses_supervised_async_skd_logprob_shortcut() is False
+
+
+def test_async_skd_sleep_helper_only_sleeps_replicas():
+    trainer = _make_trainer_for_shortcut(
+        {
+            "algorithm": {
+                "adv_estimator": AdvantageEstimator.GRPO,
+                "use_kl_in_reward": False,
+                "rollout_correction": None,
+            },
+            "distillation": {
+                "enabled": True,
+                "distillation_loss": {
+                    "use_task_rewards": False,
+                    "use_policy_gradient": False,
+                },
+            },
+            "actor_rollout_ref": {
+                "actor": {"use_kl_loss": False},
+                "rollout": {"agent": {"async_skd_mode": "lookahead"}},
+            },
+        }
+    )
+
+    trainer._sleep_replicas_after_async_skd_step_end()
+
+    assert trainer.checkpoint_manager.sleep_calls == 1
+
+
+def test_async_skd_generate_with_carryover_can_request_step_end_flush():
+    trainer = _make_trainer_for_shortcut(
+        {
+            "algorithm": {
+                "adv_estimator": AdvantageEstimator.GRPO,
+                "use_kl_in_reward": False,
+                "rollout_correction": None,
+            },
+            "distillation": {
+                "enabled": True,
+                "distillation_loss": {
+                    "use_task_rewards": False,
+                    "use_policy_gradient": False,
+                },
+            },
+            "actor_rollout_ref": {
+                "actor": {"use_kl_loss": False},
+                "rollout": {"agent": {"async_skd_mode": "lookahead"}},
+            },
+        }
+    )
+
+    trainer.async_rollout_manager.generate_sequences_with_carryover(
+        fresh_prompts=None,
+        carryover_partials=[],
+        flush_lookahead_before_return=True,
+    )
+
+    assert trainer.async_rollout_manager.last_generate_with_carryover_kwargs["flush_lookahead_before_return"] is True

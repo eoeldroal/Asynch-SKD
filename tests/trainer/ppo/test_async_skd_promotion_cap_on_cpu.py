@@ -82,6 +82,17 @@ def _base_batch(start: int, count: int) -> DataProto:
     return DataProto.concat(batches)
 
 
+def _raw_input_batch(uid: str, value: int) -> DataProto:
+    return DataProto.from_dict(
+        tensors={"dummy_tensor": torch.tensor([[value]], dtype=torch.long)},
+        non_tensors={
+            "uid": np.array([uid], dtype=object),
+            "input_pos": np.array([value], dtype=object),
+        },
+        meta_info={"metrics": [{}]},
+    )
+
+
 def test_async_skd_training_batch_respects_promoted_cap_and_preserves_fifo_overflow():
     source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
 
@@ -294,6 +305,32 @@ def test_async_skd_training_batch_rejects_missing_prompts_before_concat():
             max_promoted_count=0,
             pad_token_id=0,
         )
+
+
+def test_async_skd_training_batch_allows_raw_input_batches_without_prompts():
+    source = AsyncSkdDataSource(_EmptyIterator(), uid_fn=_UidFactory())
+    promoted_input = _raw_input_batch("promoted-0", 0)
+    promoted_output = _single_sample_batch("promoted-0", 10, prompt_width=5)
+    source._reserved_input_batches["promoted-0"] = promoted_input
+    source.record_promoted([_completed("promoted-0", promoted_output)])
+
+    base_input_batch = _raw_input_batch("base-0", 1000)
+    base_output_batch = _single_sample_batch("base-0", 2000, prompt_width=2)
+
+    merged_input, merged_output = _assemble_async_skd_training_batch(
+        base_input_batch,
+        base_output_batch,
+        async_skd_data_source=source,
+        validate=False,
+        required_multiple=None,
+        max_promoted_count=1,
+        pad_token_id=99,
+    )
+
+    assert "prompts" not in merged_input.batch
+    assert merged_input.batch["dummy_tensor"].shape == (2, 1)
+    assert merged_output.batch["prompts"].shape == (2, 5)
+    merged_input.union(merged_output)
 
 
 def test_async_skd_training_batch_expands_input_to_windowed_output_rows():
