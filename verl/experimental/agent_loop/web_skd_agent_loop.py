@@ -7,7 +7,13 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState, _safe_len, _trace_async_skd
+from verl.experimental.agent_loop.skd_agent_loop import (
+    _SKD_PENDING_TURN_CHUNKS,
+    SkdAgentLoop,
+    SkdTurnChunkState,
+    _safe_len,
+    _trace_async_skd,
+)
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.utils.chat_template import apply_chat_template
@@ -222,6 +228,21 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         agent_data.extra_fields["teacher_server_prompt_ids"] = teacher_server_prompt_ids
         agent_data.extra_fields["teacher_sglang_prefix_surplus"] = teacher_sglang_prefix_surplus
 
+    def _assert_processing_tools_turn_is_committed(self, agent_data: AgentData) -> None:
+        pending_turn_state = self._get_pending_turn_state(agent_data)
+        pending_turn_chunks = int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
+        if pending_turn_state.tokens or pending_turn_chunks:
+            raise ValueError("WebSKD PROCESSING_TOOLS requires a completed assistant turn before tool execution")
+
+    def _resolve_tool_processing_commit_inputs(
+        self,
+        agent_data: AgentData,
+    ) -> tuple[list[dict], list[dict], list[int]]:
+        student_messages = list(agent_data.messages)
+        teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages") or student_messages)
+        teacher_prompt_ids = list(self._require_prompt_stream(agent_data, "teacher_prompt_ids"))
+        return student_messages, teacher_messages, teacher_prompt_ids
+
     async def _terminate_if_teacher_prefix_overflows(
         self,
         agent_data: AgentData,
@@ -418,6 +439,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         return agent_data, next_state
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        self._assert_processing_tools_turn_is_committed(agent_data)
         tool_call_names = [getattr(tool_call, "name", None) for tool_call in agent_data.tool_calls]
         _trace_async_skd(
             "web_skd.tool_processing_begin",
@@ -551,20 +573,19 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_response_budget_exhausted")
             return AgentState.TERMINATED
 
-        teacher_prompt_ids = None
-        if teacher_message is not None:
-            teacher_prompt_ids = self._require_prompt_stream(agent_data, "teacher_prompt_ids")
-
-        next_student_messages = list(agent_data.messages)
+        (
+            next_student_messages,
+            next_teacher_messages,
+            committed_teacher_prompt_ids,
+        ) = self._resolve_tool_processing_commit_inputs(agent_data)
         if student_message is not None:
             next_student_messages.append(student_message)
 
-        next_teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
         if teacher_message is not None:
             next_teacher_messages.append(teacher_message)
 
-        next_teacher_prompt_ids = list(teacher_prompt_ids) if teacher_prompt_ids is not None else None
-        if next_teacher_prompt_ids is not None and teacher_response_ids:
+        next_teacher_prompt_ids = list(committed_teacher_prompt_ids)
+        if teacher_message is not None and teacher_response_ids:
             next_teacher_prompt_ids.extend(teacher_response_ids)
 
         next_image_data = self._prospective_image_data(agent_data, image_data)
@@ -582,7 +603,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 agent_data,
                 student_messages=next_student_messages,
                 teacher_messages=self._build_teacher_messages(deepcopy(next_teacher_messages)),
-                teacher_prompt_ids=next_teacher_prompt_ids or list(agent_data.extra_fields.get("teacher_prompt_ids", [])),
+                teacher_prompt_ids=next_teacher_prompt_ids,
                 image_data=next_image_data,
             )
             _trace_async_skd(
@@ -601,13 +622,22 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         ):
             return AgentState.TERMINATED
 
+        appended_len = 0
+        if student_message is not None:
+            appended_len = len(response_ids)
+        next_prompt_ids = list(agent_data.prompt_ids) + response_ids
+        next_response_mask = list(agent_data.response_mask) + ([0] * appended_len)
+        next_response_logprobs = list(agent_data.response_logprobs)
+        if next_response_logprobs:
+            next_response_logprobs.extend([0.0] * appended_len)
+        next_user_turns = agent_data.user_turns + (1 if student_message is not None else 0)
+
+        next_mini_step_image_spans = None
         if image_data:
-            image_extend_t0 = time.monotonic()
             image_start = _safe_len(agent_data.image_data)
-            self._extend_image_data(agent_data, image_data)
-            image_end = _safe_len(agent_data.image_data)
-            spans = list(agent_data.extra_fields.get("mini_step_image_spans") or [])
-            spans.append(
+            image_end = _safe_len(next_image_data)
+            next_mini_step_image_spans = list(agent_data.extra_fields.get("mini_step_image_spans") or [])
+            next_mini_step_image_spans.append(
                 {
                     "step_idx": int(agent_data.assistant_turns) + 1,
                     "image_start": image_start,
@@ -615,82 +645,68 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                     "terminal": False,
                 }
             )
-            agent_data.extra_fields["mini_step_image_spans"] = spans
-            image_extend_ms = (time.monotonic() - image_extend_t0) * 1000
-            _trace_async_skd(
-                "web_skd.tool_processing_image_extend_done",
-                request_id=agent_data.request_id,
-                elapsed_ms=round(image_extend_ms, 1),
-                added_image_count=_safe_len(image_data),
-                total_image_count=_safe_len(agent_data.image_data),
-            )
 
-        appended_len = 0
-        if student_message is not None:
-            student_commit_t0 = time.monotonic()
-            agent_data.messages.append(student_message)
-            appended_len = len(response_ids)
-            agent_data.prompt_ids += response_ids
-            agent_data.response_mask += [0] * appended_len
-            if agent_data.response_logprobs:
-                agent_data.response_logprobs += [0.0] * appended_len
-            agent_data.user_turns += 1
-            student_commit_ms = (time.monotonic() - student_commit_t0) * 1000
-            _trace_async_skd(
-                "web_skd.tool_processing_student_commit_done",
-                request_id=agent_data.request_id,
-                elapsed_ms=round(student_commit_ms, 1),
-                appended_len=appended_len,
-                prompt_len=len(agent_data.prompt_ids),
-                server_prompt_len=len(next_server_prompt_ids) if next_server_prompt_ids is not None else None,
-                response_len=len(agent_data.response_mask),
-            )
+        next_teacher_ids_list = None
+        next_teacher_logprobs_list = None
+        if "teacher_ids_list" in agent_data.extra_fields or "teacher_logprobs_list" in agent_data.extra_fields:
+            if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
+                raise ValueError("WebSKD teacher alignment requires both teacher_ids_list and teacher_logprobs_list")
+            assert self.loss_top_k is not None and self.loss_top_k > 0, "SKD dummy rows require distillation topk > 0"
+            next_teacher_ids_list = [list(row) for row in agent_data.extra_fields["teacher_ids_list"]]
+            next_teacher_logprobs_list = [list(row) for row in agent_data.extra_fields["teacher_logprobs_list"]]
+            next_teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(appended_len)])
+            next_teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(appended_len)])
+            if len(next_teacher_ids_list) != len(next_response_mask):
+                raise AssertionError(
+                    f"[SKD] teacher_ids_list length {len(next_teacher_ids_list)} != response_mask length {len(next_response_mask)}"
+                )
+            if len(next_teacher_logprobs_list) != len(next_response_mask):
+                raise AssertionError(
+                    "[SKD] teacher_logprobs_list length "
+                    f"{len(next_teacher_logprobs_list)} != response_mask length {len(next_response_mask)}"
+                )
 
-        teacher_commit_t0 = time.monotonic()
-        teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages", []))
-        if teacher_message is not None:
-            teacher_messages.append(teacher_message)
-            teacher_prompt_ids.extend(teacher_response_ids)
+        commit_t0 = time.monotonic()
+        agent_data.messages = next_student_messages
+        agent_data.image_data = next_image_data
+        agent_data.prompt_ids = next_prompt_ids
+        agent_data.response_mask = next_response_mask
+        if next_response_logprobs:
+            agent_data.response_logprobs = next_response_logprobs
+        agent_data.user_turns = next_user_turns
         # Keep the raw teacher conversation as the durable state. The compact
         # teacher request view is rebuilt from this raw state at the next
         # generation boundary and cached only as a compatibility snapshot.
-        agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
+        agent_data.extra_fields["web_osgym_teacher_messages"] = next_teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
-        if teacher_prompt_ids is not None:
-            agent_data.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
+        agent_data.extra_fields["teacher_prompt_ids"] = next_teacher_prompt_ids
         if next_server_prompt_ids is not None:
             agent_data.extra_fields["server_prompt_ids"] = next_server_prompt_ids
         if next_teacher_server_prompt_ids is not None:
             agent_data.extra_fields["teacher_server_prompt_ids"] = next_teacher_server_prompt_ids
         if next_teacher_sglang_prefix_surplus is not None:
             agent_data.extra_fields["teacher_sglang_prefix_surplus"] = next_teacher_sglang_prefix_surplus
-        teacher_commit_ms = (time.monotonic() - teacher_commit_t0) * 1000
+        if next_mini_step_image_spans is not None:
+            agent_data.extra_fields["mini_step_image_spans"] = next_mini_step_image_spans
+        if next_teacher_ids_list is not None and next_teacher_logprobs_list is not None:
+            agent_data.extra_fields["teacher_ids_list"] = next_teacher_ids_list
+            agent_data.extra_fields["teacher_logprobs_list"] = next_teacher_logprobs_list
+        if appended_len > 0:
+            self._increment_skd_prefix_stats(agent_data, env_units=1, tokens=appended_len)
+        commit_ms = (time.monotonic() - commit_t0) * 1000
         _trace_async_skd(
-            "web_skd.tool_processing_teacher_commit_done",
+            "web_skd.tool_processing_commit_bundle_done",
             request_id=agent_data.request_id,
-            elapsed_ms=round(teacher_commit_ms, 1),
-            teacher_message_committed=teacher_message is not None,
-            teacher_prompt_len=len(teacher_prompt_ids) if teacher_prompt_ids is not None else None,
+            elapsed_ms=round(commit_ms, 1),
+            appended_len=appended_len,
+            prompt_len=len(agent_data.prompt_ids),
+            response_len=len(agent_data.response_mask),
+            image_count=_safe_len(agent_data.image_data),
+            teacher_prompt_len=len(next_teacher_prompt_ids),
             teacher_server_prompt_len=(
                 len(next_teacher_server_prompt_ids) if next_teacher_server_prompt_ids is not None else None
             ),
             teacher_sglang_prefix_surplus=agent_data.extra_fields.get("teacher_sglang_prefix_surplus"),
-        )
-
-        align_t0 = time.monotonic()
-        self._append_dummy_teacher_rows(agent_data, appended_len)
-        self._assert_teacher_alignment(agent_data)
-        if appended_len > 0:
-            self._increment_skd_prefix_stats(agent_data, env_units=1, tokens=appended_len)
-        align_ms = (time.monotonic() - align_t0) * 1000
-        _trace_async_skd(
-            "web_skd.tool_processing_alignment_done",
-            request_id=agent_data.request_id,
-            elapsed_ms=round(align_ms, 1),
-            appended_len=appended_len,
-            teacher_ids_rows=len(agent_data.extra_fields.get("teacher_ids_list", [])),
-            teacher_logprobs_rows=len(agent_data.extra_fields.get("teacher_logprobs_list", [])),
-            response_len=len(agent_data.response_mask),
         )
 
         _trace_async_skd(
