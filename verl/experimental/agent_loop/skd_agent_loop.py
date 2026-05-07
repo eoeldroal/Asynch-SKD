@@ -54,6 +54,9 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # VERL_SKD_DEBUG=2 for token-level alignment verification (first 3 samples per batch).
 _SKD_DEBUG = int(os.getenv("VERL_SKD_DEBUG", "0"))
 _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+_SKD_CHUNK_TRACE = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE", "0"))
+_SKD_CHUNK_TRACE_TOPK = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE_TOPK", "5"))
+_SKD_CHUNK_TRACE_MAX_TOKENS = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE_MAX_TOKENS", "64"))
 _SKD_PENDING_TURN_STATE = "skd_pending_turn_state"
 _SKD_PENDING_TURN_CHUNKS = "skd_pending_turn_chunks"
 
@@ -74,6 +77,16 @@ def _safe_len(value: Any) -> int:
         return len(value)
     except TypeError:
         return 1
+
+
+def _token_edges(ids: list[int], *, head: int = 8, tail: int = 8) -> dict[str, list[int]]:
+    values = list(ids)
+    if len(values) <= head + tail:
+        return {"all": values}
+    return {
+        "head": values[:head],
+        "tail": values[-tail:],
+    }
 
 
 @dataclass(frozen=True)
@@ -209,6 +222,119 @@ class SkdAgentLoop(ToolAgentLoop):
         prompt_path = Path(self.teacher_system_prompt_path).expanduser()
         teacher_text = prompt_path.read_text(encoding="utf-8").strip()
         return teacher_text or None
+
+    def _safe_decode_token(self, token_id: int) -> str:
+        try:
+            return self.tokenizer.decode([int(token_id)], skip_special_tokens=False)
+        except Exception:
+            return f"<tok:{int(token_id)}>"
+
+    def _build_teacher_chunk_debug_rows(
+        self,
+        *,
+        chunk: list[int],
+        new_tokens: list[int],
+        teacher_ids: torch.Tensor,
+        teacher_logprobs: torch.Tensor,
+        rejection_pos: int | None,
+    ) -> list[dict[str, Any]]:
+        limit = min(len(chunk), max(_SKD_CHUNK_TRACE_MAX_TOKENS, 0))
+        topk = min(max(_SKD_CHUNK_TRACE_TOPK, 1), int(teacher_ids.shape[1]) if teacher_ids.dim() > 1 else 1)
+        rows: list[dict[str, Any]] = []
+        for idx in range(limit):
+            teacher_top_ids = teacher_ids[idx, :topk].tolist() if idx < teacher_ids.shape[0] else []
+            teacher_top_logprobs = (
+                teacher_logprobs[idx, :topk].tolist() if idx < teacher_logprobs.shape[0] else []
+            )
+            final_token_id = int(new_tokens[idx]) if idx < len(new_tokens) else None
+            rows.append(
+                {
+                    "position": idx,
+                    "student_token_id": int(chunk[idx]),
+                    "student_token_text": self._safe_decode_token(int(chunk[idx])),
+                    "teacher_top_ids": [int(token_id) for token_id in teacher_top_ids],
+                    "teacher_top_tokens": [self._safe_decode_token(int(token_id)) for token_id in teacher_top_ids],
+                    "teacher_top_logprobs": [float(logprob) for logprob in teacher_top_logprobs],
+                    "in_verify_top_k": bool(int(chunk[idx]) in teacher_top_ids[: self.skd_verify_top_k]),
+                    "final_token_id": final_token_id,
+                    "final_token_text": self._safe_decode_token(final_token_id) if final_token_id is not None else None,
+                    "committed": idx < len(new_tokens),
+                    "replaced": rejection_pos is not None and idx == rejection_pos,
+                }
+            )
+        return rows
+
+    def _emit_teacher_chunk_debug_event(
+        self,
+        *,
+        event_name: str,
+        request_id: str,
+        chunk_idx: int,
+        chunk: list[int],
+        new_tokens: list[int],
+        teacher_ids: torch.Tensor,
+        teacher_logprobs: torch.Tensor,
+        rejection_pos: int | None,
+        extra_fields: dict[str, Any] | None = None,
+    ) -> None:
+        if _SKD_CHUNK_TRACE <= 0:
+            return
+        payload = {
+            "request_id": request_id,
+            "chunk_idx": chunk_idx,
+            "chunk_len": len(chunk),
+            "new_tokens_len": len(new_tokens),
+            "rejection_pos": rejection_pos,
+            "rows": self._build_teacher_chunk_debug_rows(
+                chunk=chunk,
+                new_tokens=new_tokens,
+                teacher_ids=teacher_ids,
+                teacher_logprobs=teacher_logprobs,
+                rejection_pos=rejection_pos,
+            ),
+        }
+        if extra_fields:
+            payload.update(extra_fields)
+        emit_async_skd_event(event_name, **payload)
+
+    def _log_teacher_chunk_debug_console(
+        self,
+        *,
+        request_id: str,
+        chunk_idx: int,
+        chunk: list[int],
+        new_tokens: list[int],
+        teacher_ids: torch.Tensor,
+        teacher_logprobs: torch.Tensor,
+        rejection_pos: int | None,
+    ) -> None:
+        if _SKD_DEBUG < 2:
+            return
+        try:
+            rows = self._build_teacher_chunk_debug_rows(
+                chunk=chunk,
+                new_tokens=new_tokens,
+                teacher_ids=teacher_ids,
+                teacher_logprobs=teacher_logprobs,
+                rejection_pos=rejection_pos,
+            )
+            lines = [
+                f"[SKD_CHUNK] req={request_id} chunk={chunk_idx} chunk_len={len(chunk)} "
+                f"new_tokens_len={len(new_tokens)} rejection_pos={rejection_pos}"
+            ]
+            for row in rows:
+                top_pairs = ", ".join(
+                    f"{tok}@{logprob:.4f}"
+                    for tok, logprob in zip(row["teacher_top_tokens"], row["teacher_top_logprobs"], strict=True)
+                )
+                lines.append(
+                    f"  pos={row['position']} student={row['student_token_text']}({row['student_token_id']}) "
+                    f"committed={row['committed']} replaced={row['replaced']} "
+                    f"final={row['final_token_text']}({row['final_token_id']}) top={top_pairs}"
+                )
+            warnings.warn("\n".join(lines), stacklevel=2)
+        except Exception as exc:
+            warnings.warn(f"[SKD_CHUNK] logging error: {exc}", stacklevel=2)
 
     def _build_teacher_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Merge teacher-only system guidance into the initial conversation."""
@@ -1205,6 +1331,23 @@ class SkdAgentLoop(ToolAgentLoop):
                         teacher_sglang_prefix_surplus=teacher_logprob_range.teacher_sglang_prefix_surplus,
                         image_count=_safe_len(multi_modal_data.get("images")),
                     )
+                    if _SKD_CHUNK_TRACE > 0:
+                        emit_async_skd_event(
+                            "teacher_verify_request",
+                            request_id=agent_data.request_id,
+                            chunk_idx=next_chunk_idx,
+                            chunk_len=len(chunk),
+                            seq_len=len(verify_sequence),
+                            teacher_prompt_len=len(teacher_prompt_ids),
+                            teacher_server_prompt_len=len(teacher_server_prompt_ids),
+                            logprob_start_len=logprob_start_len,
+                            expected_logprob_rows=expected_suffix_len,
+                            expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                            teacher_server_prompt_tail=_token_edges(list(teacher_server_prompt_ids)),
+                            chunk_head=list(chunk[:8]),
+                            chunk_tail=list(chunk[-8:]),
+                            verify_sequence_tail=_token_edges(list(verify_sequence), head=0, tail=16),
+                        )
                     teacher_await_t0 = time.monotonic()
                     _trace_async_skd(
                         "loop.teacher_compute_await_begin",
@@ -1264,6 +1407,20 @@ class SkdAgentLoop(ToolAgentLoop):
                     sglang_logprob_start_len=teacher_logprob_range.sglang_logprob_start_len,
                     expected_logprob_rows=teacher_logprob_range.expected_logprob_rows,
                 )
+                self._emit_teacher_chunk_debug_event(
+                    event_name="teacher_verify_rows",
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    chunk=chunk,
+                    new_tokens=[],
+                    teacher_ids=teacher_ids,
+                    teacher_logprobs=teacher_logprobs,
+                    rejection_pos=None,
+                    extra_fields={
+                        "teacher_rows": int(teacher_ids.shape[0]),
+                        "teacher_width": int(teacher_ids.shape[1]) if teacher_ids.dim() > 1 else 1,
+                    },
+                )
                 # In SGLang delta mode, teacher_ids / teacher_logprobs only cover the
                 # chunk suffix rows needed by SKD, aligned so local row k supervises
                 # chunk token k.
@@ -1320,6 +1477,25 @@ class SkdAgentLoop(ToolAgentLoop):
                     rejection_pos=rejection_pos,
                     new_tokens_len=len(new_tokens),
                     accepted_len=len(new_tokens) - (1 if rejection_pos is not None else 0),
+                )
+                self._emit_teacher_chunk_debug_event(
+                    event_name="teacher_replacement",
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    chunk=chunk,
+                    new_tokens=new_tokens,
+                    teacher_ids=teacher_ids,
+                    teacher_logprobs=teacher_logprobs,
+                    rejection_pos=rejection_pos,
+                )
+                self._log_teacher_chunk_debug_console(
+                    request_id=agent_data.request_id,
+                    chunk_idx=next_chunk_idx,
+                    chunk=chunk,
+                    new_tokens=new_tokens,
+                    teacher_ids=teacher_ids,
+                    teacher_logprobs=teacher_logprobs,
+                    rejection_pos=rejection_pos,
                 )
 
                 skd_metrics["chunk_count"] += 1
@@ -1417,6 +1593,9 @@ class SkdAgentLoop(ToolAgentLoop):
                     response_len=len(agent_data.response_mask) + len(turn_state.tokens),
                     committed_gen_chunks=int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0)),
                     committed_prefix_tokens=int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0)),
+                    raw_chunk=list(chunk) if _SKD_CHUNK_TRACE > 0 else None,
+                    verified_chunk=list(new_tokens) if _SKD_CHUNK_TRACE > 0 else None,
+                    teacher_rows=int(teacher_ids.shape[0]) if _SKD_CHUNK_TRACE > 0 else None,
                 )
                 _trace_async_skd(
                     "loop.chunk_commit",

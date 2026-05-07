@@ -17,6 +17,7 @@ from typing import Any
 import pytest
 import torch
 
+import verl.experimental.agent_loop.skd_agent_loop as skd_agent_loop_module
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
 from verl.experimental.agent_loop.skd_agent_loop import (
     SkdAgentLoop,
@@ -609,6 +610,7 @@ async def test_rejection_at_first_token_discards_suffix():
 async def test_skd_chunk_commit_emits_realtime_progress_event(tmp_path, monkeypatch):
     event_path = tmp_path / "async_skd_events.jsonl"
     monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    monkeypatch.setattr(skd_agent_loop_module, "_SKD_CHUNK_TRACE", 1)
     loop = make_skd_loop(
         student_chunks=[[777, 20, 30]],
         teacher_topk_by_call=[{0: [100, 101, 102]}],
@@ -625,13 +627,31 @@ async def test_skd_chunk_commit_emits_realtime_progress_event(tmp_path, monkeypa
         await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
 
     events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    [request_event] = [event for event in events if event["event"] == "teacher_verify_request"]
+    [replacement_event] = [event for event in events if event["event"] == "teacher_replacement"]
     [chunk_event] = [event for event in events if event["event"] == "chunk_commit"]
+    assert request_event["sample_id"] == "sample-reject"
+    assert request_event["chunk_idx"] == 1
+    assert request_event["chunk_len"] == 3
+    assert request_event["expected_logprob_rows"] == 3
+    assert request_event["chunk_head"] == [777, 20, 30]
+    assert replacement_event["sample_id"] == "sample-reject"
+    assert replacement_event["chunk_idx"] == 1
+    assert replacement_event["chunk_len"] == 3
+    assert replacement_event["new_tokens_len"] == 1
+    assert replacement_event["rejection_pos"] == 0
+    assert replacement_event["rows"][0]["student_token_id"] == 777
+    assert replacement_event["rows"][0]["teacher_top_ids"][:3] == [100, 101, 102]
+    assert replacement_event["rows"][0]["final_token_id"] == 100
+    assert replacement_event["rows"][0]["replaced"] is True
     assert chunk_event["sample_id"] == "sample-reject"
     assert chunk_event["chunk_idx"] == 1
     assert chunk_event["accepted"] == 0
     assert chunk_event["rejected"] == 1
     assert chunk_event["new_tokens"] == 1
     assert chunk_event["response_len"] == 1
+    assert chunk_event["raw_chunk"] == [777, 20, 30]
+    assert chunk_event["verified_chunk"] == [100]
 
 
 @pytest.mark.asyncio

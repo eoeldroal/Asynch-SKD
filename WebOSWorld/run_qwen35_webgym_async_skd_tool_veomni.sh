@@ -28,6 +28,10 @@ SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 VERL_ASYNC_SKD_SLOW_LOOP_MS=10 \
 VERL_SKD_DEBUG=2 \
 VERL_ASYNC_SKD_TRACE=2 \
+VERL_ASYNC_SKD_CHUNK_TRACE=2 \
+VERL_ASYNC_SKD_CHUNK_TRACE_TOPK=5 \
+VERL_ASYNC_SKD_CHUNK_TRACE_MAX_TOKENS=64 \
+VERL_ASYNC_SKD_EVENT_LOG=/home/sogang_nlpy/verl/logs/async_skd_events_webgym.jsonl \
 python3 -m verl.trainer.main_ppo \
     model_engine=veomni \
     "data.train_files=['${WEBGYM_SKD_DATASET_DIR}/train.parquet']" \
