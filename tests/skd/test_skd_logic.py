@@ -1091,7 +1091,7 @@ async def test_teacher_verify_uses_current_prefix_state():
 
     assert student_request_prompt_ids == [1, 2, 3, 10, 11]
     assert teacher_prompt_ids == [1, 2, 30, 31, 10, 11]
-    assert teacher_server_prompt_ids == [888, 10, 11]
+    assert teacher_server_prompt_ids == [1, 2, 30, 31, 10, 11]
     assert teacher_sglang_prefix_surplus == 0
 
 
