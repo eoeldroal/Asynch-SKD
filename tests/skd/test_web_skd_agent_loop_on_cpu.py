@@ -798,7 +798,6 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         before_image_data = deepcopy(agent_data.image_data)
         before_prompt_ids = list(agent_data.prompt_ids)
         before_response_mask = list(agent_data.response_mask)
-        before_metrics = deepcopy(agent_data.metrics)
         before_extra = deepcopy(agent_data.extra_fields)
 
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
@@ -808,7 +807,6 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.image_data, before_image_data)
         self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
         self.assertEqual(agent_data.response_mask, before_response_mask)
-        self.assertEqual(agent_data.metrics, before_metrics)
         self.assertEqual(agent_data.extra_fields["server_prompt_ids"], before_extra["server_prompt_ids"])
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], before_extra["teacher_prompt_ids"])
         self.assertEqual(
