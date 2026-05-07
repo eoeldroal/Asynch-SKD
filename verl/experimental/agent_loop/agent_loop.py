@@ -65,6 +65,16 @@ DEFAULT_ROUTING_CACHE_SIZE = 10000
 ASYNC_SKD_MANAGER_CLASS = "verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager"
 ASYNC_SKD_MODES = {"sample_async", "lookahead"}
 _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS = {
+    "web_osgym_cursor_x",
+    "web_osgym_cursor_y",
+    "web_osgym_screen_width",
+    "web_osgym_screen_height",
+    "web_osgym_instance_id",
+    "web_osgym_session_id",
+    "web_osgym_include_a11y",
+    "web_osgym_reward_fetched",
+}
 
 
 def _trace_async_skd(stage: str, **fields: Any) -> None:
@@ -74,6 +84,12 @@ def _trace_async_skd(stage: str, **fields: Any) -> None:
     parts = [f"{key}={value!r}" for key, value in fields.items()]
     suffix = f" {' '.join(parts)}" if parts else ""
     print(f"[ASYNC_SKD_TRACE] stage={stage}{suffix}", flush=True)
+
+
+def _filter_exported_extra_fields(extra_fields: dict[str, Any] | None) -> dict[str, Any]:
+    if not extra_fields:
+        return {}
+    return {key: value for key, value in extra_fields.items() if key not in WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS}
 
 
 def _select_config(config, path: str, default=None):
@@ -1181,7 +1197,7 @@ class AgentLoopWorker:
                 non_tensor_batch = {
                     **{k: np.array([v]) for k, v in kwargs.items()},
                     "__num_turns__": np.array([output.num_turns]),
-                    "tool_extra_fields": np.array([output.extra_fields], dtype=object),
+                    "tool_extra_fields": np.array([_filter_exported_extra_fields(output.extra_fields)], dtype=object),
                 }
 
                 data = DataProto(
@@ -1334,6 +1350,7 @@ class AgentLoopWorker:
         # Collect extra fields from all inputs and convert them to np.ndarray
         # Keep a stable set of keys so downstream batch concat stays consistent across agent loops.
         extra_fields = {}
+        exported_extra_fields = [_filter_exported_extra_fields(input.extra_fields) for input in inputs]
         default_extra_keys = {
             "turn_scores",
             "tool_rewards",
@@ -1341,12 +1358,12 @@ class AgentLoopWorker:
             "max_global_steps",
             "extras",
         }
-        all_keys = set(key for input_item in inputs for key in input_item.extra_fields) | default_extra_keys
+        all_keys = set(key for fields in exported_extra_fields for key in fields) | default_extra_keys
         for key in all_keys:
             if key in hard_identity_keys:
                 continue
             temp_arr = np.empty(len(inputs), dtype=object)
-            temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
+            temp_arr[:] = [fields.get(key) for fields in exported_extra_fields]
             extra_fields[key] = temp_arr
 
         non_tensor_batch.update(extra_fields)

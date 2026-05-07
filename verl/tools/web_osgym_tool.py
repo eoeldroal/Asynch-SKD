@@ -130,7 +130,6 @@ class WebOsGymTool(BaseTool):
         "DONE",
         "FAIL",
     }
-    BACKEND_UNSUPPORTED_ACTIONS = {"MOUSE_DOWN", "MOUSE_UP", "RIGHT_CLICK", "DRAG_TO"}
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         super().__init__(config, tool_schema)
@@ -309,11 +308,6 @@ class WebOsGymTool(BaseTool):
 
         for action in actions:
             action_type = action.action_type
-            if action_type in self.BACKEND_UNSUPPORTED_ACTIONS:
-                raise ValueError(
-                    f"{action_type} is part of Computer 13 but is not supported by the current WebGym backend"
-                )
-
             payload = action.model_dump(exclude_none=True)
             if action_type == "MOVE_TO":
                 x = self._require_field(action, "x")

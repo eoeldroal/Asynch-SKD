@@ -13,7 +13,10 @@
 3. 각 mini-step의 action은 정확히 한 번만 loss를 받게 한다.
 4. teacher top-k는 generation 당시 full-context teacher signal을 재사용한다.
 5. actor update에 들어가는 이미지 수를 구조적으로 제한한다.
-6. tool-call format은 Qwen3.5 native `qwen3_coder` XML format을 유지한다.
+6. WebGym action semantics는 Computer 13 + OSWorld-style `1000x1000` relative coordinates로 고정한다.
+7. fully async RL은 bundled `computer(actions=[...])` schema를 canonical model-facing tool surface로 쓴다.
+8. Async SKD는 chunked rollout / teacher verification 제약 때문에 rollout prompt windowing과 constrained
+   decoding을 당장 이식하지 않되, 같은 browser-control prompt와 Computer 13 action semantics를 따른다.
 
 이 recipe는 임시 truncation이 아니라, WebGym policy를 OSWorld Qwen3-VL benchmark harness와 가까운 형태로 재정의한다.
 
@@ -243,7 +246,7 @@ training_window:
   old_history_mode: action_summary
   old_action_invalid_policy: omit
   prompt_source: osworld_qwen3vl_harness
-  coordinate_mode: deferred
+  coordinate_mode: osworld_relative_1000
   coordinate_target_mode: osworld_relative_1000
   keep_initial_observation_image: false
   target_loss: current_step_only
@@ -324,25 +327,27 @@ This policy applies to both WebSKD and pure fully async RL. The two paths should
 WebSKD:
   agent loop: web_skd_agent
   optimization: teacher-verified / windowed SKD
-  prompt/tool contract: OSWorld-style browser prompt + Qwen3.5 named tools
+  prompt/action contract: OSWorld-style browser prompt + Computer 13 actions + 1000x1000 coordinates
+  current tool surface: action-named Qwen3.5 tools when needed by chunked SKD rollout
 
 Fully async RL:
   agent loop: web_tool_agent
   optimization: PPO/GRPO from environment reward
-  prompt/tool contract: the same OSWorld-style browser prompt + Qwen3.5 named tools
+  prompt/action contract: the same OSWorld-style browser prompt + Computer 13 actions + 1000x1000 coordinates
+  current tool surface: bundled computer(actions=[...]) schema
 ```
 
-In other words, if a prompt change is intended to make the policy behave more like the OSWorld harness, it should normally land in the shared WebGym dataset prompt and be used by both SKD and RL datasets. The dataset rows may still route to different loops through `agent_name`.
+In other words, if a prompt change is intended to make the policy behave more like the OSWorld harness, it should normally land in the shared WebGym dataset prompt and be used by both SKD and RL datasets. The dataset rows may still route to different loops through `agent_name`, and the loop/tool schema may serialize the same Computer 13 action semantics differently.
 
 Recommended default:
 
 ```yaml
 student_prompt_policy:
   prompt_semantics_source: osworld_qwen3vl_harness
-  tool_syntax_source: qwen3_5_qwen3_coder
+  tool_semantics_source: computer_13
   observation_type: screenshot_only
   privileged_a11y_for_student: false
-  coordinate_mode: deferred
+  coordinate_mode: osworld_relative_1000
   coordinate_target_mode: osworld_relative_1000
   add_new_current_observation_label: false
 ```
@@ -383,20 +388,30 @@ If a previous click or input did not work, adjust based on the latest screenshot
 When the task is complete, call DONE. If it cannot be completed, call FAIL.
 ```
 
-The system message may also mention the named action set and simple defaults such as `CLICK` defaulting to left click. It should not mention the OSWorld `computer_use` wrapper, because this training stack intentionally exposes action-named Qwen3.5 tools.
+The system message should mention the Computer 13 action set, the per-turn action budget, and the
+`1000x1000` coordinate contract. It should not mention the OSWorld `computer_use` wrapper. The canonical
+fully async RL tool surface is bundled `computer(actions=[...])`; Async SKD may still expose action-named
+Qwen3.5 tools where chunked SKD rollout makes constrained decoding impractical, but the browser-action
+semantics and prompt text should remain shared.
 
 Current RL comparison:
 
 - The pure RL dataset currently routes to `web_tool_agent`; SKD routes to `web_skd_agent`.
-- Both datasets should share the same prompt text and `webgym_rl_tool_config.yaml` tool schema.
-- The current short prompt is functionally valid but under-specifies OSWorld-style screenshot grounding. It should be upgraded in the shared dataset generator rather than patched only in the RL script.
+- Both datasets should share the same browser-control prompt text and Computer 13 action semantics.
+- Fully async RL uses the bundled `computer(actions=[...])` schema in `webgym_rl_tool_config_bundled.yaml`.
+- Async SKD may keep the action-named compatibility schema in `webgym_rl_tool_config.yaml` until its chunked
+  rollout/teacher-verification path can safely adopt bundled-schema constrained decoding.
+- The prompt should explicitly describe screenshot grounding, `DONE` / `FAIL`, the action budget, and
+  `1000x1000` coordinates; these are no longer deferred experiment notes.
 - RL rollout can now use the same bounded prompt-window builder during generation via:
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable`
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n`
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample`
 - The active WebGym fully async RL launcher enables windowed generation with `history_n=5` and `max_images_per_sample=6`.
 - Actor update now also consumes WebOSGym window rows when `web_osgym_window_enable=True`: each assistant generation records the exact prompt/image slice used at rollout time, and the completed trajectory is expanded into one training row per assistant generation before `_agent_loop_postprocess()`.
-- Do not add a tool-call count cap or `1000x1000` coordinate promise in this prompt pass. The former was a superseded mitigation, and the latter should wait until coordinates are normalized end to end.
+- Async SKD should keep full accumulated rollout generation for now. Its actor-side windowed training remains
+  the bounded-backprop mechanism; rollout prompt windowing would require reworking teacher prompt streams,
+  server prompt ids, multimodal surplus accounting, and carryover restore.
 - The RL-only prompt helper now mirrors the OSWorld Qwen harness topology instead of collapsing everything into a single user turn:
   - old actions outside the recent window go into `Previous actions`
   - recent `history_n` steps stay as live `user(observation)` -> `assistant(response)` messages
@@ -410,7 +425,7 @@ For a target mini-step `i`, the windowed student message order should be:
 ```text
 system:
   OSWorld-style GUI rules
-  Qwen3.5 qwen3_coder tool schema and format rules
+  active qwen3_coder tool schema and format rules
 
 user:
   <image observation_recent_start>
@@ -456,38 +471,60 @@ web_osgym_generation_windows = [
 
 These fields are the source of truth for RL update-row reconstruction and rollout debugging. The update row must keep only the current assistant span as target, but the prompt/image context must match this recorded rollout window exactly.
 
-Coordinate handling is deferred for the first implementation. The target benchmark-aligned mode is OSWorld-style `1000x1000` relative coordinates, and the tool server is expected to provide a11y/tree coordinates in that same frame. However, existing local rollout data and screenshots are still in the original image coordinate frame. Therefore the first windowed-loss implementation should avoid changing coordinate semantics and should not rewrite coordinate prompts yet. Once the tool server and stored trajectory metadata are consistently `1000x1000`, coordinate preprocessing can be added as a separate step.
+Important boundary note: the recorded `prompt_ids` here are the local rollout-side expanded ids, not the compact
+server-side placeholder view used at SGLang raw-image request boundaries. Training-row reconstruction should stay
+anchored to the local expanded rollout state. Any compact server prompt view remains a runtime boundary projection,
+not a training-side source of truth.
+
+Coordinate handling is now part of the active browser-action contract. The model-facing prompt/schema uses
+OSWorld-style `1000x1000` relative coordinates, and `WebOsGymTool` projects those coordinates to the current
+session screenshot size before sending the server request. Documentation and prompts should therefore state
+the `0..999` coordinate grid directly. Training-window reconstruction should preserve the model-facing
+coordinates from the original action text; server-side pixel projection is a runtime tool concern, not a
+training-target rewrite.
 
 ## 8. Action and Tool-Call Policy
 
-The benchmark environment should be OSWorld/WebGym-like, but the tool-call format should remain native to Qwen3.5.
+The benchmark environment should be OSWorld/WebGym-like. The canonical action semantics are Computer 13,
+with OSWorld-style `1000x1000` coordinates. Serialization is path-specific:
 
 Recommended default:
 
 ```yaml
 action_policy:
   action_space: computer_13_semantics
-  tool_call_format: qwen3_coder_xml
+  coordinate_mode: osworld_relative_1000
+  fully_async_rl_tool_surface: bundled_computer_actions
+  async_skd_tool_surface: action_named_compat_until_chunked_skd_can_adopt_bundled_schema
   parser: qwen3_coder
   use_computer_use_wrapper: false
 ```
 
-This means the model should emit named function calls:
+The fully async RL path should emit a bundled `computer` function call:
 
 ```text
 <tool_call>
-<function=CLICK>
-<parameter=x>
-412
-</parameter>
-<parameter=y>
-280
+<function=computer>
+<parameter=actions>
+[{"action_type": "CLICK", "x": 412, "y": 280}]
 </parameter>
 </function>
 </tool_call>
 ```
 
-not the OSWorld Qwen3-VL wrapper style:
+The Async SKD compatibility path may still emit action-named Qwen3.5 calls while constrained decoding is
+not practical for chunked SKD rollout:
+
+```text
+<tool_call>
+<function=CLICK>
+<parameter=x>412</parameter>
+<parameter=y>280</parameter>
+</function>
+</tool_call>
+```
+
+Neither path should emit the OSWorld Qwen3-VL wrapper style:
 
 ```text
 <tool_call>
@@ -495,12 +532,17 @@ not the OSWorld Qwen3-VL wrapper style:
 </tool_call>
 ```
 
-The difference is serialization, not environment semantics. `computer_use` is a single wrapper function used by the OSWorld Qwen3-VL harness; Qwen3.5's native tool template and the verl `qwen3_coder` parser expect `<function=...>` and `<parameter=...>` XML blocks. Therefore the training and evaluation harness should keep named tools such as `CLICK`, `TYPING`, `PRESS`, `HOTKEY`, `SCROLL`, `WAIT`, `DONE`, and `FAIL`.
+The difference is serialization, not environment semantics. `computer_use` is a single wrapper function used
+by the OSWorld Qwen3-VL harness and is not the contract here. The current canonical RL path uses
+`computer(actions=[...])`; the current SKD path may use action-named compatibility tools. Both must describe
+the same action names, terminal semantics, and `1000x1000` coordinate frame.
 
 In one sentence:
 
 ```text
-Match OSWorld on environment, observation history, and action semantics; match Qwen3.5 on tool-call syntax and parser.
+Match OSWorld on environment, observation history, action semantics, and coordinate frame; use the local
+Qwen3.5 `qwen3_coder` parser with either bundled `computer(actions=[...])` or action-named compatibility
+serialization depending on the training path.
 ```
 
 ## 9. Teacher Target Policy
@@ -949,7 +991,7 @@ For each mini-step, build one bounded-context training sample.
 Keep task identity in the permanent anchor.
 Keep old progress as action-only text summary, omitting invalid/no-tool old actions.
 Follow OSWorld Qwen3-VL prompt semantics and message ordering.
-Defer coordinate conversion until tool-server and stored trajectory coordinates are consistently OSWorld-style 1000x1000.
+Use OSWorld-style 1000x1000 model-facing coordinates; runtime tool execution projects them to session pixels.
 Keep only recent history_n steps as multimodal screenshot/action context.
 Reuse original token-id slices for recent context and target whenever possible.
 Use the current mini-step assistant reasoning/action as the only loss target, following the original response_mask == 1 span.

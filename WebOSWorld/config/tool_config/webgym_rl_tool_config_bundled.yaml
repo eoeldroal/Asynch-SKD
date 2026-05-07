@@ -31,8 +31,12 @@ tools:
                         enum: ["MOVE_TO"]
                       x:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                       y:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                     required: ["action_type", "x", "y"]
                   - type: "object"
                     description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position. If x and y are provided, each must be its own single integer field. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
@@ -46,8 +50,12 @@ tools:
                         enum: ["left", "middle", "right"]
                       x:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                       y:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                       num_clicks:
                         type: "integer"
                         minimum: 1
@@ -83,8 +91,12 @@ tools:
                         enum: ["RIGHT_CLICK"]
                       x:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                       y:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                     required: ["action_type"]
                   - type: "object"
                     description: "Double click at the current position if x and y are not specified, otherwise double click at the specified position."
@@ -95,8 +107,12 @@ tools:
                         enum: ["DOUBLE_CLICK"]
                       x:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                       y:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                     required: ["action_type"]
                   - type: "object"
                     description: "Drag the cursor to the specified position with the left button pressed."
@@ -107,8 +123,12 @@ tools:
                         enum: ["DRAG_TO"]
                       x:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                       y:
                         type: "integer"
+                        minimum: 0
+                        maximum: 999
                     required: ["action_type", "x", "y"]
                   - type: "object"
                     description: "Scroll the mouse wheel up/down, or left/right."
@@ -163,7 +183,7 @@ tools:
                         type: "string"
                     required: ["action_type", "key"]
                   - type: "object"
-                    description: "Press the specified key combination. keys must be an array of string key names, for example ['ctrl', 'c']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+c'."
+                    description: "Press the specified key combination. keys must be an array of string key names, for example ['ctrl', 'c']. For paste, use ['ctrl', 'v']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+v'."
                     additionalProperties: false
                     properties:
                       action_type:

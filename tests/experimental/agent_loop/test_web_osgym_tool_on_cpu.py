@@ -581,24 +581,6 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metrics["invalid_action"])
         self.assertFalse(tool.client.action_called)
 
-    async def test_tool_execute_rejects_backend_unsupported_action_before_http(self):
-        class _FakeClient:
-            def __init__(self):
-                self.action_called = False
-
-            async def action(self, **kwargs):
-                self.action_called = True
-
-        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
-        tool.client = _FakeClient()
-        tool._instance_dict["i1"] = self._instance_state()
-
-        response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "RIGHT_CLICK", "x": 1, "y": 2}]})
-
-        self.assertIn("not supported by the current WebGym backend", response.text)
-        self.assertTrue(metrics["invalid_action"])
-        self.assertFalse(tool.client.action_called)
-
     async def test_tool_execute_returns_observation_for_gateway_error_response(self):
         class _FakeClient:
             async def action(self, **kwargs):
