@@ -12,8 +12,8 @@ import pandas as pd
 DEFAULT_TASK_FILE = "/home/sogang_nlpy/goonco/surfgym/tasks/tasks_kr_sites.json"
 DEFAULT_LOCAL_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_rl_counter"
 DEFAULT_ASYNC_RL_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl"
-DEFAULT_NUM_TRAIN_SAMPLES = 120
-DEFAULT_NUM_VAL_SAMPLES = 15
+DEFAULT_TRAIN_REPEATS_PER_TASK = 16
+DEFAULT_VAL_REPEATS_PER_TASK = 1
 DEFAULT_AGENT_NAME = "web_skd_agent"
 DEFAULT_ASYNC_RL_AGENT_NAME = "web_tool_agent"
 
@@ -55,12 +55,17 @@ def select_tasks(
 
 
 def _prompt(task: dict[str, Any]) -> list[dict[str, str]]:
-    instruction = str(task["task_name"])
+    instruction = str(task.get("instruction") or task.get("task_name") or "")
+    if not instruction:
+        raise ValueError(f"Task {task.get('task_id', '<unknown>')} is missing both instruction and task_name")
     return [{"role": "user", "content": instruction}]
 
 
 def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> dict[str, Any]:
     task_id = str(task["task_id"])
+    instruction = str(task.get("instruction") or task.get("task_name") or "")
+    if not instruction:
+        raise ValueError(f"Task {task_id} is missing both instruction and task_name")
     tools_kwargs = {"web_osgym": {"create_kwargs": {"task_id": task_id}}}
     return {
         "data_source": "webgym_rl",
@@ -72,7 +77,7 @@ def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> di
             "split": split,
             "index": index,
             "task_id": task_id,
-            "task_name": str(task["task_name"]),
+            "task_name": instruction,
             "website": str(task["website"]),
             "need_tools_kwargs": True,
             "tools_kwargs": tools_kwargs,
@@ -95,6 +100,17 @@ def build_rows(
     ]
 
 
+def _resolve_num_samples(
+    explicit_num_samples: int | None,
+    *,
+    num_tasks: int,
+    repeats_per_task: int,
+) -> int:
+    if explicit_num_samples is not None:
+        return explicit_num_samples
+    return num_tasks * repeats_per_task
+
+
 def write_split(
     *,
     local_save_dir: Path,
@@ -114,11 +130,21 @@ def write_standard_webgym_datasets(
     task_file: str | Path,
     skd_save_dir: str | Path,
     async_rl_save_dir: str | Path,
-    num_train_samples: int,
-    num_val_samples: int,
+    num_train_samples: int | None,
+    num_val_samples: int | None,
     include_localhost: bool = False,
 ) -> tuple[Path, Path]:
     tasks = select_tasks(load_tasks(task_file), include_localhost=include_localhost)
+    resolved_num_train_samples = _resolve_num_samples(
+        num_train_samples,
+        num_tasks=len(tasks),
+        repeats_per_task=DEFAULT_TRAIN_REPEATS_PER_TASK,
+    )
+    resolved_num_val_samples = _resolve_num_samples(
+        num_val_samples,
+        num_tasks=len(tasks),
+        repeats_per_task=DEFAULT_VAL_REPEATS_PER_TASK,
+    )
 
     skd_dir = Path(skd_save_dir).expanduser()
     skd_dir.mkdir(parents=True, exist_ok=True)
@@ -126,14 +152,14 @@ def write_standard_webgym_datasets(
         local_save_dir=skd_dir,
         split="train",
         tasks=tasks,
-        num_samples=num_train_samples,
+        num_samples=resolved_num_train_samples,
         agent_name=DEFAULT_AGENT_NAME,
     )
     write_split(
         local_save_dir=skd_dir,
         split="val",
         tasks=tasks,
-        num_samples=num_val_samples,
+        num_samples=resolved_num_val_samples,
         agent_name=DEFAULT_AGENT_NAME,
     )
 
@@ -143,14 +169,14 @@ def write_standard_webgym_datasets(
         local_save_dir=async_dir,
         split="train",
         tasks=tasks,
-        num_samples=num_train_samples,
+        num_samples=resolved_num_train_samples,
         agent_name=DEFAULT_ASYNC_RL_AGENT_NAME,
     )
     write_split(
         local_save_dir=async_dir,
         split="val",
         tasks=tasks,
-        num_samples=num_val_samples,
+        num_samples=resolved_num_val_samples,
         agent_name=DEFAULT_ASYNC_RL_AGENT_NAME,
     )
 
@@ -164,8 +190,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-file", default=DEFAULT_TASK_FILE)
     parser.add_argument("--local-save-dir", default=DEFAULT_LOCAL_SAVE_DIR)
     parser.add_argument("--async-rl-save-dir", default=DEFAULT_ASYNC_RL_SAVE_DIR)
-    parser.add_argument("--num-train-samples", type=int, default=DEFAULT_NUM_TRAIN_SAMPLES)
-    parser.add_argument("--num-val-samples", type=int, default=DEFAULT_NUM_VAL_SAMPLES)
+    parser.add_argument(
+        "--num-train-samples",
+        type=int,
+        default=None,
+        help=f"Defaults to selected_task_count * {DEFAULT_TRAIN_REPEATS_PER_TASK}.",
+    )
+    parser.add_argument(
+        "--num-val-samples",
+        type=int,
+        default=None,
+        help=f"Defaults to selected_task_count * {DEFAULT_VAL_REPEATS_PER_TASK}.",
+    )
     parser.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
     parser.add_argument(
         "--skip-async-rl-copy",
@@ -197,24 +233,34 @@ def main() -> None:
             task_ids=args.task_ids,
             include_localhost=args.include_localhost,
         )
+        resolved_num_train_samples = _resolve_num_samples(
+            args.num_train_samples,
+            num_tasks=len(tasks),
+            repeats_per_task=DEFAULT_TRAIN_REPEATS_PER_TASK,
+        )
+        resolved_num_val_samples = _resolve_num_samples(
+            args.num_val_samples,
+            num_tasks=len(tasks),
+            repeats_per_task=DEFAULT_VAL_REPEATS_PER_TASK,
+        )
         train_path = write_split(
             local_save_dir=local_save_dir,
             split="train",
             tasks=tasks,
-            num_samples=args.num_train_samples,
+            num_samples=resolved_num_train_samples,
             agent_name=args.agent_name,
         )
         val_path = write_split(
             local_save_dir=local_save_dir,
             split="val",
             tasks=tasks,
-            num_samples=args.num_val_samples,
+            num_samples=resolved_num_val_samples,
             agent_name=args.agent_name,
         )
 
         task_ids = ", ".join(str(task["task_id"]) for task in tasks)
-        print(f"Wrote {args.num_train_samples} train rows to {train_path}")
-        print(f"Wrote {args.num_val_samples} val rows to {val_path}")
+        print(f"Wrote {resolved_num_train_samples} train rows to {train_path}")
+        print(f"Wrote {resolved_num_val_samples} val rows to {val_path}")
         print(f"Task ids: {task_ids}")
         return
 

@@ -13,7 +13,7 @@ cd /home/sogang_nlpy/verl
 # via:
 #   /home/sogang_nlpy/verl/WebOSWorld/webgym_rl/create_webgym_rl_dataset.py
 WEBGYM_SKD_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl_counter
-WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml
+WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
 WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
 if [ "$#" -ge 1 ]; then
@@ -35,7 +35,7 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     data.train_batch_size=16 \
     data.max_prompt_length=2048 \
-    data.max_response_length=16384 \
+    data.max_response_length=65536 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=64 \
     data.truncation=error \
@@ -57,9 +57,9 @@ python3 -m verl.trainer.main_ppo \
     distillation.teacher_models.teacher_model.inference.name=sglang \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.80 \
-    distillation.teacher_models.teacher_model.inference.max_model_len=22529 \
-    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=22529 \
-    distillation.teacher_models.teacher_model.inference.max_num_seqs=64 \
+    distillation.teacher_models.teacher_model.inference.max_model_len=76800 \
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=76800 \
+    distillation.teacher_models.teacher_model.inference.max_num_seqs=16 \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.sglang.attention_backend=triton \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.sglang.mm_attention_backend=fa4 \
     distillation.distillation_loss.loss_mode=forward_kl_topk \
@@ -71,7 +71,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
     distillation.skd.chunk_size=64 \
     distillation.skd.verify_top_k=2 \
-    distillation.skd.max_chunks_per_sample=16 \
+    distillation.skd.max_chunks_per_sample=1024 \
     "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=True \
     distillation.skd.window_history_n=3 \
@@ -81,8 +81,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.calculate_log_probs=False \
-    actor_rollout_ref.rollout.max_model_len=18433 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=18433 \
+    actor_rollout_ref.rollout.max_model_len=76800 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=76800 \
     actor_rollout_ref.rollout.max_num_seqs=64 \
     actor_rollout_ref.rollout.n=1 \
     actor_rollout_ref.rollout.temperature=0.6 \
