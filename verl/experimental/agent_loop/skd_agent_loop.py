@@ -292,6 +292,7 @@ class SkdAgentLoop(ToolAgentLoop):
         response_logprobs = list(agent_data.response_logprobs) if agent_data.response_logprobs else None
 
         pending_turn_state = self._get_pending_turn_state(agent_data)
+        visible_pending_assistant_turns = 1 if pending_turn_state.tokens else 0
         if pending_turn_state.tokens:
             response_ids.extend(pending_turn_state.tokens)
             response_mask.extend([1] * len(pending_turn_state.tokens))
@@ -310,7 +311,7 @@ class SkdAgentLoop(ToolAgentLoop):
             response_mask=response_mask[: self.response_length],
             multi_modal_data=multi_modal_data,
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs is not None else None,
-            num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
+            num_turns=agent_data.user_turns + agent_data.assistant_turns + visible_pending_assistant_turns + 1,
             metrics=agent_data.metrics,
             routed_experts=(
                 agent_data.routed_experts[: len(prompt_ids) + self.response_length]

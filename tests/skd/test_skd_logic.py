@@ -1352,8 +1352,52 @@ async def test_skd_run_preserves_forced_cutoff_pending_turn_in_final_output():
     assert output.prompt_ids == [1, 2, 3]
     assert output.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
     assert output.response_mask == [1, 1, 1]
+    assert output.num_turns == 2
     assert output.extra_fields["skd_termination_reason"] == "max_chunks"
     assert output.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert output.extra_fields["teacher_ids_list"] == []
+    assert output.extra_fields["teacher_logprobs_list"] == []
+
+
+@pytest.mark.asyncio
+async def test_skd_run_until_exportable_boundary_terminal_cutoff_surfaces_pending_turn_in_output():
+    async def fake_process_vision_info(messages):
+        del messages
+        return {}
+
+    async def fake_apply_chat_template(messages, tools=None, images=None, videos=None, **kwargs):
+        del messages, tools, images, videos, kwargs
+        return [1, 2, 3]
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [TOOL_CALL_A, TOOL_CALL_B, 33],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+        max_chunks=1,
+    )
+    loop.process_vision_info = fake_process_vision_info
+    loop.apply_chat_template = fake_apply_chat_template
+
+    result = await loop.run_until_exportable_boundary(
+        {},
+        sample_id="terminal-cutoff",
+        logical_step=12,
+        source_type="lookahead",
+        raw_prompt=[{"role": "user", "content": "question"}],
+    )
+
+    assert isinstance(result, AgentLoopOutput)
+    assert result.prompt_ids == [1, 2, 3]
+    assert result.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert result.response_mask == [1, 1, 1]
+    assert result.num_turns == 2
+    assert result.extra_fields["skd_termination_reason"] == "max_chunks"
+    assert result.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert result.extra_fields["teacher_ids_list"] == []
+    assert result.extra_fields["teacher_logprobs_list"] == []
 
 
 @pytest.mark.asyncio
