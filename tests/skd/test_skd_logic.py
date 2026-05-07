@@ -1070,7 +1070,7 @@ def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
 
 
 @pytest.mark.asyncio
-async def test_teacher_verify_uses_current_prefix_state():
+async def test_teacher_verify_uses_current_teacher_request_prefix_state():
     loop = make_skd_loop(student_chunks=[])
     agent_data = make_agent_data([1, 2, 3])
     agent_data.extra_fields["server_prompt_ids"] = [999]
