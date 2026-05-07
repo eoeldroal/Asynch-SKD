@@ -73,9 +73,9 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.use_policy_gradient=False \
     distillation.distillation_loss.loss_max_clamp=10.0 \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
-    distillation.skd.chunk_size=64 \
-    distillation.skd.verify_top_k=2 \
-    distillation.skd.max_chunks_per_sample=1024 \
+    distillation.skd.chunk_size=128 \
+    distillation.skd.verify_top_k=5 \
+    distillation.skd.max_chunks_per_sample=512 \
     "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=True \
     distillation.skd.window_history_n=3 \
@@ -100,7 +100,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl.experimental.async_skd.manager.AsyncSkdAgentLoopManager \
     +actor_rollout_ref.rollout.agent.async_skd_mode=lookahead \
     +actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover=True \
-    +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=20 \
+    +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=16 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=4 \
     +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=12 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \

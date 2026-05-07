@@ -1,11 +1,18 @@
+import json
+import os
+import tempfile
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import patch
+
+from PIL import Image
 
 import verl.experimental.agent_loop.web_skd_agent_loop as web_skd_agent_loop_module
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
+from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.tools.base_tool import ToolResponse
 
@@ -62,6 +69,16 @@ class _TerminalImageFakeTool(_FakeTool):
         return ToolResponse(text="A11Y_TREE:\nterminal", image=["terminal-image"]), None, {
             "terminated": True,
             "termination_reason": "model_done",
+            "action_count": len(parameters["actions"]),
+        }
+
+
+class _TraceImageFakeTool(_FakeTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters))
+        return ToolResponse(text="A11Y_TREE:\nbutton", image=[Image.new("RGB", (3, 2), "red")]), None, {
+            "terminated": False,
+            "termination_reason": None,
             "action_count": len(parameters["actions"]),
         }
 
@@ -442,6 +459,103 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(teacher_server_prompt_ids, [1, 2, 3, 21, 22])
         self.assertEqual(teacher_sglang_prefix_surplus, 3)
         self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
+
+    async def test_processing_tools_dumps_web_osgym_tool_trace_for_skd(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _TraceImageFakeTool()}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            images = kwargs.get("images") or []
+            if len(messages) == 2 and messages[0] == {"role": "user", "content": "task"} and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 11, 12] + [90] * (3 * len(images))
+            return [11, 12] + [90] * (3 * len(images))
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            if messages and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 21, 22]
+            return [21, 22]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-skd-trace",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = loop.tools
+        agent_data._active_tool_schemas = []
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 777,
+                "web_osgym_include_a11y": True,
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "web_osgym_generation_windows": [
+                    {
+                        "prompt_image_indices": [4, 5],
+                        "old_summary_turn_indices": [1],
+                        "recent_observation_step_indices": [2, 3],
+                        "recent_assistant_turn_indices": [2],
+                        "text_only_recent_step_count": 1,
+                    }
+                ],
+            }
+        )
+        loop.tools["computer"]._instance_dict["instance-1"] = {
+            "task_id": "12345",
+            "request_id": 777,
+            "include_a11y": True,
+            "reward": None,
+        }
+        agent_data.tool_calls = [
+            FunctionCall(name="computer", arguments='{"actions":[{"action_type":"CLICK","x":1,"y":2}]}'),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(os.environ, {"WEB_OSGYM_TOOL_TRACE_DIR": tmpdir}):
+            state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+            self.assertEqual(state, AgentState.GENERATING)
+            event_files = list(Path(tmpdir).glob("events_*.jsonl"))
+            self.assertEqual(len(event_files), 1)
+            event = json.loads(event_files[0].read_text(encoding="utf-8").strip())
+            self.assertEqual(event["session_id"], 777)
+            self.assertEqual(event["task_id"], "12345")
+            self.assertEqual(
+                event["tool_calls"],
+                [
+                    {
+                        "name": "computer",
+                        "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                        "parsed_arguments": {"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]},
+                    }
+                ],
+            )
+            self.assertEqual(event["actions"], [{"action_type": "CLICK", "x": 1, "y": 2}])
+            self.assertEqual(
+                event["prompt_window"],
+                {
+                    "prompt_image_indices": [4, 5],
+                    "old_summary_turn_indices": [1],
+                    "recent_observation_step_indices": [2, 3],
+                    "recent_assistant_turn_indices": [2],
+                    "text_only_recent_step_count": 1,
+                },
+            )
+            self.assertEqual(event["observation"]["text"], "A11Y_TREE:\nbutton")
+            self.assertTrue(event["observation"]["has_image"])
+            image_path = Path(tmpdir) / event["observation"]["images"][0]["path"]
+            self.assertTrue(image_path.exists())
 
     async def test_processing_tools_does_not_count_teacher_only_text_gap_as_sglang_surplus(self):
         loop = _build_loop()
