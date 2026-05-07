@@ -95,7 +95,7 @@ def test_extract_prompt_logprobs_delta_mode_validates_suffix_length():
         ],
     }
 
-    with pytest.raises(ValueError, match="SGLang SKD delta prompt_logprobs length"):
+    with pytest.raises(ValueError, match="violated the exact-position contract"):
         _extract_skd_delta_prompt_logprobs_sglang(
             meta_info=meta_info,
             num_prompt_logprobs=2,
@@ -109,10 +109,12 @@ def test_extract_delta_mode_accepts_expanded_start_with_explicit_expected_rows()
     result: dict[str, list] = {}
     meta_info = {
         "input_token_logprobs": [
+            (None, 11, "tok-11"),
             (-0.2, 12, "tok-12"),
             (-0.3, 13, "tok-13"),
         ],
         "input_top_logprobs": [
+            None,
             _top_row(31),
             _top_row(41),
         ],
@@ -132,16 +134,18 @@ def test_extract_delta_mode_accepts_expanded_start_with_explicit_expected_rows()
     assert result["prompt_logprobs"] == [[-31.0, -32.0], [-41.0, -42.0]]
 
 
-def test_extract_delta_mode_keeps_surplus_trim_fallback_with_explicit_expected_rows():
+def test_extract_delta_mode_rejects_unexpected_extra_prefix_rows():
     result: dict[str, list] = {}
     meta_info = {
         "input_token_logprobs": [
+            (None, 9, "tok-9"),
             (-0.1, 10, "tok-10"),
             (-0.2, 11, "tok-11"),
             (-0.3, 12, "tok-12"),
             (-0.4, 13, "tok-13"),
         ],
         "input_top_logprobs": [
+            None,
             _top_row(11),
             _top_row(21),
             _top_row(31),
@@ -149,21 +153,18 @@ def test_extract_delta_mode_keeps_surplus_trim_fallback_with_explicit_expected_r
         ],
     }
 
-    _extract_skd_delta_prompt_logprobs_sglang(
-        meta_info=meta_info,
-        num_prompt_logprobs=2,
-        sequence_length=4,
-        result_dict=result,
-        prompt_logprobs_start_len=960,
-        expected_logprob_rows=2,
-        expected_mm_prefix_surplus=2,
-    )
-
-    assert result["prompt_ids"] == [[31, 32], [41, 42]]
-    assert result["prompt_logprobs"] == [[-31.0, -32.0], [-41.0, -42.0]]
+    with pytest.raises(ValueError, match="violated the exact-position contract"):
+        _extract_skd_delta_prompt_logprobs_sglang(
+            meta_info=meta_info,
+            num_prompt_logprobs=2,
+            sequence_length=4,
+            result_dict=result,
+            prompt_logprobs_start_len=960,
+            expected_logprob_rows=2,
+        )
 
 
-def test_extract_delta_mode_rejects_unexplained_extra_rows_with_explicit_expected_rows():
+def test_extract_delta_mode_rejects_missing_leading_placeholder():
     result: dict[str, list] = {}
     meta_info = {
         "input_token_logprobs": [
@@ -176,9 +177,10 @@ def test_extract_delta_mode_rejects_unexplained_extra_rows_with_explicit_expecte
             _top_row(21),
             _top_row(31),
         ],
+        "prompt_tokens": 963,
     }
 
-    with pytest.raises(ValueError, match="unexpected multimodal prefix surplus"):
+    with pytest.raises(ValueError, match="expected a leading None placeholder"):
         _extract_skd_delta_prompt_logprobs_sglang(
             meta_info=meta_info,
             num_prompt_logprobs=2,
@@ -186,5 +188,4 @@ def test_extract_delta_mode_rejects_unexplained_extra_rows_with_explicit_expecte
             result_dict=result,
             prompt_logprobs_start_len=960,
             expected_logprob_rows=2,
-            expected_mm_prefix_surplus=2,
         )

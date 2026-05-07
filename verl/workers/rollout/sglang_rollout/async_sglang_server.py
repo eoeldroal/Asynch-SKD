@@ -56,6 +56,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
+_ASYNC_SKD_CHUNK_TRACE = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE", "0"))
 
 
 def _trace_async_skd(stage: str, **fields: Any) -> None:
@@ -86,6 +87,39 @@ def _count_compact_prompt_logprob_rows(meta_info: dict, num_prompt_logprobs: int
             continue
         logprob, _, _ = row
         if logprob is not None:
+            count += 1
+    return count
+
+
+def _token_edges(ids: Any, *, head: int = 8, tail: int = 8) -> dict[str, list[int]]:
+    values = [int(token_id) for token_id in list(ids)]
+    if len(values) <= head + tail:
+        return {"all": values}
+    return {"head": values[:head], "tail": values[-tail:]}
+
+
+def _token_window(ids: Any, start: int, *, radius: int = 2) -> dict[str, Any]:
+    values = [int(token_id) for token_id in list(ids)]
+    left = max(0, int(start) - radius)
+    right = min(len(values), int(start) + radius + 3)
+    return {
+        "start": int(start),
+        "left": left,
+        "right": right,
+        "tokens": values[left:right],
+    }
+
+
+def _count_none_prompt_logprob_rows(meta_info: dict, num_prompt_logprobs: int) -> int:
+    if num_prompt_logprobs > 0:
+        return sum(1 for row in meta_info.get("input_top_logprobs") or [] if row is None)
+    count = 0
+    for row in meta_info.get("input_token_logprobs") or []:
+        if row is None:
+            count += 1
+            continue
+        logprob, _, _ = row
+        if logprob is None:
             count += 1
     return count
 
@@ -159,33 +193,9 @@ def _extract_skd_delta_prompt_logprobs_sglang(
     input_token_logprobs = meta_info.get("input_token_logprobs") or []
     if num_prompt_logprobs > 0:
         input_top_logprobs = meta_info.get("input_top_logprobs") or []
+    prompt_tokens = meta_info.get("prompt_tokens")
     prompt_ids_ls: list[list[int]] = []
     prompt_logprobs_ls: list[list[float]] = []
-
-    # SGLang returns compact rows starting at logprob_start_len. The first row in
-    # that returned slice is a None/no-context placeholder, so SKD consumes the
-    # compact output by skipping placeholders rather than indexing by original
-    # full-sequence positions.
-    if num_prompt_logprobs == 0:
-        for entry in input_token_logprobs:
-            if entry is None:
-                continue
-            logprob, token_id, _ = entry
-            if logprob is None:
-                continue
-            prompt_ids_ls.append([int(token_id)])
-            prompt_logprobs_ls.append([float(logprob)])
-    else:
-        for top_entries in input_top_logprobs:
-            if top_entries is None:
-                continue
-            ids = [int(tok_id) for _, tok_id, _ in top_entries]
-            logprobs = [float(logprob) for logprob, _, _ in top_entries]
-            assert len(ids) == num_prompt_logprobs, (
-                f"SGLang returned {len(ids)} top logprobs in SKD delta mode, expected {num_prompt_logprobs}."
-            )
-            prompt_ids_ls.append(ids)
-            prompt_logprobs_ls.append(logprobs)
 
     if expected_logprob_rows is not None:
         expected_len = int(expected_logprob_rows)
@@ -196,35 +206,74 @@ def _extract_skd_delta_prompt_logprobs_sglang(
             f"Invalid SGLang SKD delta prompt_logprobs range: sequence_length={sequence_length}, "
             f"prompt_logprobs_start_len={prompt_logprobs_start_len}."
         )
+    expected_total_rows = expected_len + 1
+    if prompt_tokens is not None:
+        prompt_token_contract_rows = int(prompt_tokens) - prompt_logprobs_start_len
+        if prompt_token_contract_rows != expected_total_rows:
+            raise ValueError(
+                "SGLang SKD delta prompt_logprobs exact-position contract is inconsistent: "
+                f"prompt_tokens={prompt_tokens}, prompt_logprobs_start_len={prompt_logprobs_start_len}, "
+                f"expected_total_rows={expected_total_rows}, expected_logprob_rows={expected_len}, "
+                f"expected_mm_prefix_surplus={expected_mm_prefix_surplus}."
+            )
+
+    # SGLang regular requests align input logprob arrays to
+    # origin_input_ids[logprob_start_len:]:
+    # - row 0 is an explicit None/no-context placeholder
+    # - the final sampling-token row is removed
+    # Therefore an exact SKD request must return:
+    #   row 0   -> placeholder for the guard prefix token at start_len
+    #   row 1.. -> exact chunk rows
+    if num_prompt_logprobs == 0:
+        raw_rows = list(input_token_logprobs)
+        if not raw_rows:
+            raise ValueError("SGLang SKD delta input_token_logprobs returned no rows.")
+        if len(raw_rows) != expected_total_rows:
+            raise ValueError(
+                "SGLang SKD delta input_token_logprobs violated the exact-position contract: "
+                f"returned={len(raw_rows)}, expected_total_rows={expected_total_rows}, "
+                f"expected_logprob_rows={expected_len}, prompt_logprobs_start_len={prompt_logprobs_start_len}."
+            )
+        if raw_rows[0] is None or raw_rows[0][0] is not None:
+            raise ValueError(
+                "SGLang SKD delta input_token_logprobs expected a leading None placeholder row "
+                f"at prompt_logprobs_start_len={prompt_logprobs_start_len}, got {raw_rows[0]!r}."
+            )
+        if any(entry is None or entry[0] is None for entry in raw_rows[1:]):
+            raise ValueError("SGLang SKD delta input_token_logprobs had unexpected placeholder rows after index 0.")
+        selected_rows = raw_rows[1:]
+        for logprob, token_id, _ in selected_rows:
+            prompt_ids_ls.append([int(token_id)])
+            prompt_logprobs_ls.append([float(logprob)])
+    else:
+        raw_rows = list(input_top_logprobs)
+        if not raw_rows:
+            raise ValueError("SGLang SKD delta input_top_logprobs returned no rows.")
+        if len(raw_rows) != expected_total_rows:
+            raise ValueError(
+                "SGLang SKD delta input_top_logprobs violated the exact-position contract: "
+                f"returned={len(raw_rows)}, expected_total_rows={expected_total_rows}, "
+                f"expected_logprob_rows={expected_len}, prompt_logprobs_start_len={prompt_logprobs_start_len}."
+            )
+        if raw_rows[0] is not None:
+            raise ValueError(
+                "SGLang SKD delta input_top_logprobs expected a leading None placeholder row "
+                f"at prompt_logprobs_start_len={prompt_logprobs_start_len}, got {raw_rows[0]!r}."
+            )
+        if any(top_entries is None for top_entries in raw_rows[1:]):
+            raise ValueError("SGLang SKD delta input_top_logprobs had unexpected placeholder rows after index 0.")
+        selected_rows = raw_rows[1:]
+        for top_entries in selected_rows:
+            ids = [int(tok_id) for _, tok_id, _ in top_entries]
+            logprobs = [float(logprob) for logprob, _, _ in top_entries]
+            assert len(ids) == num_prompt_logprobs, (
+                f"SGLang returned {len(ids)} top logprobs in SKD delta mode, expected {num_prompt_logprobs}."
+            )
+            prompt_ids_ls.append(ids)
+            prompt_logprobs_ls.append(logprobs)
 
     returned_len = len(prompt_ids_ls)
-    if returned_len > expected_len:
-        trimmed_rows = returned_len - expected_len
-        if expected_mm_prefix_surplus is not None and trimmed_rows != expected_mm_prefix_surplus:
-            raise ValueError(
-                f"SGLang SKD delta prompt_logprobs has unexpected multimodal prefix surplus: "
-                f"actual_surplus={trimmed_rows}, expected_mm_prefix_surplus={expected_mm_prefix_surplus}, "
-                f"returned={returned_len}, expected_suffix={expected_len}, sequence_length={sequence_length}, "
-                f"prompt_logprobs_start_len={prompt_logprobs_start_len}. "
-                "For multimodal SKD this surplus must equal the cumulative expansion gap between the "
-                "processor-expanded teacher prompt and the logical server prompt."
-            )
-        logger.info(
-            "Trimming %s leading SGLang SKD delta prompt_logprobs rows "
-            "(returned=%s, expected_suffix=%s, sequence_length=%s, prompt_logprobs_start_len=%s, "
-            "expected_mm_prefix_surplus=%s, expected_logprob_rows=%s). "
-            "This is expected for multimodal prompts whose image tokens are expanded inside SGLang.",
-            trimmed_rows,
-            returned_len,
-            expected_len,
-            sequence_length,
-            prompt_logprobs_start_len,
-            expected_mm_prefix_surplus,
-            expected_logprob_rows,
-        )
-        prompt_ids_ls = prompt_ids_ls[trimmed_rows:]
-        prompt_logprobs_ls = prompt_logprobs_ls[trimmed_rows:]
-    elif returned_len < expected_len:
+    if returned_len < expected_len:
         raise ValueError(
             f"SGLang SKD delta prompt_logprobs length ({returned_len}) is shorter than expected suffix "
             f"length ({expected_len}) for sequence_length={sequence_length}, "
@@ -631,6 +680,11 @@ class SGLangHttpServer:
         prompt_logprobs_start_len = sampling_params.pop("prompt_logprobs_start_len", None)
         expected_mm_prefix_surplus = sampling_params.pop("expected_mm_prefix_surplus", None)
         prompt_logprobs_expected_len = sampling_params.pop("prompt_logprobs_expected_len", None)
+        prompt_start_window = None
+        prompt_tail_tokens = None
+        if prompt_logprobs_start_len is not None and _ASYNC_SKD_CHUNK_TRACE > 0:
+            prompt_start_window = _token_window(prompt_ids, int(prompt_logprobs_start_len))
+            prompt_tail_tokens = _token_edges(prompt_ids, head=0, tail=16)
         if prompt_logprobs is not None:
             return_logprob = True
         request_input_kind = "input_ids"
@@ -667,6 +721,8 @@ class SGLangHttpServer:
             prompt_logprobs=prompt_logprobs,
             logprob_start_len=prompt_logprobs_start_len,
             top_logprobs_num=request.get("top_logprobs_num"),
+            prompt_start_window=prompt_start_window,
+            prompt_tail_tokens=prompt_tail_tokens,
         )
         reqinput_t0 = time.monotonic()
         generate_request = GenerateReqInput(**request)
@@ -926,25 +982,47 @@ class SGLangHttpServer:
                 prompt_logprobs_expected_len=prompt_logprobs_expected_len,
                 expected_delta_len=expected_delta_len,
                 expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                raw_compact_rows=raw_compact_prompt_rows,
+                raw_none_rows=_count_none_prompt_logprob_rows(meta_info, int(prompt_logprobs)),
+                prompt_start_window=prompt_start_window,
+                prompt_tail_tokens=prompt_tail_tokens,
             )
             extract_t0 = time.monotonic()
-            if prompt_logprobs_start_len is not None and prompt_logprobs_start_len > 0:
-                _extract_skd_delta_prompt_logprobs_sglang(
-                    meta_info=meta_info,
-                    num_prompt_logprobs=prompt_logprobs,
-                    sequence_length=len(prompt_ids),
-                    result_dict=extra_fields,
+            try:
+                if prompt_logprobs_start_len is not None and prompt_logprobs_start_len > 0:
+                    _extract_skd_delta_prompt_logprobs_sglang(
+                        meta_info=meta_info,
+                        num_prompt_logprobs=prompt_logprobs,
+                        sequence_length=len(prompt_ids),
+                        result_dict=extra_fields,
+                        prompt_logprobs_start_len=prompt_logprobs_start_len,
+                        expected_mm_prefix_surplus=expected_mm_prefix_surplus,
+                        expected_logprob_rows=prompt_logprobs_expected_len,
+                    )
+                else:
+                    _extract_prompt_logprobs_sglang(
+                        meta_info=meta_info,
+                        num_prompt_logprobs=prompt_logprobs,
+                        sequence_length=len(prompt_ids),
+                        result_dict=extra_fields,
+                    )
+            except Exception as exc:
+                _trace_async_skd(
+                    "sglang.prompt_logprobs_extract_error",
+                    request_id=request_id,
+                    error_type=type(exc).__name__,
+                    error=repr(exc),
+                    input_token_logprobs_len=_safe_len(meta_info.get("input_token_logprobs")),
+                    input_top_logprobs_len=_safe_len(meta_info.get("input_top_logprobs")),
+                    raw_compact_rows=raw_compact_prompt_rows,
+                    raw_none_rows=_count_none_prompt_logprob_rows(meta_info, int(prompt_logprobs)),
                     prompt_logprobs_start_len=prompt_logprobs_start_len,
+                    prompt_logprobs_expected_len=prompt_logprobs_expected_len,
                     expected_mm_prefix_surplus=expected_mm_prefix_surplus,
-                    expected_logprob_rows=prompt_logprobs_expected_len,
+                    prompt_start_window=prompt_start_window,
+                    prompt_tail_tokens=prompt_tail_tokens,
                 )
-            else:
-                _extract_prompt_logprobs_sglang(
-                    meta_info=meta_info,
-                    num_prompt_logprobs=prompt_logprobs,
-                    sequence_length=len(prompt_ids),
-                    result_dict=extra_fields,
-                )
+                raise
             extract_ms = (time.monotonic() - extract_t0) * 1000
             extracted_rows = _safe_len(extra_fields.get("prompt_ids"))
             first_row = extra_fields.get("prompt_ids", [[]])[0] if extracted_rows else []
