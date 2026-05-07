@@ -1315,6 +1315,48 @@ async def test_skd_max_chunks_cutoff_keeps_turn_buffer_uncommitted():
 
 
 @pytest.mark.asyncio
+async def test_skd_run_preserves_forced_cutoff_pending_turn_in_final_output():
+    class _ParserMustNotRun:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            raise AssertionError(
+                f"tool parser must not run at finalized max-chunks cutoff: response_ids={response_ids!r}, tools={tools!r}"
+            )
+
+    loop = make_skd_loop(
+        student_chunks=[
+            [TOOL_CALL_A, TOOL_CALL_B, 33],
+        ],
+        teacher_topk_by_call=[
+            {},
+        ],
+        max_chunks=1,
+    )
+    loop.tool_parser = _ParserMustNotRun()
+    agent_data = make_agent_data([1, 2, 3])
+
+    async def _init_boundary_agent_data(**kwargs):
+        del kwargs
+        return agent_data
+
+    async def _pending_state(agent_data_arg, sampling_params):
+        del sampling_params
+        assert agent_data_arg is agent_data
+        return AgentState.GENERATING
+
+    loop._init_boundary_agent_data = _init_boundary_agent_data
+    loop._handle_pending_state = _pending_state
+
+    output = await loop.run({}, raw_prompt=[{"role": "user", "content": "question"}])
+
+    assert isinstance(output, AgentLoopOutput)
+    assert output.prompt_ids == [1, 2, 3]
+    assert output.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert output.response_mask == [1, 1, 1]
+    assert output.extra_fields["skd_termination_reason"] == "max_chunks"
+    assert output.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
+
+
+@pytest.mark.asyncio
 async def test_skd_budget_exhausted_keeps_pending_turn_uncommitted():
     class _ParserMustNotRun:
         async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):

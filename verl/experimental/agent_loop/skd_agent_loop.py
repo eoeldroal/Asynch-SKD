@@ -281,8 +281,23 @@ class SkdAgentLoop(ToolAgentLoop):
 
     def _finalize_boundary_agent_output(self, agent_data: AgentData) -> AgentLoopOutput:
         """Build AgentLoopOutput from AgentData using ToolAgentLoop-compatible semantics."""
-        response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
-        prompt_ids = agent_data.prompt_ids[: len(agent_data.prompt_ids) - len(agent_data.response_mask)]
+        committed_response_len = len(agent_data.response_mask)
+        if committed_response_len > 0:
+            response_ids = list(agent_data.prompt_ids[-committed_response_len:])
+            prompt_ids = list(agent_data.prompt_ids[: len(agent_data.prompt_ids) - committed_response_len])
+        else:
+            response_ids = []
+            prompt_ids = list(agent_data.prompt_ids)
+        response_mask = list(agent_data.response_mask)
+        response_logprobs = list(agent_data.response_logprobs) if agent_data.response_logprobs else None
+
+        pending_turn_state = self._get_pending_turn_state(agent_data)
+        if pending_turn_state.tokens:
+            response_ids.extend(pending_turn_state.tokens)
+            response_mask.extend([1] * len(pending_turn_state.tokens))
+            if response_logprobs is not None:
+                response_logprobs.extend([0.0] * len(pending_turn_state.tokens))
+
         multi_modal_data = {}
         if agent_data.image_data is not None:
             multi_modal_data["images"] = agent_data.image_data
@@ -292,11 +307,9 @@ class SkdAgentLoop(ToolAgentLoop):
         output = AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=response_ids[: self.response_length],
-            response_mask=agent_data.response_mask[: self.response_length],
+            response_mask=response_mask[: self.response_length],
             multi_modal_data=multi_modal_data,
-            response_logprobs=agent_data.response_logprobs[: self.response_length]
-            if agent_data.response_logprobs
-            else None,
+            response_logprobs=response_logprobs[: self.response_length] if response_logprobs is not None else None,
             num_turns=agent_data.user_turns + agent_data.assistant_turns + 1,
             metrics=agent_data.metrics,
             routed_experts=(
