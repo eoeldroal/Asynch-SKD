@@ -54,11 +54,11 @@ bash WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni.sh
 특징:
 
 - `default_agent_loop=web_skd_agent`
-- tool config: `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
-  - Async SKD currently uses this action-named compatibility schema because chunked SKD rollout is not yet
-    constrained-decoding friendly.
-  - Fully async RL uses the canonical bundled `computer(actions=[...])` schema in
-    `WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml`.
+- tool config: `WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml`
+  - Async SKD and fully async RL both use the bundled `computer(actions=[...])` schema in the current WebGym
+    launchers.
+  - Keeping one model-facing tool surface makes later constrained decoding work land on the same contract for
+    both training paths.
 - screenshot image + teacher-only a11y/text observation split
 - bounded windowed actor update
 - Qwen3.5 / VeOmni runtime baseline
@@ -113,8 +113,9 @@ bash WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni.sh
 - `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
   - runtime-owned `web_osgym_session_id` allocation and restore
 - `verl/tools/web_osgym_tool.py`
-  - canonical model-facing `computer(actions=[...])` tool for bundled RL
-  - action-named compatibility tools for Async SKD
+  - canonical model-facing `computer(actions=[...])` tool for the current WebGym training path
+  - legacy compatibility helpers for older action-named calls still exist in code, but they are not the
+    current Async SKD launcher contract
   - `1000x1000` model-facing coordinate projection to session pixel coordinates
   - `DONE` / `FAIL` terminal handling
 

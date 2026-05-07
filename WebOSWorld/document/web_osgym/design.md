@@ -318,9 +318,9 @@ Completed WebSKD trajectory는 actor update 전에 current mini-step 중심의 b
 ## 15. Action Semantics
 
 Action schema는 Computer 13 계열 low-level action을 따른다. 현재 canonical tool surface는
-bundled `computer(actions=[...])` schema다. Async SKD가 chunked generation / teacher verification
-제약 때문에 action-named Qwen3.5 tool surface를 쓰는 경우에도, 의미론은 같은 Computer 13 action
-list여야 한다.
+bundled `computer(actions=[...])` schema다. 현재 WebGym Async SKD와 fully async RL launcher는 모두
+이 bundled surface를 쓴다. 코드에 남아 있는 legacy action-named compatibility path도 의미론은 같은
+Computer 13 action list여야 한다.
 
 Supported action names:
 
@@ -486,10 +486,11 @@ Trainer entrypoint:
 Tool config:
 
 - `WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml`
-  - canonical bundled `computer(actions=[...])` schema used by fully async RL
+  - canonical bundled `computer(actions=[...])` schema used by both fully async RL and the current Async
+    SKD WebGym launcher
 - `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
-  - compatibility action-named Computer 13 schema, primarily for Async SKD paths that cannot yet use
-    generation-time constrained decoding cleanly
+  - legacy compatibility action-named Computer 13 schema kept only for older or debugging paths, not for the
+    current Async SKD WebGym training launcher
 
 Prompt files:
 

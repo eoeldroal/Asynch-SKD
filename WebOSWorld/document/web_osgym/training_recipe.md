@@ -328,7 +328,7 @@ WebSKD:
   agent loop: web_skd_agent
   optimization: teacher-verified / windowed SKD
   prompt/action contract: OSWorld-style browser prompt + Computer 13 actions + 1000x1000 coordinates
-  current tool surface: action-named Qwen3.5 tools when needed by chunked SKD rollout
+  current tool surface: bundled computer(actions=[...]) schema
 
 Fully async RL:
   agent loop: web_tool_agent
@@ -390,17 +390,16 @@ When the task is complete, call DONE. If it cannot be completed, call FAIL.
 
 The system message should mention the Computer 13 action set, the per-turn action budget, and the
 `1000x1000` coordinate contract. It should not mention the OSWorld `computer_use` wrapper. The canonical
-fully async RL tool surface is bundled `computer(actions=[...])`; Async SKD may still expose action-named
-Qwen3.5 tools where chunked SKD rollout makes constrained decoding impractical, but the browser-action
-semantics and prompt text should remain shared.
+tool surface for both fully async RL and Async SKD is bundled `computer(actions=[...])`; the browser-action
+semantics and prompt text should remain shared across the two training paths.
 
 Current RL comparison:
 
 - The pure RL dataset currently routes to `web_tool_agent`; SKD routes to `web_skd_agent`.
 - Both datasets should share the same browser-control prompt text and Computer 13 action semantics.
 - Fully async RL uses the bundled `computer(actions=[...])` schema in `webgym_rl_tool_config_bundled.yaml`.
-- Async SKD may keep the action-named compatibility schema in `webgym_rl_tool_config.yaml` until its chunked
-  rollout/teacher-verification path can safely adopt bundled-schema constrained decoding.
+- Async SKD also uses the bundled `computer(actions=[...])` schema in the current WebGym launcher so future
+  constrained decoding work can target the same model-facing contract.
 - The prompt should explicitly describe screenshot grounding, `DONE` / `FAIL`, the action budget, and
   `1000x1000` coordinates; these are no longer deferred experiment notes.
 - RL rollout can now use the same bounded prompt-window builder during generation via:
@@ -512,8 +511,8 @@ The fully async RL path should emit a bundled `computer` function call:
 </tool_call>
 ```
 
-The Async SKD compatibility path may still emit action-named Qwen3.5 calls while constrained decoding is
-not practical for chunked SKD rollout:
+Legacy compatibility code paths may still emit action-named Qwen3.5 calls, but that is not the current
+WebGym training contract:
 
 ```text
 <tool_call>
@@ -533,16 +532,16 @@ Neither path should emit the OSWorld Qwen3-VL wrapper style:
 ```
 
 The difference is serialization, not environment semantics. `computer_use` is a single wrapper function used
-by the OSWorld Qwen3-VL harness and is not the contract here. The current canonical RL path uses
-`computer(actions=[...])`; the current SKD path may use action-named compatibility tools. Both must describe
-the same action names, terminal semantics, and `1000x1000` coordinate frame.
+by the OSWorld Qwen3-VL harness and is not the contract here. The current WebGym RL path and the current
+WebGym SKD path both use `computer(actions=[...])`. Any legacy compatibility surface must still describe the
+same action names, terminal semantics, and `1000x1000` coordinate frame.
 
 In one sentence:
 
 ```text
 Match OSWorld on environment, observation history, action semantics, and coordinate frame; use the local
-Qwen3.5 `qwen3_coder` parser with either bundled `computer(actions=[...])` or action-named compatibility
-serialization depending on the training path.
+Qwen3.5 `qwen3_coder` parser with bundled `computer(actions=[...])` serialization for the current training
+paths.
 ```
 
 ## 9. Teacher Target Policy
