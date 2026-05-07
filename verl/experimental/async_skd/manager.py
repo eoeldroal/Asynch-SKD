@@ -23,6 +23,7 @@ except ModuleNotFoundError:  # pragma: no cover - local test environments may no
             del metrics, output
             return {}
 
+from verl.experimental.async_skd.batch_alignment import align_prompt_width_for_concat
 from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.async_skd.metadata import align_non_tensor_keys_for_concat
 from verl.experimental.async_skd.state import AsyncSkdSample, SkdPartialState
@@ -85,7 +86,15 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         return self._finalize_outputs(outputs)
 
     def _finalize_outputs(self, outputs: list[DataProto]) -> DataProto:
-        output = DataProto.concat(align_non_tensor_keys_for_concat(outputs))
+        output = DataProto.concat(
+            align_non_tensor_keys_for_concat(
+                align_prompt_width_for_concat(
+                    outputs,
+                    pad_token_id=self._async_skd_pad_token_id(),
+                    context_name="async-SKD manager output",
+                )
+            )
+        )
         metrics = [single.meta_info.pop("metrics") for single in outputs]
         timing = self._performance_metrics(metrics, output)
         for key in {
@@ -112,6 +121,14 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             output.meta_info["async_skd_metrics"] = extra_metrics
             self._async_skd_last_step_metrics = None
         return output
+
+    def _async_skd_pad_token_id(self) -> int:
+        model_config = getattr(self, "model_config", None)
+        tokenizer = getattr(model_config, "tokenizer", None)
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is None:
+            raise ValueError("Async-SKD manager prompt-width alignment requires a tokenizer pad_token_id.")
+        return int(pad_token_id)
 
     def _async_skd_mode(self) -> str:
         mode = OmegaConf.select(self.config, "actor_rollout_ref.rollout.agent.async_skd_mode", default=None)

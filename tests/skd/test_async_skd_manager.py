@@ -88,9 +88,51 @@ def _make_output(input_pos: int) -> DataProto:
     )
 
 
+
+
+def _make_output_with_prompt_width(input_pos: int, prompt_len: int) -> DataProto:
+    response_len = 3
+    seq_len = prompt_len + response_len
+    prompts = torch.arange(100 + input_pos, 100 + input_pos + prompt_len, dtype=torch.long).unsqueeze(0)
+    responses = torch.tensor([[input_pos, input_pos + 10, 0]], dtype=torch.long)
+    response_mask = torch.tensor([[1, 1, 0]], dtype=torch.long)
+    attention_mask = torch.ones(1, seq_len, dtype=torch.long)
+    input_ids = torch.cat([prompts, responses], dim=1)
+    position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+    return DataProto.from_dict(
+        tensors={
+            "prompts": prompts,
+            "responses": responses,
+            "response_mask": response_mask,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+        },
+        non_tensors={
+            "input_pos": np.array([input_pos], dtype=object),
+            "payload": np.array([f"out-{input_pos}"], dtype=object),
+        },
+        meta_info={
+            "metrics": [
+                {
+                    "generate_sequences": float(input_pos + 1),
+                    "tool_calls": float(input_pos % 2),
+                    "num_preempted": -1,
+                }
+            ]
+        },
+    )
+
 def _make_manager(*, mode: str = "sample_async", rollout_n: int = 1, delays: dict[int, float] | None = None):
     calls: list[tuple[str, int]] = []
     manager = AsyncSkdAgentLoopManager.__new__(AsyncSkdAgentLoopManager)
+
+    class _Tokenizer:
+        pad_token_id = 0
+
+    class _ModelConfig:
+        tokenizer = _Tokenizer()
+
     manager.config = OmegaConf.create(
         {
             "actor_rollout_ref": {
@@ -102,6 +144,7 @@ def _make_manager(*, mode: str = "sample_async", rollout_n: int = 1, delays: dic
         }
     )
     manager.rollout_config = OmegaConf.create({"n": rollout_n})
+    manager.model_config = _ModelConfig()
     manager.stream_teacher_with_rollout = False
     manager.agent_loop_workers = [
         _FakeWorker(name="worker-0", delays=delays or {}, calls=calls),
@@ -267,3 +310,69 @@ def test_lookahead_prefetch_limit_allows_two_step_horizon():
     )
 
     assert manager._lookahead_prefetch_limit(64) == 80
+
+
+def test_async_skd_manager_finalize_outputs_aligns_prompt_width_before_concat():
+    manager, _ = _make_manager()
+
+    class _Tokenizer:
+        pad_token_id = 0
+
+    class _ModelConfig:
+        tokenizer = _Tokenizer()
+
+    manager.model_config = _ModelConfig()
+
+    outputs = [
+        _make_output_with_prompt_width(0, 2),
+        _make_output_with_prompt_width(1, 5),
+    ]
+
+    finalized = manager._finalize_outputs(outputs)
+
+    assert finalized.batch["prompts"].shape == (2, 5)
+    assert finalized.batch["input_ids"].shape == (2, 8)
+    assert finalized.batch["attention_mask"].shape == (2, 8)
+    assert finalized.batch["position_ids"].shape == (2, 8)
+    assert finalized.non_tensor_batch["input_pos"].tolist() == [0, 1]
+    assert finalized.batch["prompts"][0].tolist() == [0, 0, 0, 100, 101]
+    assert finalized.batch["prompts"][1].tolist() == [101, 102, 103, 104, 105]
+
+
+def test_async_skd_manager_finalize_outputs_uses_model_config_tokenizer_pad_token():
+    manager, _ = _make_manager()
+
+    class _Tokenizer:
+        pad_token_id = 7
+
+    class _ModelConfig:
+        tokenizer = _Tokenizer()
+
+    manager.model_config = _ModelConfig()
+
+    outputs = [
+        _make_output_with_prompt_width(0, 2),
+        _make_output_with_prompt_width(1, 5),
+    ]
+
+    finalized = manager._finalize_outputs(outputs)
+
+    assert finalized.batch["prompts"][0].tolist() == [7, 7, 7, 100, 101]
+
+
+def test_async_skd_manager_finalize_outputs_rejects_missing_pad_token_id():
+    manager, _ = _make_manager()
+
+    class _Tokenizer:
+        pad_token_id = None
+
+    class _ModelConfig:
+        tokenizer = _Tokenizer()
+
+    manager.model_config = _ModelConfig()
+
+    with pytest.raises(ValueError, match="pad_token_id"):
+        manager._finalize_outputs([
+            _make_output_with_prompt_width(0, 2),
+            _make_output_with_prompt_width(1, 5),
+        ])

@@ -34,6 +34,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
+from verl.experimental.async_skd.batch_alignment import align_prompt_width_for_concat
 from verl.experimental.async_skd.metadata import align_non_tensor_keys_for_concat, sync_output_non_tensor_with_input
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -181,67 +182,22 @@ def _assemble_async_skd_training_batch(
     if validate or async_skd_data_source is None:
         return base_input_batch, base_output_batch
 
-    def _left_pad_dim(tensor: torch.Tensor, dim: int, pad_size: int, value: int | float) -> torch.Tensor:
-        if pad_size <= 0:
-            return tensor
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = pad_size
-        pad = torch.full(
-            pad_shape,
-            value,
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        return torch.cat([pad, tensor], dim=dim)
-
-    def _pad_batch_prompt_width(batch: DataProto, target_prompt_width: int) -> DataProto:
-        if batch.batch is None or "prompts" not in batch.batch:
-            return batch
-        prompt_width = int(batch.batch["prompts"].size(1))
-        pad_size = target_prompt_width - prompt_width
-        if pad_size <= 0:
-            return batch
-
-        batch.batch["prompts"] = _left_pad_dim(batch.batch["prompts"], 1, pad_size, pad_token_id)
-        if "responses" not in batch.batch:
-            return batch
-
-        response_width = int(batch.batch["responses"].size(1))
-        old_seq_width = prompt_width + response_width
-        for key, value in (("input_ids", pad_token_id), ("attention_mask", 0)):
-            if key in batch.batch:
-                tensor = batch.batch[key]
-                if int(tensor.size(1)) != old_seq_width:
-                    raise ValueError(
-                        f"Cannot align async-SKD batch key {key!r}: "
-                        f"width={tensor.size(1)} expected={old_seq_width}"
-                    )
-                batch.batch[key] = _left_pad_dim(tensor, 1, pad_size, value)
-        if "position_ids" in batch.batch:
-            tensor = batch.batch["position_ids"]
-            if int(tensor.size(-1)) != old_seq_width:
-                raise ValueError(
-                    "Cannot align async-SKD batch key 'position_ids': "
-                    f"width={tensor.size(-1)} expected={old_seq_width}"
-                )
-            batch.batch["position_ids"] = _left_pad_dim(tensor, tensor.dim() - 1, pad_size, 0)
-        for key, value in (("teacher_ids", pad_token_id), ("teacher_logprobs", 0.0)):
-            if key in batch.batch:
-                tensor = batch.batch[key]
-                if int(tensor.size(1)) != old_seq_width:
-                    raise ValueError(
-                        f"Cannot align async-SKD batch key {key!r}: "
-                        f"width={tensor.size(1)} expected={old_seq_width}"
-                    )
-                batch.batch[key] = _left_pad_dim(tensor, 1, pad_size, value)
-        return batch
-
     def _align_pairs_for_concat(
         input_batches: list[DataProto], output_batches: list[DataProto]
     ) -> tuple[list[DataProto], list[DataProto]]:
         target_prompt_width = max(int(batch.batch["prompts"].size(1)) for batch in output_batches)
-        output_batches = [_pad_batch_prompt_width(batch, target_prompt_width) for batch in output_batches]
-        input_batches = [_pad_batch_prompt_width(batch, target_prompt_width) for batch in input_batches]
+        output_batches = align_prompt_width_for_concat(
+            output_batches,
+            pad_token_id=pad_token_id,
+            context_name="async-SKD training output",
+            target_prompt_width=target_prompt_width,
+        )
+        input_batches = align_prompt_width_for_concat(
+            input_batches,
+            pad_token_id=pad_token_id,
+            context_name="async-SKD training input",
+            target_prompt_width=target_prompt_width,
+        )
         return input_batches, output_batches
 
     def _expand_input_to_output(input_batch: DataProto, output_batch: DataProto) -> DataProto:
