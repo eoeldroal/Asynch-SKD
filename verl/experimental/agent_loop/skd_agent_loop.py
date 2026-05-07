@@ -505,8 +505,15 @@ class SkdAgentLoop(ToolAgentLoop):
         if committed_teacher_prompt_ids is None:
             committed_teacher_prompt_ids = agent_data.prompt_ids
         teacher_prompt_ids = list(committed_teacher_prompt_ids) + list(turn_state.tokens)
-        teacher_server_prompt_ids = list(teacher_prompt_ids)
-        teacher_sglang_prefix_surplus = max(len(teacher_prompt_ids) - len(teacher_server_prompt_ids), 0)
+        committed_teacher_server_prompt_ids = agent_data.extra_fields.get("teacher_server_prompt_ids")
+        if committed_teacher_server_prompt_ids is None:
+            committed_teacher_server_prompt_ids = committed_teacher_prompt_ids
+        teacher_server_prompt_ids = list(committed_teacher_server_prompt_ids) + list(turn_state.tokens)
+        has_teacher_multimodal = bool(_safe_len(agent_data.image_data) or _safe_len(agent_data.video_data))
+        teacher_sglang_prefix_surplus = _teacher_sglang_prefix_surplus_from_fields(
+            agent_data.extra_fields,
+            has_multimodal=has_teacher_multimodal,
+        )
         return teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
 
     def _commit_pending_turn_state(
