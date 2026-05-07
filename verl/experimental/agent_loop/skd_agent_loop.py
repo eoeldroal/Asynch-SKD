@@ -432,6 +432,7 @@ class SkdAgentLoop(ToolAgentLoop):
         turn_state: SkdTurnChunkState,
         *,
         pending_chunks: int,
+        clear_response_ids: bool = True,
     ) -> None:
         if turn_state.tokens:
             agent_data.extra_fields[_SKD_PENDING_TURN_STATE] = turn_state.to_payload()
@@ -443,6 +444,8 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data.extra_fields.pop(_SKD_PENDING_TURN_STATE, None)
         agent_data.extra_fields.pop(_SKD_PENDING_TURN_RESPONSE_IDS, None)
         agent_data.extra_fields.pop(_SKD_PENDING_TURN_CHUNKS, None)
+        if clear_response_ids:
+            agent_data.response_ids = []
 
     def _compose_turn_prompt_ids(self, committed_prompt_ids: list[int], turn_tokens: list[int]) -> list[int]:
         if not turn_tokens:
@@ -451,8 +454,18 @@ class SkdAgentLoop(ToolAgentLoop):
             return list(committed_prompt_ids)
         return list(committed_prompt_ids) + list(turn_tokens)
 
-    def _finalize_pending_turn_state(self, agent_data: AgentData, turn_state: SkdTurnChunkState, *, pending_chunks: int) -> None:
+    def _commit_pending_turn_state(
+        self,
+        agent_data: AgentData,
+        turn_state: SkdTurnChunkState,
+        *,
+        pending_chunks: int,
+        finalize_assistant_turn: bool,
+    ) -> None:
+        agent_data.response_ids = list(turn_state.tokens)
         if not turn_state.tokens:
+            turn_state.raw_chunk = []
+            turn_state.verified_chunk = []
             self._set_pending_turn_state(agent_data, turn_state, pending_chunks=0)
             return
 
@@ -476,14 +489,15 @@ class SkdAgentLoop(ToolAgentLoop):
             if prompt_ids is not None:
                 prompt_ids.extend(turn_state.tokens)
         agent_data.response_ids = list(turn_state.tokens)
-        agent_data.assistant_turns += 1
+        if finalize_assistant_turn:
+            agent_data.assistant_turns += 1
         self._increment_skd_prefix_stats(agent_data, gen_chunks=pending_chunks, tokens=len(turn_state.tokens))
         turn_state.tokens = []
         turn_state.teacher_ids_rows = []
         turn_state.teacher_logprobs_rows = []
         turn_state.raw_chunk = []
         turn_state.verified_chunk = []
-        self._set_pending_turn_state(agent_data, turn_state, pending_chunks=0)
+        self._set_pending_turn_state(agent_data, turn_state, pending_chunks=0, clear_response_ids=False)
         self._assert_teacher_alignment(agent_data)
 
     def _teacher_max_model_len(self, routing_key: Any = None) -> int | None:
@@ -1427,8 +1441,22 @@ class SkdAgentLoop(ToolAgentLoop):
         if chunk_output is not None and chunk_output.routed_experts is not None:
             agent_data.routed_experts = chunk_output.routed_experts
 
+        forced_cutoff_reasons = {"budget_exhausted", "max_chunks", "teacher_context_exhausted"}
         if termination_reason == "eos":
-            self._finalize_pending_turn_state(agent_data, turn_state, pending_chunks=pending_turn_chunks)
+            self._commit_pending_turn_state(
+                agent_data,
+                turn_state,
+                pending_chunks=pending_turn_chunks,
+                finalize_assistant_turn=True,
+            )
+            turn_response_ids = list(agent_data.response_ids)
+        elif termination_reason in forced_cutoff_reasons:
+            self._commit_pending_turn_state(
+                agent_data,
+                turn_state,
+                pending_chunks=pending_turn_chunks,
+                finalize_assistant_turn=False,
+            )
             turn_response_ids = list(agent_data.response_ids)
 
         # Compute accept rate metric
@@ -1456,11 +1484,11 @@ class SkdAgentLoop(ToolAgentLoop):
         )
 
         # Check termination conditions (same as ToolAgentLoop L253-259)
+        if termination_reason in forced_cutoff_reasons:
+            return AgentState.TERMINATED
         if termination_reason != "eos":
             return AgentState.GENERATING
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
-            return AgentState.TERMINATED
-        if termination_reason == "teacher_context_exhausted":
             return AgentState.TERMINATED
         if self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
             return AgentState.TERMINATED

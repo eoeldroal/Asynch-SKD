@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, _build_teacher_logprob_range
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState, _build_teacher_logprob_range
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.experimental.async_skd.events import async_skd_event_context
@@ -397,7 +397,13 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
     )
     agent_data = make_agent_data([1, 2, 3])
 
-    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
     assert next_state == AgentState.PROCESSING_TOOLS
     assert not loop._can_export_partial_state(agent_data, next_state)
     with pytest.raises(ValueError, match="Cannot export SKD partial state"):
@@ -535,7 +541,13 @@ async def test_rejection_at_first_token_discards_suffix():
     )
     agent_data = make_agent_data([1, 2, 3])
 
-    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
 
     assert next_state == AgentState.TERMINATED
     assert not loop._can_export_partial_state(agent_data, next_state)
@@ -659,6 +671,38 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
     assert restored_agent_data.extra_fields["skd_committed_gen_chunks"] == 2
     assert restored_agent_data.extra_fields["skd_committed_prefix_tokens"] == 4
     assert_skd_alignment(restored_agent_data)
+
+
+def test_skd_set_pending_turn_state_clears_stale_response_ids_when_empty():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.response_ids = [10]
+    agent_data.extra_fields["skd_pending_turn_response_ids"] = [10]
+    agent_data.extra_fields["skd_pending_turn_state"] = {
+        "tokens": [10],
+        "teacher_ids_rows": [[10, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
+        "raw_chunk": [10],
+        "verified_chunk": [10],
+    }
+    agent_data.extra_fields["skd_pending_turn_chunks"] = 1
+
+    loop._set_pending_turn_state(
+        agent_data,
+        SkdTurnChunkState(
+            tokens=[],
+            teacher_ids_rows=[],
+            teacher_logprobs_rows=[],
+            raw_chunk=[],
+            verified_chunk=[],
+        ),
+        pending_chunks=0,
+    )
+
+    assert agent_data.response_ids == []
+    assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
+    assert "skd_pending_turn_state" not in agent_data.extra_fields
+    assert "skd_pending_turn_chunks" not in agent_data.extra_fields
 
 
 @pytest.mark.asyncio
@@ -1103,13 +1147,19 @@ async def test_skd_closed_tool_call_without_eos_does_not_invoke_tool_parser():
         teacher_topk_by_call=[
             {},
         ],
-        max_chunks=1,
+        max_chunks=2,
     )
     loop.tokenizer = FakeHermesTokenizer()
     loop.tool_parser = _ParserMustNotRun()
     agent_data = make_agent_data([1, 2, 3])
 
-    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+    next_state = await SkdAgentLoop._handle_generating_state(
+        loop,
+        agent_data,
+        {},
+        False,
+        stop_after_skd_chunk=True,
+    )
 
     assert next_state == AgentState.GENERATING
     assert agent_data.response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]
@@ -1139,8 +1189,50 @@ async def test_skd_max_chunks_cutoff_flushes_turn_buffer_without_tool_processing
 
     assert next_state == AgentState.TERMINATED
     assert agent_data.extra_fields["skd_termination_reason"] == "max_chunks"
+    assert agent_data.prompt_ids == [1, 2, 3, TOOL_CALL_A, TOOL_CALL_B, 33]
     assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert agent_data.response_mask == [1, 1, 1]
+    assert agent_data.assistant_turns == 0
     assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
+    assert "skd_pending_turn_state" not in agent_data.extra_fields
+    assert_skd_alignment(agent_data)
+
+
+@pytest.mark.asyncio
+async def test_skd_budget_exhausted_flushes_pending_turn_without_tool_processing():
+    class _ParserMustNotRun:
+        async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
+            raise AssertionError(
+                f"tool parser must not run at budget cutoff: response_ids={response_ids!r}, tools={tools!r}"
+            )
+
+    loop = make_skd_loop(student_chunks=[], response_length=1)
+    loop.tool_parser = _ParserMustNotRun()
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.extra_fields["teacher_ids_list"] = []
+    agent_data.extra_fields["teacher_logprobs_list"] = []
+    agent_data.extra_fields["skd_pending_turn_response_ids"] = [10]
+    agent_data.extra_fields["skd_pending_turn_state"] = {
+        "tokens": [10],
+        "teacher_ids_rows": [[10, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
+        "raw_chunk": [10],
+        "verified_chunk": [10],
+    }
+    agent_data.extra_fields["skd_pending_turn_chunks"] = 1
+    agent_data.response_ids = [10]
+
+    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
+
+    assert next_state == AgentState.TERMINATED
+    assert agent_data.extra_fields["skd_termination_reason"] == "budget_exhausted"
+    assert agent_data.prompt_ids == [1, 2, 3, 10]
+    assert agent_data.response_ids == [10]
+    assert agent_data.response_mask == [1]
+    assert agent_data.assistant_turns == 0
+    assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
+    assert "skd_pending_turn_state" not in agent_data.extra_fields
+    assert_skd_alignment(agent_data)
 
 
 @pytest.mark.asyncio
