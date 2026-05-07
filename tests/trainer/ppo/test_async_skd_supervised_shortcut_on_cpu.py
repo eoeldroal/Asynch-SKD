@@ -62,6 +62,9 @@ class _AsyncSkdManagerStub:
     def set_async_skd_data_source(self, *args, **kwargs):
         raise NotImplementedError
 
+    def set_async_skd_pad_token_id(self, *args, **kwargs):
+        raise NotImplementedError
+
 
 def _make_trainer_for_shortcut(config_dict: dict) -> RayPPOTrainer:
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)

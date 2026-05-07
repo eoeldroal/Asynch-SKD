@@ -629,10 +629,33 @@ class RayPPOTrainer:
     def _iter_training_steps(self, start_epoch: int):
         if self._uses_async_skd_lookahead_training():
             source = self._prepare_async_skd_training_source(start_epoch)
+            harvest_fn = getattr(self.async_rollout_manager, "harvest_finished_async_skd_lookahead", None)
+            has_inflight_fn = getattr(self.async_rollout_manager, "has_async_skd_inflight_lookahead", None)
+            flush_fn = getattr(self.async_rollout_manager, "flush_async_skd_lookahead", None)
             while True:
+                if callable(harvest_fn):
+                    harvest_fn()
                 carryover_partials, fresh_batch, current_input_batch = source.next_current_batch(
                     base_batch_size=self._async_skd_base_batch_size()
                 )
+                if current_input_batch is None:
+                    if callable(has_inflight_fn) and has_inflight_fn():
+                        if not callable(flush_fn):
+                            raise ValueError(
+                                "Async-SKD manager has in-flight lookahead tasks but cannot flush them safely."
+                            )
+                        flush_fn()
+                        if callable(harvest_fn):
+                            harvest_fn()
+                        carryover_partials, fresh_batch, current_input_batch = source.next_current_batch(
+                            base_batch_size=self._async_skd_base_batch_size()
+                        )
+                        if current_input_batch is not None:
+                            pass
+                        else:
+                            break
+                    else:
+                        break
                 if current_input_batch is None:
                     break
                 current_input_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
@@ -789,6 +812,8 @@ class RayPPOTrainer:
 
         validation_async_skd_source = getattr(self, "_async_skd_data_source", None)
         manager_supports_async_source = hasattr(self.async_rollout_manager, "set_async_skd_data_source")
+        if manager_supports_async_source and hasattr(self.async_rollout_manager, "flush_async_skd_lookahead"):
+            self.async_rollout_manager.flush_async_skd_lookahead()
         if manager_supports_async_source:
             self.async_rollout_manager.set_async_skd_data_source(None)
 
@@ -1147,6 +1172,8 @@ class RayPPOTrainer:
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_model_manager=self.teacher_model_manager,
         )
+        if hasattr(self.async_rollout_manager, "set_async_skd_pad_token_id"):
+            self.async_rollout_manager.set_async_skd_pad_token_id(self.tokenizer.pad_token_id)
 
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         # Support custom CheckpointEngineManager via config
@@ -1217,6 +1244,8 @@ class RayPPOTrainer:
         dataloader_state_dict = self.train_dataloader.state_dict()
         dataloader_payload = {"dataloader_state_dict": dataloader_state_dict}
         if self._async_skd_data_source is not None:
+            if hasattr(self.async_rollout_manager, "flush_async_skd_lookahead"):
+                self.async_rollout_manager.flush_async_skd_lookahead()
             dataloader_payload["async_skd_data_source_state_dict"] = self._async_skd_data_source.state_dict()
         torch.save(dataloader_payload, dataloader_local_path)
 

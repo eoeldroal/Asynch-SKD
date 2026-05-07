@@ -25,9 +25,18 @@ class _ValidationSourceAwareManager:
     def __init__(self, source: _TrackingAsyncSkdSource) -> None:
         self.current_source = source
         self.generate_seen_sources: list[object | None] = []
+        self.flush_seen_sources: list[object | None] = []
+        self.has_inflight = True
 
     def set_async_skd_data_source(self, source) -> None:
         self.current_source = source
+
+    def flush_async_skd_lookahead(self):
+        self.flush_seen_sources.append(self.current_source)
+        self.has_inflight = False
+
+    def has_async_skd_inflight_lookahead(self) -> bool:
+        return self.has_inflight
 
     def generate_sequences(self, batch: DataProto) -> DataProto:
         self.generate_seen_sources.append(self.current_source)
@@ -116,6 +125,7 @@ def test_validate_temporarily_detaches_training_async_skd_source(monkeypatch):
     metrics = trainer._validate()
 
     assert metrics == {"validation/mock": 1.0}
+    assert manager.flush_seen_sources == [source]
     assert manager.generate_seen_sources == [None]
     assert source.validation_leak_count == 0
     assert trainer._async_skd_data_source is source

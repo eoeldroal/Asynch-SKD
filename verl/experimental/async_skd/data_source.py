@@ -150,6 +150,12 @@ class AsyncSkdDataSource:
         """Fresh quota for the next current step. Promoted samples do not reduce it."""
         return max(0, base_batch_size - len(self._carryover_partials))
 
+    def has_future_current_work(self) -> bool:
+        """Return whether another current step can be formed without using promoted-only rows."""
+        if self._carryover_partials:
+            return True
+        return self._ensure_fresh_available()
+
     def next_current_batch(
         self,
         base_batch_size: int,

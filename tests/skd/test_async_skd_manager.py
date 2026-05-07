@@ -130,12 +130,6 @@ def _make_manager(*, mode: str = "sample_async", rollout_n: int = 1, delays: dic
     calls: list[tuple[str, int]] = []
     manager = AsyncSkdAgentLoopManager.__new__(AsyncSkdAgentLoopManager)
 
-    class _Tokenizer:
-        pad_token_id = 0
-
-    class _ModelConfig:
-        tokenizer = _Tokenizer()
-
     manager.config = OmegaConf.create(
         {
             "actor_rollout_ref": {
@@ -147,7 +141,7 @@ def _make_manager(*, mode: str = "sample_async", rollout_n: int = 1, delays: dic
         }
     )
     manager.rollout_config = OmegaConf.create({"n": rollout_n})
-    manager.model_config = _ModelConfig()
+    manager.set_async_skd_pad_token_id(0)
     manager.stream_teacher_with_rollout = False
     manager.agent_loop_workers = [
         _FakeWorker(name="worker-0", delays=delays or {}, calls=calls),
@@ -317,14 +311,7 @@ def test_lookahead_prefetch_limit_allows_two_step_horizon():
 
 def test_async_skd_manager_finalize_outputs_aligns_prompt_width_before_concat():
     manager, _ = _make_manager()
-
-    class _Tokenizer:
-        pad_token_id = 0
-
-    class _ModelConfig:
-        tokenizer = _Tokenizer()
-
-    manager.model_config = _ModelConfig()
+    manager.set_async_skd_pad_token_id(0)
 
     outputs = [
         _make_output_with_prompt_width(0, 2),
@@ -342,16 +329,9 @@ def test_async_skd_manager_finalize_outputs_aligns_prompt_width_before_concat():
     assert finalized.batch["prompts"][1].tolist() == [101, 102, 103, 104, 105]
 
 
-def test_async_skd_manager_finalize_outputs_uses_model_config_tokenizer_pad_token():
+def test_async_skd_manager_finalize_outputs_uses_injected_pad_token():
     manager, _ = _make_manager()
-
-    class _Tokenizer:
-        pad_token_id = 7
-
-    class _ModelConfig:
-        tokenizer = _Tokenizer()
-
-    manager.model_config = _ModelConfig()
+    manager.set_async_skd_pad_token_id(7)
 
     outputs = [
         _make_output_with_prompt_width(0, 2),
@@ -363,16 +343,9 @@ def test_async_skd_manager_finalize_outputs_uses_model_config_tokenizer_pad_toke
     assert finalized.batch["prompts"][0].tolist() == [7, 7, 7, 100, 101]
 
 
-def test_async_skd_manager_finalize_outputs_rejects_missing_pad_token_id():
+def test_async_skd_manager_finalize_outputs_rejects_missing_explicit_pad_token_id():
     manager, _ = _make_manager()
-
-    class _Tokenizer:
-        pad_token_id = None
-
-    class _ModelConfig:
-        tokenizer = _Tokenizer()
-
-    manager.model_config = _ModelConfig()
+    manager._async_skd_pad_token_id_value = None
 
     with pytest.raises(ValueError, match="pad_token_id"):
         manager._finalize_outputs([
@@ -381,8 +354,16 @@ def test_async_skd_manager_finalize_outputs_rejects_missing_pad_token_id():
         ])
 
 
+def test_async_skd_manager_rejects_none_pad_token_in_setter():
+    manager, _ = _make_manager()
+
+    with pytest.raises(ValueError, match="explicit tokenizer pad_token_id"):
+        manager.set_async_skd_pad_token_id(None)
+
+
 def test_async_skd_manager_finalize_outputs_aligns_routed_experts_with_prompt_width():
     manager, _ = _make_manager()
+    manager.set_async_skd_pad_token_id(0)
 
     outputs = [
         _make_output_with_prompt_width(0, 2, with_routed_experts=True),
@@ -399,6 +380,7 @@ def test_async_skd_manager_finalize_outputs_aligns_routed_experts_with_prompt_wi
 
 def test_async_skd_manager_finalize_outputs_rejects_missing_prompts():
     manager, _ = _make_manager()
+    manager.set_async_skd_pad_token_id(0)
     bad_output = DataProto.from_dict(
         tensors={
             "responses": torch.tensor([[1, 2, 0]], dtype=torch.long),

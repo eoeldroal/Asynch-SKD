@@ -55,16 +55,119 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         super().__init__(*args, **kwargs)
         self.agent_loop_workers_class = ray.remote(AsyncSkdAgentLoopWorker)
         self._async_skd_data_source = None
+        self._async_skd_pad_token_id_value: int | None = None
+        self._async_skd_inflight_lookahead: dict[asyncio.Task, dict[str, Any]] = {}
+        self._async_skd_last_promoted_samples: list[AsyncSkdSample] = []
+        self._async_skd_carryover_partials: list[SkdPartialState] = []
         self._teacher_replica_pin_by_sample_id: dict[str, str] = {}
         self._teacher_routing_key_by_sample_id: dict[str, str] = {}
         self._teacher_replica_last_plan_stats: dict[str, Any] = {}
         self._teacher_server_ids_by_routing_key = self._load_teacher_server_ids_by_routing_key()
 
     def set_async_skd_data_source(self, source: Any | None) -> None:
+        if source is None and self.has_async_skd_inflight_lookahead():
+            raise ValueError("Cannot detach async-SKD data source while lookahead tasks remain in flight.")
         self._async_skd_data_source = source
+
+    def set_async_skd_pad_token_id(self, pad_token_id: int | None) -> None:
+        if pad_token_id is None:
+            raise ValueError("Async-SKD manager requires an explicit tokenizer pad_token_id.")
+        self._async_skd_pad_token_id_value = int(pad_token_id)
+
+    def has_async_skd_inflight_lookahead(self) -> bool:
+        return bool(getattr(self, "_async_skd_inflight_lookahead", {}))
 
     def _get_async_skd_data_source(self) -> Any | None:
         return getattr(self, "_async_skd_data_source", None)
+
+    def _record_harvested_lookahead_results(
+        self,
+        promoted_lookahead: list[tuple[int, AsyncSkdSample]],
+        carryover_partials: list[tuple[int, SkdPartialState]],
+    ) -> None:
+        promoted_samples = [sample for _, sample in sorted(promoted_lookahead, key=lambda item: item[0])]
+        carryover_samples = [partial for _, partial in sorted(carryover_partials, key=lambda item: item[0])]
+        self._async_skd_last_promoted_samples = promoted_samples
+        self._async_skd_carryover_partials = carryover_samples
+        if not promoted_samples and not carryover_samples:
+            return
+        source = self._get_async_skd_data_source()
+        if source is None:
+            raise ValueError(
+                "Cannot record async-SKD lookahead results without an attached data source."
+            )
+        if promoted_samples:
+            source.record_promoted(promoted_samples)
+        if carryover_samples:
+            source.record_carryover(carryover_samples)
+
+    @auto_await
+    async def harvest_finished_async_skd_lookahead(self) -> dict[str, int]:
+        lookahead_active = getattr(self, "_async_skd_inflight_lookahead", None)
+        if lookahead_active is None:
+            self._async_skd_inflight_lookahead = {}
+            lookahead_active = self._async_skd_inflight_lookahead
+        promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
+        carryover_partials: list[tuple[int, SkdPartialState]] = []
+        done = [task for task in lookahead_active if task.done()]
+        for task in done:
+            meta = lookahead_active.pop(task)
+            sample: AsyncSkdSample = await task
+            sample.validate()
+            if sample.kind == "completed":
+                self._clear_teacher_assignment(sample.sample_id)
+                promoted_lookahead.append((int(meta["order"]), sample))
+                continue
+
+            partial = sample.require_partial()
+            teacher_replica_id = meta.get("teacher_replica_id")
+            if teacher_replica_id is not None and partial.extra_fields.get("teacher_replica_id") is None:
+                partial.extra_fields["teacher_replica_id"] = teacher_replica_id
+            if teacher_replica_id is not None:
+                self._teacher_replica_pin_by_sample_id[partial.sample_id] = str(teacher_replica_id)
+            carryover_partials.append((int(meta["order"]), partial))
+
+        self._record_harvested_lookahead_results(promoted_lookahead, carryover_partials)
+        return {
+            "promoted_count": len(promoted_lookahead),
+            "carryover_count": len(carryover_partials),
+            "inflight_remaining": len(lookahead_active),
+        }
+
+    @auto_await
+    async def flush_async_skd_lookahead(self) -> dict[str, int]:
+        lookahead_active = getattr(self, "_async_skd_inflight_lookahead", None)
+        if lookahead_active is None:
+            self._async_skd_inflight_lookahead = {}
+            lookahead_active = self._async_skd_inflight_lookahead
+        promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
+        carryover_partials: list[tuple[int, SkdPartialState]] = []
+
+        while lookahead_active:
+            done, _ = await asyncio.wait(set(lookahead_active.keys()), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                meta = lookahead_active.pop(task)
+                sample: AsyncSkdSample = await task
+                sample.validate()
+                if sample.kind == "completed":
+                    self._clear_teacher_assignment(sample.sample_id)
+                    promoted_lookahead.append((int(meta["order"]), sample))
+                    continue
+
+                partial = sample.require_partial()
+                teacher_replica_id = meta.get("teacher_replica_id")
+                if teacher_replica_id is not None and partial.extra_fields.get("teacher_replica_id") is None:
+                    partial.extra_fields["teacher_replica_id"] = teacher_replica_id
+                if teacher_replica_id is not None:
+                    self._teacher_replica_pin_by_sample_id[partial.sample_id] = str(teacher_replica_id)
+                carryover_partials.append((int(meta["order"]), partial))
+
+        self._record_harvested_lookahead_results(promoted_lookahead, carryover_partials)
+        return {
+            "promoted_count": len(promoted_lookahead),
+            "carryover_count": len(carryover_partials),
+            "inflight_remaining": 0,
+        }
 
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -123,9 +226,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         return output
 
     def _async_skd_pad_token_id(self) -> int:
-        model_config = getattr(self, "model_config", None)
-        tokenizer = getattr(model_config, "tokenizer", None)
-        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        pad_token_id = getattr(self, "_async_skd_pad_token_id_value", None)
         if pad_token_id is None:
             raise ValueError("Async-SKD manager prompt-width alignment requires a tokenizer pad_token_id.")
         return int(pad_token_id)
@@ -623,6 +724,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             return []
         if not self.agent_loop_workers:
             raise RuntimeError("AsyncSkdAgentLoopManager requires at least one agent loop worker")
+        await self.harvest_finished_async_skd_lookahead()
 
         _trace_async_skd(
             "async_skd_manager.lookahead_begin",
@@ -637,14 +739,20 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         promoted_lookahead: list[tuple[int, AsyncSkdSample]] = []
         carryover_partials: list[tuple[int, SkdPartialState]] = []
         current_active: dict[asyncio.Task, dict[str, Any]] = {}
-        lookahead_active: dict[asyncio.Task, dict[str, Any]] = {}
+        lookahead_active = getattr(self, "_async_skd_inflight_lookahead", None)
+        if lookahead_active is None:
+            self._async_skd_inflight_lookahead = {}
+            lookahead_active = self._async_skd_inflight_lookahead
         lookahead_started_count = 0
         drain_requested = False
         num_workers = len(self.agent_loop_workers)
         worker_capacity = max(1, math.ceil(current_count / num_workers))
         prefetch_worker_target = self._lookahead_prefetch_worker_target(worker_capacity)
         worker_active_counts = [0 for _ in range(num_workers)]
-        worker_active_max = 0
+        for meta in lookahead_active.values():
+            worker_idx = int(meta["worker_idx"])
+            worker_active_counts[worker_idx] += 1
+        worker_active_max = max(worker_active_counts) if worker_active_counts else 0
         lookahead_continued_partial_count = 0
 
         def worker_idx_for_order(order: int) -> int:
@@ -935,7 +1043,7 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
         for kind, order, payload in current_items:
             launch_current(kind, order, payload)
 
-        while current_active or lookahead_active:
+        while current_active or (drain_requested and lookahead_active):
             _trace_async_skd(
                 "async_skd_manager.wait_begin",
                 logical_step=logical_step,
@@ -945,10 +1053,8 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                 drain_requested=drain_requested,
             )
             wait_t0 = time.monotonic()
-            done, _ = await asyncio.wait(
-                set(current_active.keys()) | set(lookahead_active.keys()),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            wait_tasks = set(current_active.keys()) | set(lookahead_active.keys())
+            done, _ = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
             wait_ms = (time.monotonic() - wait_t0) * 1000
             _trace_async_skd(
                 "async_skd_manager.wait_done",
@@ -1006,28 +1112,33 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
                     )
                     self._clear_teacher_assignment(str(meta["sample_id"]))
                     if not current_active and not drain_requested:
-                        actual_lt_sample_id = str(meta["sample_id"])
-                        print(
-                            "[ASYNC_SKD] drain_start "
-                            f"completed_current={current_count} lookahead_active={len(lookahead_active)} "
-                            f"started={lookahead_started_count} promoted={len(promoted_lookahead)} "
-                            f"carryover_next={len(carryover_partials)}",
-                            flush=True,
+                        source = self._get_async_skd_data_source()
+                        should_drain_terminal_tail = bool(lookahead_active) and source is not None and not bool(
+                            source.has_future_current_work()
                         )
-                        emit_async_skd_event(
-                            "drain_start",
-                            global_step=logical_step,
-                            logical_step=logical_step,
-                            actual_lt_sample_id=actual_lt_sample_id,
-                            actual_lt_worker_idx=worker_idx,
-                            actual_lt_duration_ms=duration_ms,
-                            current_completed=current_count,
-                            lookahead_active=len(lookahead_active),
-                            lookahead_started_count=lookahead_started_count,
-                            promoted_count=len(promoted_lookahead),
-                            carryover_next_count=len(carryover_partials),
-                        )
-                        drain_requested = True
+                        if should_drain_terminal_tail:
+                            actual_lt_sample_id = str(meta["sample_id"])
+                            print(
+                                "[ASYNC_SKD] drain_start "
+                                f"completed_current={current_count} lookahead_active={len(lookahead_active)} "
+                                f"started={lookahead_started_count} promoted={len(promoted_lookahead)} "
+                                f"carryover_next={len(carryover_partials)}",
+                                flush=True,
+                            )
+                            emit_async_skd_event(
+                                "drain_start",
+                                global_step=logical_step,
+                                logical_step=logical_step,
+                                actual_lt_sample_id=actual_lt_sample_id,
+                                actual_lt_worker_idx=worker_idx,
+                                actual_lt_duration_ms=duration_ms,
+                                current_completed=current_count,
+                                lookahead_active=len(lookahead_active),
+                                lookahead_started_count=lookahead_started_count,
+                                promoted_count=len(promoted_lookahead),
+                                carryover_next_count=len(carryover_partials),
+                            )
+                            drain_requested = True
                     try_admit_lookahead(worker_idx)
 
             for task in done:
@@ -1169,15 +1280,6 @@ class AsyncSkdAgentLoopManager(AgentLoopManager):
             prefetch_worker_target=prefetch_worker_target,
             worker_active_max=worker_active_max,
         )
-        self._async_skd_last_promoted_samples = [
-            sample for _, sample in sorted(promoted_lookahead, key=lambda item: item[0])
-        ]
-        self._async_skd_carryover_partials = [
-            partial for _, partial in sorted(carryover_partials, key=lambda item: item[0])
-        ]
-        source = self._get_async_skd_data_source()
-        if source is not None:
-            source.record_promoted(self._async_skd_last_promoted_samples)
-            source.record_carryover(self._async_skd_carryover_partials)
+        self._record_harvested_lookahead_results(promoted_lookahead, carryover_partials)
 
         return [output for output in current_completed if output is not None]
