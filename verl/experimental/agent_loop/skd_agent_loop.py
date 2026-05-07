@@ -54,7 +54,6 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # VERL_SKD_DEBUG=2 for token-level alignment verification (first 3 samples per batch).
 _SKD_DEBUG = int(os.getenv("VERL_SKD_DEBUG", "0"))
 _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEBUG", "0")))
-_SKD_PENDING_TURN_RESPONSE_IDS = "skd_pending_turn_response_ids"
 _SKD_PENDING_TURN_STATE = "skd_pending_turn_state"
 _SKD_PENDING_TURN_CHUNKS = "skd_pending_turn_chunks"
 
@@ -110,12 +109,17 @@ class SkdTurnChunkState:
     def from_payload(cls, payload: dict[str, Any] | None) -> "SkdTurnChunkState":
         if payload is None:
             return cls(tokens=[], teacher_ids_rows=[], teacher_logprobs_rows=[], raw_chunk=[], verified_chunk=[])
+        required_keys = {"tokens", "teacher_ids_rows", "teacher_logprobs_rows", "raw_chunk", "verified_chunk"}
+        missing_keys = required_keys.difference(payload)
+        if missing_keys:
+            missing = ", ".join(sorted(missing_keys))
+            raise ValueError(f"Invalid SKD pending turn state payload: missing keys: {missing}")
         return cls(
-            tokens=list(payload.get("tokens", [])),
-            teacher_ids_rows=[list(row) for row in payload.get("teacher_ids_rows", [])],
-            teacher_logprobs_rows=[list(row) for row in payload.get("teacher_logprobs_rows", [])],
-            raw_chunk=list(payload.get("raw_chunk", [])),
-            verified_chunk=list(payload.get("verified_chunk", [])),
+            tokens=list(payload["tokens"]),
+            teacher_ids_rows=[list(row) for row in payload["teacher_ids_rows"]],
+            teacher_logprobs_rows=[list(row) for row in payload["teacher_logprobs_rows"]],
+            raw_chunk=list(payload["raw_chunk"]),
+            verified_chunk=list(payload["verified_chunk"]),
         )
 
 
@@ -155,11 +159,14 @@ def _build_teacher_logprob_range(
 def _teacher_sglang_prefix_surplus_from_fields(extra_fields: dict[str, Any], *, has_multimodal: bool) -> int:
     """Return the explicitly tracked teacher multimodal expansion surplus."""
     tracked = extra_fields.get("teacher_sglang_prefix_surplus")
-    if tracked is not None:
-        return max(int(tracked), 0)
-    if has_multimodal:
-        raise ValueError("teacher_sglang_prefix_surplus is required for multimodal teacher verification.")
-    return 0
+    if tracked is None:
+        if has_multimodal:
+            raise ValueError("teacher_sglang_prefix_surplus is required for multimodal teacher verification.")
+        raise ValueError("teacher_sglang_prefix_surplus is required for teacher verification.")
+    tracked_int = int(tracked)
+    if tracked_int < 0:
+        raise ValueError(f"teacher_sglang_prefix_surplus must be non-negative, got {tracked_int}.")
+    return tracked_int
 
 
 @register("skd_agent")
@@ -193,10 +200,7 @@ class SkdAgentLoop(ToolAgentLoop):
         self.teacher_system_prompt = self._load_teacher_system_prompt()
 
         if self.teacher_server_manager is None:
-            logger.warning(
-                "SkdAgentLoop: teacher_server_manager is None. "
-                "SKD verification will be skipped — falling back to standard generation."
-            )
+            raise ValueError("SkdAgentLoop requires teacher_server_manager for teacher verification")
 
     def _load_teacher_system_prompt(self) -> str | None:
         """Load teacher-only system prompt once at worker initialization."""
@@ -299,14 +303,26 @@ class SkdAgentLoop(ToolAgentLoop):
             response_mask.extend([1] * len(pending_turn_state.tokens))
             if response_logprobs is not None:
                 response_logprobs.extend([0.0] * len(pending_turn_state.tokens))
-            finalized_extra_fields.setdefault("teacher_ids_list", [])
-            finalized_extra_fields.setdefault("teacher_logprobs_list", [])
+            if "teacher_ids_list" not in finalized_extra_fields or "teacher_logprobs_list" not in finalized_extra_fields:
+                raise ValueError("SKD requires teacher row lists before finalizing a pending assistant turn")
             finalized_extra_fields["teacher_ids_list"] = list(finalized_extra_fields["teacher_ids_list"]) + [
                 list(row) for row in pending_turn_state.teacher_ids_rows
             ]
             finalized_extra_fields["teacher_logprobs_list"] = list(
                 finalized_extra_fields["teacher_logprobs_list"]
             ) + [list(row) for row in pending_turn_state.teacher_logprobs_rows]
+        if "teacher_ids_list" not in finalized_extra_fields or "teacher_logprobs_list" not in finalized_extra_fields:
+            raise ValueError("SKD requires teacher row lists in finalized output")
+        if len(finalized_extra_fields["teacher_ids_list"]) != len(response_mask):
+            raise ValueError(
+                "SKD finalized output teacher_ids_list must align with response_mask: "
+                f"teacher_rows={len(finalized_extra_fields['teacher_ids_list'])} response_mask={len(response_mask)}"
+            )
+        if len(finalized_extra_fields["teacher_logprobs_list"]) != len(response_mask):
+            raise ValueError(
+                "SKD finalized output teacher_logprobs_list must align with response_mask: "
+                f"teacher_rows={len(finalized_extra_fields['teacher_logprobs_list'])} response_mask={len(response_mask)}"
+            )
 
         multi_modal_data = {}
         if agent_data.image_data is not None:
@@ -356,8 +372,7 @@ class SkdAgentLoop(ToolAgentLoop):
                 elif state == AgentState.PROCESSING_TOOLS:
                     state = await self._handle_processing_tools_state(agent_data)
                 else:
-                    logger.error(f"Invalid state: {state}")
-                    state = AgentState.TERMINATED
+                    raise ValueError(f"Invalid state while running SKD loop: {state}")
             return self._finalize_boundary_agent_output(agent_data)
         finally:
             await self._release_teacher_sticky_session(agent_data.request_id)
@@ -367,24 +382,18 @@ class SkdAgentLoop(ToolAgentLoop):
         if not prompt_delta:
             return
 
-        teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
-        if teacher_prompt_ids is not None:
-            teacher_prompt_ids.extend(prompt_delta)
+        teacher_prompt_ids = self._require_teacher_prompt_stream(agent_data, "teacher_prompt_ids")
+        teacher_prompt_ids.extend(prompt_delta)
 
-        server_prompt_ids = agent_data.extra_fields.get("server_prompt_ids")
-        if server_prompt_ids is not None:
-            server_prompt_ids.extend(prompt_delta)
-
-        teacher_server_prompt_ids = agent_data.extra_fields.get("teacher_server_prompt_ids")
-        if teacher_server_prompt_ids is not None:
-            teacher_server_prompt_ids.extend(prompt_delta)
+        teacher_server_prompt_ids = self._require_teacher_prompt_stream(agent_data, "teacher_server_prompt_ids")
+        teacher_server_prompt_ids.extend(prompt_delta)
 
     def _append_dummy_teacher_rows(self, agent_data: AgentData, count: int) -> None:
         """Keep SKD teacher targets aligned with response_mask for tool/user spans."""
         if count <= 0:
             return
         if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
-            return
+            raise ValueError("SKD requires teacher_ids_list and teacher_logprobs_list before appending dummy rows")
         assert self.loss_top_k is not None and self.loss_top_k > 0, "SKD dummy rows require distillation topk > 0"
 
         teacher_ids_list = agent_data.extra_fields["teacher_ids_list"]
@@ -392,18 +401,23 @@ class SkdAgentLoop(ToolAgentLoop):
         teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(count)])
         teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(count)])
 
+    def _validate_teacher_state_for_partial(self, agent_data: AgentData) -> None:
+        self._require_teacher_prompt_stream(agent_data, "teacher_prompt_ids")
+        self._require_teacher_prompt_stream(agent_data, "teacher_server_prompt_ids")
+        _teacher_sglang_prefix_surplus_from_fields(
+            agent_data.extra_fields,
+            has_multimodal=bool(_safe_len(agent_data.image_data) or _safe_len(agent_data.video_data)),
+        )
+
+    @staticmethod
+    def _require_teacher_prompt_stream(agent_data: AgentData, key: str) -> list[int]:
+        stream = agent_data.extra_fields.get(key)
+        if not isinstance(stream, list):
+            raise ValueError(f"SKD requires {key} to be initialized before teacher verification")
+        return stream
+
     def _get_pending_turn_state(self, agent_data: AgentData) -> SkdTurnChunkState:
         payload = agent_data.extra_fields.get(_SKD_PENDING_TURN_STATE)
-        if payload is None and agent_data.extra_fields.get(_SKD_PENDING_TURN_RESPONSE_IDS):
-            pending_tokens = list(agent_data.extra_fields.get(_SKD_PENDING_TURN_RESPONSE_IDS, []))
-            pending_count = len(pending_tokens)
-            teacher_ids_rows = list(agent_data.extra_fields.get("teacher_ids_list", []))[-pending_count:]
-            teacher_logprobs_rows = list(agent_data.extra_fields.get("teacher_logprobs_list", []))[-pending_count:]
-            payload = {
-                "tokens": pending_tokens,
-                "teacher_ids_rows": teacher_ids_rows,
-                "teacher_logprobs_rows": teacher_logprobs_rows,
-            }
         state = SkdTurnChunkState.from_payload(payload)
         if len(state.teacher_ids_rows) != len(state.tokens):
             raise ValueError(
@@ -417,38 +431,6 @@ class SkdAgentLoop(ToolAgentLoop):
             )
         return state
 
-    def _normalize_legacy_pending_turn_restore(self, agent_data: AgentData, turn_state: SkdTurnChunkState) -> int:
-        if _SKD_PENDING_TURN_STATE in agent_data.extra_fields or not turn_state.tokens:
-            return int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
-
-        pending_count = len(turn_state.tokens)
-        if (
-            len(agent_data.response_mask) < pending_count
-            or agent_data.prompt_ids[-pending_count:] != turn_state.tokens
-            or agent_data.response_ids != turn_state.tokens
-        ):
-            return int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
-
-        del agent_data.prompt_ids[-pending_count:]
-        del agent_data.response_mask[-pending_count:]
-        teacher_ids_list = agent_data.extra_fields.get("teacher_ids_list")
-        teacher_logprobs_list = agent_data.extra_fields.get("teacher_logprobs_list")
-        if teacher_ids_list is not None:
-            del teacher_ids_list[-pending_count:]
-        if teacher_logprobs_list is not None:
-            del teacher_logprobs_list[-pending_count:]
-        for field_name in ("teacher_prompt_ids", "server_prompt_ids", "teacher_server_prompt_ids"):
-            prompt_ids = agent_data.extra_fields.get(field_name)
-            if prompt_ids is not None and len(prompt_ids) >= pending_count and prompt_ids[-pending_count:] == turn_state.tokens:
-                del prompt_ids[-pending_count:]
-
-        committed_prefix_tokens = int(agent_data.extra_fields.get("skd_committed_prefix_tokens", 0))
-        agent_data.extra_fields["skd_committed_prefix_tokens"] = max(committed_prefix_tokens - pending_count, 0)
-        pending_chunks = int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 1 if pending_count > 0 else 0))
-        committed_gen_chunks = int(agent_data.extra_fields.get("skd_committed_gen_chunks", 0))
-        agent_data.extra_fields["skd_committed_gen_chunks"] = max(committed_gen_chunks - pending_chunks, 0)
-        return pending_chunks
-
     def _set_pending_turn_state(
         self,
         agent_data: AgentData,
@@ -459,13 +441,11 @@ class SkdAgentLoop(ToolAgentLoop):
     ) -> None:
         if turn_state.tokens:
             agent_data.extra_fields[_SKD_PENDING_TURN_STATE] = turn_state.to_payload()
-            agent_data.extra_fields[_SKD_PENDING_TURN_RESPONSE_IDS] = list(turn_state.tokens)
             agent_data.extra_fields[_SKD_PENDING_TURN_CHUNKS] = int(pending_chunks)
             agent_data.response_ids = list(turn_state.tokens)
             return
 
         agent_data.extra_fields.pop(_SKD_PENDING_TURN_STATE, None)
-        agent_data.extra_fields.pop(_SKD_PENDING_TURN_RESPONSE_IDS, None)
         agent_data.extra_fields.pop(_SKD_PENDING_TURN_CHUNKS, None)
         if clear_response_ids:
             agent_data.response_ids = []
@@ -501,13 +481,12 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data: AgentData,
         turn_state: SkdTurnChunkState,
     ) -> tuple[list[int], list[int], int]:
-        committed_teacher_prompt_ids = agent_data.extra_fields.get("teacher_prompt_ids")
-        if committed_teacher_prompt_ids is None:
-            committed_teacher_prompt_ids = agent_data.prompt_ids
+        committed_teacher_prompt_ids = self._require_teacher_prompt_stream(agent_data, "teacher_prompt_ids")
         teacher_prompt_ids = list(committed_teacher_prompt_ids) + list(turn_state.tokens)
-        committed_teacher_server_prompt_ids = agent_data.extra_fields.get("teacher_server_prompt_ids")
-        if committed_teacher_server_prompt_ids is None:
-            committed_teacher_server_prompt_ids = committed_teacher_prompt_ids
+        committed_teacher_server_prompt_ids = self._require_teacher_prompt_stream(
+            agent_data,
+            "teacher_server_prompt_ids",
+        )
         teacher_server_prompt_ids = list(committed_teacher_server_prompt_ids) + list(turn_state.tokens)
         has_teacher_multimodal = bool(_safe_len(agent_data.image_data) or _safe_len(agent_data.video_data))
         teacher_sglang_prefix_surplus = _teacher_sglang_prefix_surplus_from_fields(
@@ -546,7 +525,7 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data.response_mask.extend([1] * len(turn_state.tokens))
         teacher_ids_list.extend([list(row) for row in turn_state.teacher_ids_rows])
         teacher_logprobs_list.extend([list(row) for row in turn_state.teacher_logprobs_rows])
-        for field_name in ("teacher_prompt_ids", "server_prompt_ids", "teacher_server_prompt_ids"):
+        for field_name in ("teacher_prompt_ids", "teacher_server_prompt_ids"):
             prompt_ids = agent_data.extra_fields.get(field_name)
             if prompt_ids is not None:
                 prompt_ids.extend(turn_state.tokens)
@@ -698,6 +677,7 @@ class SkdAgentLoop(ToolAgentLoop):
         source_type: str,
     ) -> SkdPartialState:
         """Export an unfinished trajectory snapshot at a committed-unit boundary."""
+        self._validate_teacher_state_for_partial(agent_data)
         if not self._can_export_partial_state(agent_data, next_state):
             raise ValueError(
                 "Cannot export SKD partial state: "
@@ -717,7 +697,7 @@ class SkdAgentLoop(ToolAgentLoop):
             tools_kwargs=deepcopy(agent_data.tools_kwargs),
             messages=deepcopy(agent_data.messages),
             prompt_ids=list(agent_data.prompt_ids),
-            teacher_prompt_ids=list(extra_fields.get("teacher_prompt_ids", [])),
+            teacher_prompt_ids=list(self._require_teacher_prompt_stream(agent_data, "teacher_prompt_ids")),
             response_ids=list(agent_data.response_ids),
             response_mask=list(agent_data.response_mask),
             response_logprobs=list(agent_data.response_logprobs),
@@ -791,11 +771,12 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data.extra_fields["skd_committed_gen_chunks"] = partial_state.committed_gen_chunks
         agent_data.extra_fields["skd_committed_env_units"] = partial_state.committed_env_units
         agent_data.extra_fields["skd_committed_prefix_tokens"] = partial_state.committed_prefix_tokens
+        self._validate_teacher_state_for_partial(agent_data)
 
         if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
             raise ValueError("Invalid SKD partial state: missing teacher row lists in extra_fields")
         pending_turn_state = self._get_pending_turn_state(agent_data)
-        pending_chunks = self._normalize_legacy_pending_turn_restore(agent_data, pending_turn_state)
+        pending_chunks = int(agent_data.extra_fields.get(_SKD_PENDING_TURN_CHUNKS, 0))
         self._set_pending_turn_state(
             agent_data,
             pending_turn_state,
@@ -961,13 +942,15 @@ class SkdAgentLoop(ToolAgentLoop):
         if teacher_messages == agent_data.messages:
             teacher_prompt_ids = list(prompt_ids)
         else:
-                teacher_prompt_ids = await self.apply_chat_template(
-                    teacher_messages,
-                    tools=schemas,
-                    images=agent_data.image_data,
-                    videos=agent_data.video_data,
-                )
+            teacher_prompt_ids = await self.apply_chat_template(
+                teacher_messages,
+                tools=schemas,
+                images=agent_data.image_data,
+                videos=agent_data.video_data,
+            )
         agent_data.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
+        agent_data.extra_fields["teacher_server_prompt_ids"] = list(teacher_prompt_ids)
+        agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
         return AgentState.GENERATING
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
@@ -998,11 +981,8 @@ class SkdAgentLoop(ToolAgentLoop):
         4. Repeat from the replacement point
         5. Teacher logprobs are accumulated during verification (no separate pass needed)
         """
-        # Fallback to standard generation if no teacher
         if self.teacher_server_manager is None:
-            if stop_after_skd_chunk:
-                raise ValueError("stop_after_skd_chunk requires SKD teacher verification")
-            return await super()._handle_generating_state(agent_data, sampling_params, ignore_termination)
+            raise ValueError("SKD requires teacher_server_manager for teacher verification")
 
         sample_start_time = time.monotonic()
 

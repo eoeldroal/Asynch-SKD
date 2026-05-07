@@ -18,7 +18,11 @@ import pytest
 import torch
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopOutput, AgentLoopWorker
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState, _build_teacher_logprob_range
+from verl.experimental.agent_loop.skd_agent_loop import (
+    SkdAgentLoop,
+    SkdTurnChunkState,
+    _build_teacher_logprob_range,
+)
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.experimental.async_skd.events import async_skd_event_context
@@ -284,6 +288,8 @@ def make_agent_data(prompt_ids: list[int] | None = None) -> AgentData:
     )
     agent_data.prompt_ids = list(prompt_ids or [1, 2, 3])
     agent_data.extra_fields["teacher_prompt_ids"] = list(agent_data.prompt_ids)
+    agent_data.extra_fields["teacher_server_prompt_ids"] = list(agent_data.prompt_ids)
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
     return agent_data
 
 
@@ -310,12 +316,35 @@ def assert_masked_teacher_rows(agent_data: AgentData) -> None:
             assert ids != [0] * LOSS_TOP_K
 
 
+def test_skd_pending_turn_payload_requires_all_fields():
+    with pytest.raises(ValueError, match="missing keys"):
+        SkdTurnChunkState.from_payload({"tokens": [1, 2, 3]})
+
+
 def assert_committed_tokens_inside_teacher_topk(agent_data: AgentData) -> None:
     response_ids = agent_data.prompt_ids[-len(agent_data.response_mask) :]
     rows = zip(response_ids, agent_data.response_mask, teacher_rows(agent_data), strict=True)
     for token_id, mask, ids in rows:
         if mask == 1:
             assert token_id in ids[:VERIFY_TOP_K], f"token {token_id} not in teacher top-k row {ids}"
+
+
+def test_finalize_boundary_output_requires_teacher_rows_for_pending_turn():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.extra_fields.pop("teacher_ids_list", None)
+    agent_data.extra_fields.pop("teacher_logprobs_list", None)
+    agent_data.extra_fields["skd_pending_turn_state"] = {
+        "tokens": [10],
+        "teacher_ids_rows": [[10, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
+        "raw_chunk": [10],
+        "verified_chunk": [10],
+    }
+    agent_data.extra_fields["skd_pending_turn_chunks"] = 1
+
+    with pytest.raises(ValueError, match="teacher row lists"):
+        loop._finalize_boundary_agent_output(agent_data)
 
 
 @pytest.mark.asyncio
@@ -355,6 +384,8 @@ def test_skd_finalize_slices_routed_experts_like_tool_agent_loop():
     agent_data = make_agent_data(prompt_ids=[1, 2, 3])
     agent_data.response_mask = [1, 1]
     agent_data.prompt_ids += [10, EOS]
+    agent_data.extra_fields["teacher_ids_list"] = [[10, 0, 0, 0], [EOS, 0, 0, 0]]
+    agent_data.extra_fields["teacher_logprobs_list"] = [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K]
     agent_data.routed_experts = torch.arange(20).reshape(10, 1, 2)
 
     output = loop._finalize_boundary_agent_output(agent_data)
@@ -554,7 +585,6 @@ async def test_rejection_at_first_token_discards_suffix():
     assert agent_data.prompt_ids == [1, 2, 3]
     assert agent_data.response_mask == []
     assert teacher_rows(agent_data) == []
-    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [100]
     assert agent_data.extra_fields["skd_pending_turn_state"] == {
         "tokens": [100],
         "teacher_ids_rows": [[100, 101, 102, 0]],
@@ -633,7 +663,6 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
     assert agent_data.response_mask == []
     assert agent_data.assistant_turns == 0
     assert agent_data.extra_fields["skd_termination_reason"] == "committed_unit_boundary"
-    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
     assert agent_data.extra_fields["skd_pending_turn_state"] == {
         "tokens": [10, 11],
         "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
@@ -662,8 +691,6 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
     restored_agent_data, restored_state = restored_loop._restore_partial_state(partial)
     assert restored_state == AgentState.GENERATING
     assert restored_agent_data.response_ids == [10, 11]
-    assert restored_agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
-
     next_state = await SkdAgentLoop._handle_generating_state(restored_loop, restored_agent_data, {}, False)
 
     assert next_state == AgentState.TERMINATED
@@ -671,7 +698,6 @@ async def test_skd_generation_can_pause_at_committed_chunk_boundary_and_resume()
     assert restored_agent_data.response_ids == [10, 11, 20, EOS]
     assert restored_agent_data.response_mask == [1, 1, 1, 1]
     assert restored_agent_data.assistant_turns == 1
-    assert "skd_pending_turn_response_ids" not in restored_agent_data.extra_fields
     assert restored_agent_data.extra_fields["skd_termination_reason"] == "eos"
     assert restored_agent_data.extra_fields["skd_committed_gen_chunks"] == 2
     assert restored_agent_data.extra_fields["skd_committed_prefix_tokens"] == 4
@@ -682,7 +708,6 @@ def test_skd_set_pending_turn_state_clears_stale_response_ids_when_empty():
     loop = make_skd_loop(student_chunks=[])
     agent_data = make_agent_data([1, 2, 3])
     agent_data.response_ids = [10]
-    agent_data.extra_fields["skd_pending_turn_response_ids"] = [10]
     agent_data.extra_fields["skd_pending_turn_state"] = {
         "tokens": [10],
         "teacher_ids_rows": [[10, 0, 0, 0]],
@@ -705,7 +730,6 @@ def test_skd_set_pending_turn_state_clears_stale_response_ids_when_empty():
     )
 
     assert agent_data.response_ids == []
-    assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
     assert "skd_pending_turn_state" not in agent_data.extra_fields
     assert "skd_pending_turn_chunks" not in agent_data.extra_fields
 
@@ -752,7 +776,6 @@ async def test_skd_chunks_do_not_commit_prompt_state_before_eos():
 
     assert next_state == AgentState.GENERATING
     assert agent_data.response_ids == [10, 11]
-    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
     assert agent_data.extra_fields["skd_pending_turn_state"] == {
         "tokens": [10, 11],
         "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
@@ -900,8 +923,24 @@ async def test_skd_multimodal_teacher_requires_explicit_sglang_surplus():
     agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3] + [900] * 17
+    del agent_data.extra_fields["teacher_sglang_prefix_surplus"]
 
     with pytest.raises(ValueError, match="teacher_sglang_prefix_surplus is required"):
+        await loop._handle_generating_state(
+            agent_data,
+            {"max_tokens": 2},
+            ignore_termination=False,
+            stop_after_skd_chunk=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_skd_teacher_rejects_negative_tracked_sglang_surplus():
+    loop = make_skd_loop(student_chunks=[[10, 11]], chunk_size=2, response_length=8)
+    agent_data = make_agent_data([1, 2, 3])
+    agent_data.extra_fields["teacher_sglang_prefix_surplus"] = -1
+
+    with pytest.raises(ValueError, match="teacher_sglang_prefix_surplus must be non-negative"):
         await loop._handle_generating_state(
             agent_data,
             {"max_tokens": 2},
@@ -919,6 +958,7 @@ async def test_web_skd_image_generation_keeps_input_ids_request_view():
     agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
+    agent_data.extra_fields["web_osgym_teacher_messages"] = [{"role": "user", "content": "question"}]
 
     async def _skip_reward(*args, **kwargs):
         del args, kwargs
@@ -1055,7 +1095,7 @@ async def test_web_skd_teacher_verification_span_stays_stable_across_image_tool_
     }
 
 
-def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
+def test_skd_text_tool_delta_updates_teacher_streams_only():
     loop = make_skd_loop(student_chunks=[])
     agent_data = make_agent_data([1, 2, 3, 70, 71])
     agent_data.extra_fields["server_prompt_ids"] = [1, 2, 3]
@@ -1064,9 +1104,43 @@ def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
 
     loop._append_student_prompt_delta_to_teacher_stream(agent_data, prev_prompt_len=3)
 
-    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3, 70, 71]
+    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3]
     assert agent_data.extra_fields["teacher_prompt_ids"] == [1, 2, 3, 70, 71]
     assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3, 70, 71]
+
+
+@pytest.mark.asyncio
+async def test_teacher_verify_requires_teacher_prompt_ids():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    del agent_data.extra_fields["teacher_prompt_ids"]
+    pending_turn = SkdTurnChunkState(
+        tokens=[10, 11],
+        teacher_ids_rows=[[10, 0, 0, 0], [11, 0, 0, 0]],
+        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        raw_chunk=[10, 11],
+        verified_chunk=[10, 11],
+    )
+
+    with pytest.raises(ValueError, match="teacher_prompt_ids"):
+        await loop._build_teacher_verify_request_view(agent_data, pending_turn)
+
+
+@pytest.mark.asyncio
+async def test_teacher_verify_requires_teacher_server_prompt_ids():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    del agent_data.extra_fields["teacher_server_prompt_ids"]
+    pending_turn = SkdTurnChunkState(
+        tokens=[10, 11],
+        teacher_ids_rows=[[10, 0, 0, 0], [11, 0, 0, 0]],
+        teacher_logprobs_rows=[[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        raw_chunk=[10, 11],
+        verified_chunk=[10, 11],
+    )
+
+    with pytest.raises(ValueError, match="teacher_server_prompt_ids"):
+        await loop._build_teacher_verify_request_view(agent_data, pending_turn)
 
 
 @pytest.mark.asyncio
@@ -1140,6 +1214,33 @@ async def test_web_skd_request_views_rebuild_compact_ids_then_extend_pending_tur
     assert teacher_prompt_ids == [1, 2, 3, 900, 901, 10, 11]
     assert teacher_server_prompt_ids == [1, 2, 3, 10, 11]
     assert teacher_sglang_prefix_surplus == 2
+
+
+def test_export_partial_state_requires_teacher_prompt_ids():
+    loop = make_skd_loop(student_chunks=[])
+    agent_data = make_agent_data([1, 2, 3])
+    del agent_data.extra_fields["teacher_prompt_ids"]
+    agent_data.extra_fields["teacher_ids_list"] = []
+    agent_data.extra_fields["teacher_logprobs_list"] = []
+
+    with pytest.raises(ValueError, match="teacher_prompt_ids"):
+        loop._export_partial_state(
+            agent_data,
+            AgentState.GENERATING,
+            sample_id="sample-1",
+            logical_step=1,
+            source_type="current",
+        )
+
+
+@pytest.mark.asyncio
+async def test_skd_generation_requires_teacher_server_manager():
+    loop = make_skd_loop(student_chunks=[[10, EOS]], chunk_size=8)
+    loop.teacher_server_manager = None
+    agent_data = make_agent_data([1, 2, 3])
+
+    with pytest.raises(ValueError, match="teacher_server_manager"):
+        await loop._handle_generating_state(agent_data, {}, ignore_termination=False)
 
 
 def test_build_teacher_logprob_range_multimodal_scalar_shifts_start():
@@ -1299,7 +1400,6 @@ async def test_skd_max_chunks_cutoff_keeps_turn_buffer_uncommitted():
     assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
     assert agent_data.response_mask == []
     assert agent_data.assistant_turns == 0
-    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
     assert agent_data.extra_fields["skd_pending_turn_state"] == {
         "tokens": [TOOL_CALL_A, TOOL_CALL_B, 33],
         "teacher_ids_rows": [
@@ -1334,7 +1434,6 @@ async def test_skd_empty_chunk_terminates_without_pending_turn_state():
     assert agent_data.response_ids == []
     assert agent_data.response_mask == []
     assert agent_data.assistant_turns == 0
-    assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
     assert "skd_pending_turn_state" not in agent_data.extra_fields
     assert "skd_pending_turn_chunks" not in agent_data.extra_fields
     assert teacher_rows(agent_data) == []
@@ -1382,7 +1481,7 @@ async def test_skd_run_preserves_forced_cutoff_pending_turn_in_final_output():
     assert output.response_mask == [1, 1, 1]
     assert output.num_turns == 2
     assert output.extra_fields["skd_termination_reason"] == "max_chunks"
-    assert output.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert output.extra_fields["skd_pending_turn_state"]["tokens"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
     assert output.extra_fields["teacher_ids_list"] == [
         [TOOL_CALL_A, 0, 0, 0],
         [TOOL_CALL_B, 0, 0, 0],
@@ -1433,7 +1532,7 @@ async def test_skd_run_until_exportable_boundary_terminal_cutoff_surfaces_pendin
     assert result.response_mask == [1, 1, 1]
     assert result.num_turns == 2
     assert result.extra_fields["skd_termination_reason"] == "max_chunks"
-    assert result.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
+    assert result.extra_fields["skd_pending_turn_state"]["tokens"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
     assert result.extra_fields["teacher_ids_list"] == [
         [TOOL_CALL_A, 0, 0, 0],
         [TOOL_CALL_B, 0, 0, 0],
@@ -1459,7 +1558,6 @@ async def test_skd_budget_exhausted_keeps_pending_turn_uncommitted():
     agent_data = make_agent_data([1, 2, 3])
     agent_data.extra_fields["teacher_ids_list"] = []
     agent_data.extra_fields["teacher_logprobs_list"] = []
-    agent_data.extra_fields["skd_pending_turn_response_ids"] = [10]
     agent_data.extra_fields["skd_pending_turn_state"] = {
         "tokens": [10],
         "teacher_ids_rows": [[10, 0, 0, 0]],
@@ -1478,7 +1576,6 @@ async def test_skd_budget_exhausted_keeps_pending_turn_uncommitted():
     assert agent_data.response_ids == [10]
     assert agent_data.response_mask == []
     assert agent_data.assistant_turns == 0
-    assert agent_data.extra_fields["skd_pending_turn_response_ids"] == [10]
     assert agent_data.extra_fields["skd_pending_turn_state"] == {
         "tokens": [10],
         "teacher_ids_rows": [[10, 0, 0, 0]],
@@ -1487,43 +1584,6 @@ async def test_skd_budget_exhausted_keeps_pending_turn_uncommitted():
         "verified_chunk": [10],
     }
     assert_skd_alignment(agent_data)
-
-
-@pytest.mark.asyncio
-async def test_skd_resume_uses_explicit_pending_turn_state_even_when_suffix_matches():
-    loop = make_skd_loop(
-        student_chunks=[
-            [20, EOS],
-        ],
-        teacher_topk_by_call=[
-            {},
-        ],
-    )
-    agent_data = make_agent_data([1, 2, 10])
-    agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 10]
-    agent_data.extra_fields["server_prompt_ids"] = [1, 2, 10]
-    agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 10]
-    agent_data.extra_fields["teacher_ids_list"] = []
-    agent_data.extra_fields["teacher_logprobs_list"] = []
-    agent_data.extra_fields["skd_pending_turn_response_ids"] = [10]
-    agent_data.extra_fields["skd_pending_turn_state"] = {
-        "tokens": [10],
-        "teacher_ids_rows": [[10, 0, 0, 0]],
-        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
-        "raw_chunk": [10],
-        "verified_chunk": [10],
-    }
-    agent_data.extra_fields["skd_pending_turn_chunks"] = 1
-    agent_data.response_ids = [10]
-
-    next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
-
-    assert next_state == AgentState.TERMINATED
-    assert loop.server_manager.call_log[0]["prompt_ids"] == [1, 2, 10, 10]
-    assert loop.teacher_server_manager.call_log[0]["sequence_ids"] == [1, 2, 10, 10, 20, EOS]
-    assert agent_data.prompt_ids == [1, 2, 10, 10, 20, EOS]
-    assert agent_data.response_ids == [10, 20, EOS]
-    assert agent_data.response_mask == [1, 1, 1]
 
 
 @pytest.mark.asyncio
@@ -1649,7 +1709,6 @@ async def test_skd_run_until_exportable_boundary_fresh_returns_partial():
     assert result.response_mask == []
     assert result.assistant_turns == 0
     assert result.tools_kwargs == {"session": "abc"}
-    assert result.extra_fields["skd_pending_turn_response_ids"] == [10, 11]
     assert result.extra_fields["skd_pending_turn_state"] == {
         "tokens": [10, 11],
         "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
@@ -1687,12 +1746,13 @@ async def test_skd_run_until_exportable_boundary_resume_partial_keeps_teacher_re
         committed_env_units=0,
         committed_prefix_tokens=0,
         metrics={},
-        extra_fields={
-            "teacher_prompt_ids": [1, 2, 3],
-            "teacher_ids_list": [],
-            "teacher_logprobs_list": [],
-            "skd_pending_turn_response_ids": [10],
-            "skd_pending_turn_state": {
+            extra_fields={
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "skd_pending_turn_state": {
                 "tokens": [10],
                 "teacher_ids_rows": [[10, 0, 0, 0]],
                 "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K],
@@ -1849,12 +1909,13 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
         committed_env_units=0,
         committed_prefix_tokens=0,
         metrics={},
-        extra_fields={
-            "teacher_prompt_ids": [1, 2, 3],
-            "teacher_ids_list": [],
-            "teacher_logprobs_list": [],
-            "skd_pending_turn_response_ids": [10, 11],
-            "skd_pending_turn_state": {
+            extra_fields={
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "skd_pending_turn_state": {
                 "tokens": [10, 11],
                 "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
                 "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
@@ -1895,7 +1956,6 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
     assert result.response_mask == [1, 1, 1, 1]
     assert result.num_turns == 2
     assert result.extra_fields["skd_termination_reason"] == "eos"
-    assert "skd_pending_turn_response_ids" not in result.extra_fields
     assert result.extra_fields["teacher_ids_list"] == [
         [10, 0, 0, 0],
         [11, 0, 0, 0],
@@ -1903,77 +1963,6 @@ async def test_skd_run_until_exportable_boundary_resume_returns_completed_output
         [EOS, 0, 0, 0],
     ]
     assert result.extra_fields["parent_request_id"] is None
-
-
-@pytest.mark.asyncio
-async def test_skd_run_from_partial_to_completion_ignores_exportable_intermediate_boundary():
-    partial = SkdPartialState(
-        sample_id="resume-to-completion",
-        logical_step=13,
-        source_type="lookahead",
-        agent_state=AgentState.GENERATING.value,
-        request_id="req-resume-to-completion",
-        tools_kwargs={},
-        messages=[{"role": "user", "content": "question"}],
-        prompt_ids=[1, 2, 3, 10],
-        teacher_prompt_ids=[1, 2, 3, 10],
-        response_ids=[10],
-        response_mask=[1],
-        response_logprobs=[],
-        assistant_turns=0,
-        user_turns=0,
-        rollout_birth_version=7,
-        rollout_min_version=7,
-        rollout_max_version=7,
-        committed_gen_chunks=1,
-        committed_env_units=0,
-        committed_prefix_tokens=1,
-        metrics={},
-        extra_fields={
-            "teacher_prompt_ids": [1, 2, 3, 10],
-            "teacher_ids_list": [[10, 0, 0, 0]],
-            "teacher_logprobs_list": [[-1.0] * LOSS_TOP_K],
-            "skd_pending_turn_response_ids": [10],
-            "skd_committed_gen_chunks": 1,
-            "skd_committed_env_units": 0,
-            "skd_committed_prefix_tokens": 1,
-            "rollout_birth_version": 7,
-            "rollout_min_version": 7,
-            "rollout_max_version": 7,
-            "raw_prompt": [{"role": "user", "content": "question"}],
-        },
-    )
-
-    loop = make_skd_loop(
-        student_chunks=[
-            [20],
-            [30, EOS],
-        ],
-        teacher_topk_by_call=[
-            {},
-            {},
-        ],
-    )
-
-    old_request_id = partial.request_id
-    result = await loop.run_from_partial_to_completion({}, partial_state=partial)
-
-    assert isinstance(result, AgentLoopOutput)
-    assert result.prompt_ids == [1, 2, 3]
-    assert result.response_ids == [10, 20, 30, EOS]
-    assert result.response_mask == [1, 1, 1, 1]
-    assert loop.server_manager.call_count == 2
-    assert result.extra_fields["skd_termination_reason"] == "eos"
-    assert "skd_pending_turn_response_ids" not in result.extra_fields
-    new_student_request_ids = {entry["request_id"] for entry in loop.server_manager.call_log}
-    new_teacher_request_ids = {entry["request_id"] for entry in loop.teacher_server_manager.call_log}
-    assert len(new_student_request_ids) == 1
-    assert new_student_request_ids == new_teacher_request_ids
-    [new_request_id] = list(new_teacher_request_ids)
-    assert new_request_id != old_request_id
-    assert result.extra_fields["parent_request_id"] == old_request_id
-    assert set(loop.teacher_server_manager.released_request_ids) == {old_request_id, new_request_id}
-    assert len(loop.teacher_server_manager.released_request_ids) == 2
 
 
 @pytest.mark.asyncio
@@ -2021,6 +2010,7 @@ async def test_web_skd_image_generation_appends_suffix_to_server_prompt_ids_with
     agent_data.extra_fields["teacher_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_server_prompt_ids"] = [1, 2, 3]
     agent_data.extra_fields["teacher_sglang_prefix_surplus"] = 0
+    agent_data.extra_fields["web_osgym_teacher_messages"] = [{"role": "user", "content": "question"}]
 
     async def _recompute_student(agent_data_arg, messages):
         del agent_data_arg, messages
@@ -2040,7 +2030,7 @@ async def test_web_skd_image_generation_appends_suffix_to_server_prompt_ids_with
     assert student_call["prompt_ids"] == [1, 2, 3]
     assert student_call["prompt_text"] is None
     assert student_call["image_data"] == ["image-1"]
-    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3, 10, EOS]
+    assert agent_data.extra_fields["server_prompt_ids"] == [1, 2, 3]
     assert agent_data.prompt_ids == [1, 2, 3, 10, EOS]
     assert agent_data.extra_fields["teacher_server_prompt_ids"] == [1, 2, 3, 10, EOS]
     assert "student_generate_prompt_text_used" not in agent_data.extra_fields

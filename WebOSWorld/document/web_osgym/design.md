@@ -164,6 +164,7 @@ image가 포함되면 expanded prompt ids에는 image expansion이 반영될 수
 - SGLang에 보낼 compact request ids는 request 시점의 committed state에 현재 assistant turn state를 합쳐서 만든다.
 - compact request ids와 teacher verify 길이 보정값은 long-lived truth가 아니라 request-time derived values다.
 - active SKD chunk loop는 같은 현재 turn state를 이어 가지만, request prefix는 iteration마다 현재 committed state에서 다시 계산한다.
+- teacher 전용 state가 없으면 student state로 대체하지 않는다. `teacher_prompt_ids`, teacher request prefix, teacher observation messages 중 하나라도 빠지면 바로 오류를 내고 중단한다.
 
 ## 8. Assistant Turn Promotion and Atomic Observation Commit
 
@@ -196,13 +197,13 @@ Web observation은 다음 canonical state를 함께 바꾼다.
 - response mask
 - dummy teacher rows
 
-그리고 commit 직후 current messages 기준으로 compact request view를 다시 계산한다.
+compact request view는 필요할 때 현재 canonical state에서 다시 계산한다.
 
 - `server_prompt_ids`
 - `teacher_server_prompt_ids`
 - `teacher_sglang_prefix_surplus`
 
-이 상태는 모두 성공한 뒤 한 번에 commit되어야 한다. 일부만 commit되면 carryover, cutoff, teacher verification에서 상태가 깨진다.
+이 값들은 guard 검사나 request 직전 계산에는 쓸 수 있지만, canonical state로 오래 저장하지 않는다. observation bundle commit에서 원자적으로 맞춰야 하는 것은 compact request cache가 아니라 **expanded canonical state 자체**다. 일부만 commit되면 carryover, cutoff, teacher verification에서 상태가 깨진다.
 
 중요한 점은 image-bearing boundary를 compact delta append로 넘기지 않는다는 것이다. 새 image가 붙으면 compact request view는 이전 값에 suffix를 더하지 않고, **현재 canonical state에서 다시 계산**한다.
 
@@ -272,6 +273,7 @@ Teacher verification의 target은 항상 **학생이 방금 생성한 chunk**다
 - `teacher_server_prompt_ids`와 `teacher_sglang_prefix_surplus`는 long-lived truth가 아니라, **verify request를 보내기 직전 계산하는 파생값**이다.
 - verify request prefix는 **현재 teacher messages / image_data / 현재 assistant turn token buffer** 기준으로 다시 만든다.
 - verify 중인 active chunk loop는 현재 turn state를 이어 가지만, request prefix의 기준은 항상 현재 committed state다.
+- teacher verification에 필요한 값이 없거나 모순되면 조용히 0이나 student prefix로 복구하지 않고 즉시 실패한다.
 
 즉 teacher verification은 stale compact snapshot을 신뢰해서 이어 붙이는 방식이 아니라, **현재 상태에서 request-time view를 다시 만들고 그 위에 현재 chunk를 올리는 방식**으로 본다.
 

@@ -3,7 +3,8 @@ from copy import deepcopy
 from unittest.mock import patch
 
 import verl.experimental.agent_loop.web_skd_agent_loop as web_skd_agent_loop_module
-from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
+from verl.experimental.async_skd.state import SkdPartialState
+from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
 from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.tools.base_tool import ToolResponse
@@ -109,6 +110,19 @@ def _build_loop():
     return loop
 
 
+async def _derive_request_views(loop, agent_data):
+    return await loop._build_request_prompt_views_from_turn_state(
+        agent_data,
+        SkdTurnChunkState(
+            tokens=[],
+            teacher_ids_rows=[],
+            teacher_logprobs_rows=[],
+            raw_chunk=[],
+            verified_chunk=[],
+        ),
+    )
+
+
 class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
     def test_web_skd_agent_is_still_skd(self):
         self.assertTrue(issubclass(WebSkdAgentLoop, SkdAgentLoop))
@@ -137,6 +151,92 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(teacher_messages[1], {"role": "user", "content": "teacher-task"})
         self.assertEqual(teacher_prompt_ids, [101, 102, 103])
         self.assertEqual(image_data, ["image-1"])
+
+    def test_resolve_request_prompt_inputs_requires_teacher_messages(self):
+        loop = _build_loop()
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "student-task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-missing-teacher-messages",
+            tools_kwargs={},
+        )
+        agent_data.extra_fields["teacher_prompt_ids"] = [101, 102, 103]
+
+        with self.assertRaisesRegex(ValueError, "web_osgym_teacher_messages"):
+            loop._resolve_request_prompt_inputs_from_agent_state(agent_data)
+
+    def test_resolve_tool_processing_commit_inputs_requires_teacher_messages(self):
+        loop = _build_loop()
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "student-task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-missing-teacher-messages-tools",
+            tools_kwargs={},
+        )
+        agent_data.extra_fields["teacher_prompt_ids"] = [101, 102, 103]
+
+        with self.assertRaisesRegex(ValueError, "web_osgym_teacher_messages"):
+            loop._resolve_tool_processing_commit_inputs(agent_data)
+
+    def test_multimodal_prefix_surplus_delta_rejects_negative_gap(self):
+        loop = _build_loop()
+
+        with self.assertRaisesRegex(ValueError, "multimodal expansion gap"):
+            loop._multimodal_prefix_surplus_delta([1, 2], [1, 2, 3], ["image-1"])
+
+    def test_restore_partial_state_uses_canonical_teacher_state_without_compact_cache(self):
+        loop = _build_loop()
+        partial = SkdPartialState(
+            sample_id="web-partial",
+            logical_step=1,
+            source_type="carryover",
+            agent_state=AgentState.GENERATING.value,
+            request_id="req-web-partial",
+            tools_kwargs={},
+            messages=[{"role": "user", "content": "task"}],
+            prompt_ids=[1, 2, 3],
+            teacher_prompt_ids=[1, 2, 3],
+            response_ids=[],
+            response_mask=[],
+            response_logprobs=[],
+            assistant_turns=0,
+            user_turns=0,
+            rollout_birth_version=None,
+            rollout_min_version=None,
+            rollout_max_version=None,
+            committed_gen_chunks=0,
+            committed_env_units=0,
+            committed_prefix_tokens=0,
+            metrics={},
+            extra_fields={
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "skd_pending_turn_state": {
+                    "tokens": [],
+                    "teacher_ids_rows": [],
+                    "teacher_logprobs_rows": [],
+                    "raw_chunk": [],
+                    "verified_chunk": [],
+                },
+                "skd_pending_turn_chunks": 0,
+            },
+            image_data=[],
+            video_data=[],
+        )
+
+        agent_data, state = loop._restore_partial_state(partial)
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3])
+        self.assertEqual(agent_data.extra_fields["web_osgym_teacher_messages"], [{"role": "user", "content": "task"}])
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
 
     def test_tool_message_has_one_marker_per_image(self):
         loop = _build_loop()
@@ -180,7 +280,15 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("A11Y_TREE", str(agent_data.messages))
         self.assertTrue(agent_data.extra_fields["web_osgym_teacher_observation_text"].startswith("A11Y_TREE"))
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [7, 8, 9])
-        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 1)
+        student_request_prompt_ids, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await _derive_request_views(loop, agent_data)
+        )
+        self.assertEqual(student_request_prompt_ids, [21, 22])
+        self.assertEqual(teacher_server_prompt_ids, [21, 22])
+        self.assertEqual(teacher_sglang_prefix_surplus, 1)
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
 
     async def test_pending_discards_whole_start_bundle_when_tokenization_fails(self):
         loop = _build_loop()
@@ -261,7 +369,10 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
         self.assertEqual(state, AgentState.GENERATING)
-        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 0)
+        _, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = await _derive_request_views(loop, agent_data)
+        self.assertEqual(teacher_server_prompt_ids, [21, 22])
+        self.assertEqual(teacher_sglang_prefix_surplus, 0)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
         self.assertIn("failed_action_index", str(agent_data.messages[-1]["content"]))
         self.assertEqual(agent_data.metrics["web_osgym/action_count"], 2)
         self.assertEqual(len(agent_data.extra_fields["teacher_ids_list"]), len(agent_data.response_mask))
@@ -325,7 +436,10 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
         self.assertEqual(state, AgentState.GENERATING)
-        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 3)
+        _, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = await _derive_request_views(loop, agent_data)
+        self.assertEqual(teacher_server_prompt_ids, [1, 2, 3, 21, 22])
+        self.assertEqual(teacher_sglang_prefix_surplus, 3)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
 
     async def test_processing_tools_does_not_count_teacher_only_text_gap_as_sglang_surplus(self):
         loop = _build_loop()
@@ -383,7 +497,10 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
         self.assertEqual(state, AgentState.GENERATING)
-        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 0)
+        _, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = await _derive_request_views(loop, agent_data)
+        self.assertEqual(teacher_server_prompt_ids, [21, 22])
+        self.assertEqual(teacher_sglang_prefix_surplus, 0)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
 
     async def test_processing_tools_accepts_action_named_tool_call(self):
         loop = _build_loop()
@@ -608,8 +725,14 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
         self.assertEqual(state, AgentState.GENERATING)
-        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [21, 22])
-        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [21, 22])
+        student_request_prompt_ids, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await _derive_request_views(loop, agent_data)
+        )
+        self.assertEqual(student_request_prompt_ids, [21, 22])
+        self.assertEqual(teacher_server_prompt_ids, [21, 22])
+        self.assertEqual(teacher_sglang_prefix_surplus, 0)
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
 
     async def test_processing_tools_rebuilds_teacher_prompt_streams_for_image_boundary(self):
         loop = _build_loop()
@@ -659,10 +782,13 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
 
         self.assertEqual(state, AgentState.GENERATING)
-        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [21, 22])
-        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [21, 22])
+        student_request_prompt_ids, _, teacher_server_prompt_ids, _ = await _derive_request_views(loop, agent_data)
+        self.assertEqual(student_request_prompt_ids, [21, 22])
+        self.assertEqual(teacher_server_prompt_ids, [21, 22])
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 11, 12])
         self.assertEqual(agent_data.image_data, ["image-1"])
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
 
     async def test_processing_tools_discards_whole_observation_bundle_on_response_cutoff(self):
         loop = _build_loop()
@@ -938,6 +1064,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 "server_prompt_ids": [888],
                 "teacher_ids_list": [],
                 "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
             }
         )
         agent_data.tool_calls = [
@@ -961,8 +1088,14 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 {"role": "tool", "content": [{"type": "image"}, {"type": "text", "text": "A11Y_TREE:\nroot"}]},
             ],
         )
-        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [1, 2, 3, 81, 82])
-        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [1, 2, 3, 91, 92])
+        student_request_prompt_ids, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await _derive_request_views(loop, agent_data)
+        )
+        self.assertEqual(student_request_prompt_ids, [1, 2, 3, 81, 82])
+        self.assertEqual(teacher_server_prompt_ids, [1, 2, 3, 91, 92])
+        self.assertEqual(teacher_sglang_prefix_surplus, 2)
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
 
     async def test_processing_tools_does_not_commit_terminal_action_response_observation(self):
         loop = _build_loop()
@@ -1150,7 +1283,6 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.messages[-1], {"role": "tool", "content": [{"type": "image"}]})
         self.assertEqual(agent_data.image_data, ["image-1"])
         self.assertEqual(agent_data.prompt_ids, [1, 2, 3, 61, 62, 63, 64])
-        self.assertEqual(agent_data.extra_fields["server_prompt_ids"], [1, 2, 3, 81, 82])
         self.assertEqual(agent_data.response_mask, [0, 0, 0, 0])
         self.assertEqual(agent_data.user_turns, 1)
         self.assertEqual(
@@ -1158,8 +1290,15 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             [{"step_idx": 1, "image_start": 0, "image_end": 1, "terminal": False}],
         )
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 71, 72, 73, 74])
-        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [1, 2, 3, 91, 92])
-        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 2)
+        student_request_prompt_ids, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await _derive_request_views(loop, agent_data)
+        )
+        self.assertEqual(student_request_prompt_ids, [1, 2, 3, 81, 82])
+        self.assertEqual(teacher_server_prompt_ids, [1, 2, 3, 91, 92])
+        self.assertEqual(teacher_sglang_prefix_surplus, 2)
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)
 
     async def test_teacher_observation_commit_appends_canonical_delta_ids(self):
         loop = _build_loop()
@@ -1227,5 +1366,12 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(state, AgentState.GENERATING)
         self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 71, 72, 73, 74])
-        self.assertEqual(agent_data.extra_fields["teacher_server_prompt_ids"], [1, 2, 3, 81, 82])
-        self.assertEqual(agent_data.extra_fields["teacher_sglang_prefix_surplus"], 2)
+        student_request_prompt_ids, _, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
+            await _derive_request_views(loop, agent_data)
+        )
+        self.assertEqual(student_request_prompt_ids, [1, 2, 3, 81, 82])
+        self.assertEqual(teacher_server_prompt_ids, [1, 2, 3, 81, 82])
+        self.assertEqual(teacher_sglang_prefix_surplus, 2)
+        self.assertNotIn("server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_server_prompt_ids", agent_data.extra_fields)
+        self.assertNotIn("teacher_sglang_prefix_surplus", agent_data.extra_fields)

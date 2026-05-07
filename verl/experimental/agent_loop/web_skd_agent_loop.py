@@ -59,6 +59,13 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         return stream
 
     @staticmethod
+    def _require_teacher_messages(agent_data: AgentData) -> list[dict]:
+        teacher_messages = agent_data.extra_fields.get("web_osgym_teacher_messages")
+        if not isinstance(teacher_messages, list) or not teacher_messages:
+            raise ValueError("WebSKD requires web_osgym_teacher_messages to be initialized before request rebuild")
+        return teacher_messages
+
+    @staticmethod
     def _prospective_image_data(agent_data: AgentData, new_images: list[Any] | None) -> list[Any] | None:
         image_data = list(agent_data.image_data) if agent_data.image_data is not None else None
         if new_images:
@@ -82,7 +89,13 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         """
         if not image_data:
             return 0
-        return max(len(expanded_ids) - len(server_ids), 0)
+        surplus = len(expanded_ids) - len(server_ids)
+        if surplus < 0:
+            raise ValueError(
+                "WebSKD multimodal expansion gap must be non-negative: "
+                f"expanded_ids={len(expanded_ids)} server_ids={len(server_ids)}"
+            )
+        return surplus
 
     async def _apply_server_chat_template(
         self,
@@ -220,34 +233,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         agent_data: AgentData,
     ) -> tuple[list[dict], list[dict], list[int], list[Any] | None]:
         student_messages = list(agent_data.messages)
-        teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages") or [])
-        if not teacher_messages:
-            teacher_messages = deepcopy(student_messages)
+        teacher_messages = deepcopy(self._require_teacher_messages(agent_data))
         teacher_messages = self._build_teacher_messages(deepcopy(teacher_messages))
         teacher_prompt_ids = self._require_prompt_stream(agent_data, "teacher_prompt_ids")
         image_data = agent_data.image_data
         return student_messages, teacher_messages, teacher_prompt_ids, image_data
-
-    async def _refresh_request_prompt_views_from_agent_state(
-        self,
-        agent_data: AgentData,
-    ) -> None:
-        student_messages, teacher_messages, teacher_prompt_ids, image_data = (
-            self._resolve_request_prompt_inputs_from_agent_state(agent_data)
-        )
-
-        server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus = (
-            await self._build_request_prompt_views(
-                agent_data,
-                student_messages=student_messages,
-                teacher_messages=teacher_messages,
-                teacher_prompt_ids=teacher_prompt_ids,
-                image_data=image_data,
-            )
-        )
-        agent_data.extra_fields["server_prompt_ids"] = server_prompt_ids
-        agent_data.extra_fields["teacher_server_prompt_ids"] = teacher_server_prompt_ids
-        agent_data.extra_fields["teacher_sglang_prefix_surplus"] = teacher_sglang_prefix_surplus
 
     def _assert_processing_tools_turn_is_committed(self, agent_data: AgentData) -> None:
         pending_turn_state = self._get_pending_turn_state(agent_data)
@@ -260,9 +250,13 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         agent_data: AgentData,
     ) -> tuple[list[dict], list[dict], list[int]]:
         student_messages = list(agent_data.messages)
-        teacher_messages = deepcopy(agent_data.extra_fields.get("web_osgym_teacher_messages") or student_messages)
+        teacher_messages = deepcopy(self._require_teacher_messages(agent_data))
         teacher_prompt_ids = list(self._require_prompt_stream(agent_data, "teacher_prompt_ids"))
         return student_messages, teacher_messages, teacher_prompt_ids
+
+    def _validate_teacher_state_for_partial(self, agent_data: AgentData) -> None:
+        self._require_teacher_messages(agent_data)
+        self._require_prompt_stream(agent_data, "teacher_prompt_ids")
 
     async def _terminate_if_teacher_prefix_overflows(
         self,
@@ -358,23 +352,6 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             prompt_len=len(prompt_ids),
             image_count=_safe_len(next_image_data),
         )
-        _trace_async_skd(
-            "web_skd.pending_student_server_template_begin",
-            request_id=agent_data.request_id,
-            message_count=len(student_messages),
-            tool_count=_safe_len(schemas),
-        )
-        student_server_t0 = time.monotonic()
-        server_prompt_ids = await self._recompute_server_prompt_ids(
-            agent_data, student_messages
-        )
-        student_server_ms = (time.monotonic() - student_server_t0) * 1000
-        _trace_async_skd(
-            "web_skd.pending_student_server_template_done",
-            request_id=agent_data.request_id,
-            elapsed_ms=round(student_server_ms, 1),
-            server_prompt_len=len(server_prompt_ids),
-        )
         teacher_template_messages = self._build_teacher_messages(deepcopy(teacher_messages))
         _trace_async_skd(
             "web_skd.pending_teacher_template_begin",
@@ -398,22 +375,6 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             teacher_prompt_len=len(teacher_prompt_ids),
             image_count=_safe_len(next_image_data),
         )
-        _trace_async_skd(
-            "web_skd.pending_teacher_server_template_begin",
-            request_id=agent_data.request_id,
-            message_count=len(teacher_template_messages),
-            tool_count=_safe_len(schemas),
-        )
-        teacher_server_t0 = time.monotonic()
-        teacher_server_prompt_ids = await self._apply_server_chat_template(teacher_template_messages, tools=schemas)
-        teacher_server_ms = (time.monotonic() - teacher_server_t0) * 1000
-        _trace_async_skd(
-            "web_skd.pending_teacher_server_template_done",
-            request_id=agent_data.request_id,
-            elapsed_ms=round(teacher_server_ms, 1),
-            teacher_server_prompt_len=len(teacher_server_prompt_ids),
-        )
-
         commit_t0 = time.monotonic()
         image_start = 0
         image_end = _safe_len(next_image_data)
@@ -429,26 +390,19 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                     "terminal": False,
                 }
             ]
-        agent_data.extra_fields["server_prompt_ids"] = server_prompt_ids
         agent_data.extra_fields["web_osgym_teacher_messages"] = teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
         agent_data.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids
-        agent_data.extra_fields["teacher_server_prompt_ids"] = teacher_server_prompt_ids
-        agent_data.extra_fields["teacher_sglang_prefix_surplus"] = self._multimodal_prefix_surplus_delta(
-            teacher_prompt_ids,
-            teacher_server_prompt_ids,
-            next_image_data,
-        )
+        agent_data.extra_fields.pop("server_prompt_ids", None)
+        agent_data.extra_fields.pop("teacher_server_prompt_ids", None)
+        agent_data.extra_fields.pop("teacher_sglang_prefix_surplus", None)
         commit_ms = (time.monotonic() - commit_t0) * 1000
         _trace_async_skd(
             "web_skd.pending_commit_done",
             request_id=agent_data.request_id,
             elapsed_ms=round(commit_ms, 1),
             prompt_len=len(agent_data.prompt_ids),
-            server_prompt_len=len(server_prompt_ids),
             teacher_prompt_len=len(teacher_prompt_ids),
-            teacher_server_prompt_len=len(teacher_server_prompt_ids),
-            teacher_sglang_prefix_surplus=agent_data.extra_fields["teacher_sglang_prefix_surplus"],
             image_count=_safe_len(agent_data.image_data),
         )
         return AgentState.GENERATING
@@ -695,18 +649,15 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         if next_response_logprobs:
             agent_data.response_logprobs = next_response_logprobs
         agent_data.user_turns = next_user_turns
-        # Keep the raw teacher conversation as the durable state. The compact
-        # teacher request view is rebuilt from this raw state at the next
-        # generation boundary and cached only as a compatibility snapshot.
+        # Keep the raw teacher conversation as the durable state. Compact
+        # request ids and the teacher verify offset are rebuilt from this
+        # canonical state at request time instead of living as durable state.
         agent_data.extra_fields["web_osgym_teacher_messages"] = next_teacher_messages
         agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
         agent_data.extra_fields["teacher_prompt_ids"] = next_teacher_prompt_ids
-        if next_server_prompt_ids is not None:
-            agent_data.extra_fields["server_prompt_ids"] = next_server_prompt_ids
-        if next_teacher_server_prompt_ids is not None:
-            agent_data.extra_fields["teacher_server_prompt_ids"] = next_teacher_server_prompt_ids
-        if next_teacher_sglang_prefix_surplus is not None:
-            agent_data.extra_fields["teacher_sglang_prefix_surplus"] = next_teacher_sglang_prefix_surplus
+        agent_data.extra_fields.pop("server_prompt_ids", None)
+        agent_data.extra_fields.pop("teacher_server_prompt_ids", None)
+        agent_data.extra_fields.pop("teacher_sglang_prefix_surplus", None)
         if next_mini_step_image_spans is not None:
             agent_data.extra_fields["mini_step_image_spans"] = next_mini_step_image_spans
         if next_teacher_ids_list is not None and next_teacher_logprobs_list is not None:
@@ -724,10 +675,8 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             response_len=len(agent_data.response_mask),
             image_count=_safe_len(agent_data.image_data),
             teacher_prompt_len=len(next_teacher_prompt_ids),
-            teacher_server_prompt_len=(
-                len(next_teacher_server_prompt_ids) if next_teacher_server_prompt_ids is not None else None
-            ),
-            teacher_sglang_prefix_surplus=agent_data.extra_fields.get("teacher_sglang_prefix_surplus"),
+            teacher_server_prompt_len=len(next_teacher_server_prompt_ids) if next_teacher_server_prompt_ids is not None else None,
+            teacher_sglang_prefix_surplus=next_teacher_sglang_prefix_surplus,
         )
 
         _trace_async_skd(
@@ -737,7 +686,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             response_len=len(agent_data.response_mask),
             prompt_len=len(agent_data.prompt_ids),
             image_count=_safe_len(agent_data.image_data),
-            teacher_sglang_prefix_surplus=agent_data.extra_fields.get("teacher_sglang_prefix_surplus"),
+            teacher_sglang_prefix_surplus=next_teacher_sglang_prefix_surplus,
             terminated=result.get("terminated", False),
             termination_reason=result.get("termination_reason"),
         )
@@ -750,7 +699,6 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         ignore_termination: bool = False,
         stop_after_skd_chunk: bool = False,
     ) -> AgentState:
-        await self._refresh_request_prompt_views_from_agent_state(agent_data)
         next_state = await super()._handle_generating_state(
             agent_data,
             sampling_params,
@@ -780,7 +728,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
                 elif state == AgentState.PROCESSING_TOOLS:
                     state = await self._handle_processing_tools_state(agent_data)
                 else:
-                    state = AgentState.TERMINATED
+                    raise ValueError(f"Invalid state while running WebSKD loop: {state}")
             return self._finalize_boundary_agent_output(agent_data)
         finally:
             await self._release_web_osgym_session(agent_data)
