@@ -290,6 +290,7 @@ class SkdAgentLoop(ToolAgentLoop):
             prompt_ids = list(agent_data.prompt_ids)
         response_mask = list(agent_data.response_mask)
         response_logprobs = list(agent_data.response_logprobs) if agent_data.response_logprobs else None
+        finalized_extra_fields = deepcopy(agent_data.extra_fields)
 
         pending_turn_state = self._get_pending_turn_state(agent_data)
         visible_pending_assistant_turns = 1 if pending_turn_state.tokens else 0
@@ -298,6 +299,14 @@ class SkdAgentLoop(ToolAgentLoop):
             response_mask.extend([1] * len(pending_turn_state.tokens))
             if response_logprobs is not None:
                 response_logprobs.extend([0.0] * len(pending_turn_state.tokens))
+            finalized_extra_fields.setdefault("teacher_ids_list", [])
+            finalized_extra_fields.setdefault("teacher_logprobs_list", [])
+            finalized_extra_fields["teacher_ids_list"] = list(finalized_extra_fields["teacher_ids_list"]) + [
+                list(row) for row in pending_turn_state.teacher_ids_rows
+            ]
+            finalized_extra_fields["teacher_logprobs_list"] = list(
+                finalized_extra_fields["teacher_logprobs_list"]
+            ) + [list(row) for row in pending_turn_state.teacher_logprobs_rows]
 
         multi_modal_data = {}
         if agent_data.image_data is not None:
@@ -318,7 +327,7 @@ class SkdAgentLoop(ToolAgentLoop):
                 if agent_data.routed_experts is not None
                 else None
             ),
-            extra_fields=agent_data.extra_fields,
+            extra_fields=finalized_extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
         output.extra_fields.setdefault("parent_request_id", None)

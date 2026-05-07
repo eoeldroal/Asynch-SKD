@@ -1355,8 +1355,18 @@ async def test_skd_run_preserves_forced_cutoff_pending_turn_in_final_output():
     assert output.num_turns == 2
     assert output.extra_fields["skd_termination_reason"] == "max_chunks"
     assert output.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
-    assert output.extra_fields["teacher_ids_list"] == []
-    assert output.extra_fields["teacher_logprobs_list"] == []
+    assert output.extra_fields["teacher_ids_list"] == [
+        [TOOL_CALL_A, 0, 0, 0],
+        [TOOL_CALL_B, 0, 0, 0],
+        [33, 0, 0, 0],
+    ]
+    assert output.extra_fields["teacher_logprobs_list"] == [
+        [-1.0] * LOSS_TOP_K,
+        [-2.0] * LOSS_TOP_K,
+        [-3.0] * LOSS_TOP_K,
+    ]
+    assert len(output.response_mask) == len(output.extra_fields["teacher_ids_list"])
+    assert len(output.response_mask) == len(output.extra_fields["teacher_logprobs_list"])
 
 
 @pytest.mark.asyncio
@@ -1396,8 +1406,16 @@ async def test_skd_run_until_exportable_boundary_terminal_cutoff_surfaces_pendin
     assert result.num_turns == 2
     assert result.extra_fields["skd_termination_reason"] == "max_chunks"
     assert result.extra_fields["skd_pending_turn_response_ids"] == [TOOL_CALL_A, TOOL_CALL_B, 33]
-    assert result.extra_fields["teacher_ids_list"] == []
-    assert result.extra_fields["teacher_logprobs_list"] == []
+    assert result.extra_fields["teacher_ids_list"] == [
+        [TOOL_CALL_A, 0, 0, 0],
+        [TOOL_CALL_B, 0, 0, 0],
+        [33, 0, 0, 0],
+    ]
+    assert result.extra_fields["teacher_logprobs_list"] == [
+        [-1.0] * LOSS_TOP_K,
+        [-2.0] * LOSS_TOP_K,
+        [-3.0] * LOSS_TOP_K,
+    ]
 
 
 @pytest.mark.asyncio
