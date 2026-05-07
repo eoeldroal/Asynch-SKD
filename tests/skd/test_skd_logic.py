@@ -1041,13 +1041,12 @@ async def test_skd_export_allows_closed_tool_call_without_eos_as_generation_pref
 
 
 @pytest.mark.asyncio
-async def test_skd_closed_tool_call_without_eos_keeps_generating_and_does_not_populate_tool_calls():
-    class _ClosedToolParser:
+async def test_skd_closed_tool_call_without_eos_does_not_invoke_tool_parser():
+    class _ParserMustNotRun:
         async def extract_tool_calls(self, response_ids: list[int], tools: list[Any]):
-            del tools
-            if response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]:
-                return None, [FakeToolCall(name="lookup", arguments='{"query":"weather"}')]
-            return None, []
+            raise AssertionError(
+                f"tool parser must not run before EOS: response_ids={response_ids!r}, tools={tools!r}"
+            )
 
     loop = make_skd_loop(
         student_chunks=[
@@ -1059,18 +1058,17 @@ async def test_skd_closed_tool_call_without_eos_keeps_generating_and_does_not_po
         max_chunks=1,
     )
     loop.tokenizer = FakeHermesTokenizer()
-    loop.tool_parser = _ClosedToolParser()
+    loop.tool_parser = _ParserMustNotRun()
     agent_data = make_agent_data([1, 2, 3])
 
     next_state = await SkdAgentLoop._handle_generating_state(loop, agent_data, {}, False)
 
     assert next_state == AgentState.GENERATING
     assert agent_data.response_ids == [OPEN_TOOL, 11, CLOSE_TOOL]
-    assert agent_data.tool_calls == []
 
 
 @pytest.mark.asyncio
-async def test_skd_forced_cutoff_flushes_turn_buffer_without_tool_processing():
+async def test_skd_max_chunks_cutoff_flushes_turn_buffer_without_tool_processing():
     loop = make_skd_loop(
         student_chunks=[
             [TOOL_CALL_A, TOOL_CALL_B, 33],
@@ -1088,6 +1086,7 @@ async def test_skd_forced_cutoff_flushes_turn_buffer_without_tool_processing():
     assert agent_data.extra_fields["skd_termination_reason"] == "max_chunks"
     assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, 33]
     assert agent_data.tool_calls == []
+    assert "skd_pending_turn_response_ids" not in agent_data.extra_fields
 
 
 @pytest.mark.asyncio
