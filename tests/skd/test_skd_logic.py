@@ -402,7 +402,6 @@ async def test_full_skd_tool_trajectory_e2e(monkeypatch):
         agent_data,
         {},
         False,
-        stop_after_skd_chunk=True,
     )
     assert next_state == AgentState.PROCESSING_TOOLS
     assert not loop._can_export_partial_state(agent_data, next_state)
@@ -794,7 +793,14 @@ async def test_skd_teacher_request_counts_teacher_only_text_as_server_prefix_not
     assert teacher_call["expected_mm_prefix_surplus"] == 0
     assert teacher_call["expected_logprob_rows"] == 2
     assert teacher_call["chunk"] == [10, 11]
-    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+    assert teacher_rows(agent_data) == []
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
 
 
 @pytest.mark.asyncio
@@ -821,7 +827,14 @@ async def test_skd_teacher_request_uses_tracked_multimodal_surplus_for_sglang_st
     assert teacher_call["expected_mm_prefix_surplus"] == 959
     assert teacher_call["expected_logprob_rows"] == 2
     assert teacher_call["chunk"] == [10, 11]
-    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+    assert teacher_rows(agent_data) == []
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
 
 
 @pytest.mark.asyncio
@@ -970,7 +983,14 @@ async def test_web_skd_teacher_verify_rebuilds_request_views_from_current_messag
     assert teacher_call["sequence_ids"] == [1, 2, 3, 10, 11]
     assert teacher_call["expected_mm_prefix_surplus"] == 2
     assert teacher_call["expected_logprob_rows"] == 2
-    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+    assert teacher_rows(agent_data) == []
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
 
 
 @pytest.mark.asyncio
@@ -1017,9 +1037,16 @@ async def test_web_skd_teacher_verification_span_stays_stable_across_image_tool_
     assert teacher_call["expected_mm_prefix_surplus"] == 2
     assert teacher_call["expected_logprob_rows"] == 2
     assert teacher_call["chunk"] == [10, 11]
-    assert agent_data.extra_fields["teacher_server_prompt_ids"] == original_teacher_server_prompt_ids + [10, 11]
+    assert agent_data.extra_fields["teacher_server_prompt_ids"] == original_teacher_server_prompt_ids
     assert agent_data.extra_fields["teacher_sglang_prefix_surplus"] == 2
-    assert teacher_rows(agent_data) == [[10, 0, 0, 0], [11, 0, 0, 0]]
+    assert teacher_rows(agent_data) == []
+    assert agent_data.extra_fields["skd_pending_turn_state"] == {
+        "tokens": [10, 11],
+        "teacher_ids_rows": [[10, 0, 0, 0], [11, 0, 0, 0]],
+        "teacher_logprobs_rows": [[-1.0] * LOSS_TOP_K, [-2.0] * LOSS_TOP_K],
+        "raw_chunk": [10, 11],
+        "verified_chunk": [10, 11],
+    }
 
 
 def test_skd_text_tool_delta_updates_student_and_teacher_server_streams():
