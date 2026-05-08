@@ -89,7 +89,7 @@ class AgentData:
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
-    max_tool_parse_error_retries = 1
+    max_tool_parse_error_retries = 9999
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

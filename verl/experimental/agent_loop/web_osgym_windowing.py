@@ -208,5 +208,5 @@ def format_previous_actions(actions: Sequence[Mapping[str, Any]] | np.ndarray | 
             for key, value in action.items()
             if key not in {"action_type", "name"} and value is not None
         ]
-        formatted.append(f"{index}. {str(action_name).upper()}({', '.join(arguments)})")
+        formatted.append(f"Step {index}: {str(action_name).upper()}({', '.join(arguments)})")
     return "\n".join(formatted) if formatted else "None"

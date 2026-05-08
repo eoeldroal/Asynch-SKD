@@ -9,9 +9,10 @@ Use the screenshot carefully:
 
 Be careful with repeated actions:
 - Do not repeat the same click, scroll, drag, or typing pattern unless the latest observation provides new evidence that repeating it is useful.
-- If a previous action produced no visible progress, adjust the next action instead of retrying the same target by habit.
+- If a previous action produced no visible progress, adjust the next action instead of retrying the same action.
+- Continue from the current visible state and preserve valid progress.
 
-Handle terminal actions strictly:
+Handle actions strictly:
 - DONE is appropriate only when the current browser state clearly satisfies the task instruction.
 - FAIL is appropriate only when the task cannot reasonably be completed.
 - Do not emit DONE or FAIL speculatively when a grounded next browser action remains available.

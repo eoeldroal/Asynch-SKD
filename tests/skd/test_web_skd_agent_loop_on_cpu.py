@@ -1059,7 +1059,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
                 "teacher_ids_list": [],
                 "teacher_logprobs_list": [],
                 "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
-                "tool_parse_error_retry_count": 1,
+                "tool_parse_error_retry_count": 9999,
             }
         )
         before_messages = deepcopy(agent_data.messages)
@@ -1076,6 +1076,59 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.messages, before_messages)
         self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
         self.assertEqual(agent_data.response_mask, before_response_mask)
+
+    async def test_tool_parse_error_keeps_retrying_until_large_retry_budget_is_used(self):
+        loop = _build_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            remove_system_prompt = kwargs.get("remove_system_prompt", False)
+            if remove_system_prompt:
+                return [71, 72]
+            if messages and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 71, 72]
+            return [1, 2, 3]
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            del kwargs
+            if messages and messages[-1]["role"] == "tool":
+                return [21, 22]
+            return [1, 2, 3]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-parse-recovery-large-budget",
+            tools_kwargs={},
+        )
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "tool_parse_error_retry_count": 9998,
+            }
+        )
+
+        state = await WebSkdAgentLoop._handle_tool_parse_error(
+            loop,
+            agent_data,
+            ToolParseError(kind="tool_tag_incomplete", message="a tool-call tag is incomplete."),
+        )
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.extra_fields["tool_parse_error_retry_count"], 9999)
 
     async def test_tool_observation_commit_is_atomic(self):
         loop = _build_loop()

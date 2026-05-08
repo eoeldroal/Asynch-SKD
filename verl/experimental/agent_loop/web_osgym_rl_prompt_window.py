@@ -70,15 +70,11 @@ def _extract_latest_user_instruction(base_messages: Any) -> str:
     return ""
 
 
-def _coordinate_guidance() -> str:
-    return "All action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner."
-
-
 def _build_prompt_text(instruction: str, previous_actions: str, prompt_images: Sequence[Any]) -> str:
     del prompt_images
     return (
         "Please generate the next move according to the UI screenshot, instruction and previous actions.\n"
-        f"{_coordinate_guidance()}\n\n"
+        "\n"
         f"Instruction: {instruction}\n\n"
         f"Previous actions:\n{previous_actions}"
     )

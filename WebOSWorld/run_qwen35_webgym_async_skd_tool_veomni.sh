@@ -73,7 +73,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
     distillation.skd.chunk_size=128 \
     distillation.skd.verify_top_k=5 \
-    distillation.skd.max_chunks_per_sample=192 \
+    distillation.skd.max_chunks_per_sample=224 \
     "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=False \
     actor_rollout_ref.rollout.name=sglang \

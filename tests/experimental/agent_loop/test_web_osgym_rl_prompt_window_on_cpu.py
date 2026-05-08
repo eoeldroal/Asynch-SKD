@@ -51,7 +51,7 @@ def test_build_web_osgym_prompt_window_keeps_old_actions_only_outside_history_wi
     first_user = prompt_window.messages[1]
     assert first_user["role"] == "user"
     assert first_user["content"][0] == {"type": "image"}
-    assert "Previous actions:\n1. CLICK(x=10, y=20)" in first_user["content"][-1]["text"]
+    assert "Previous actions:\nStep 1: CLICK(x=10, y=20)" in first_user["content"][-1]["text"]
     assert "WAIT" not in first_user["content"][-1]["text"]
     assert "CLICK(x=30, y=40)" not in first_user["content"][-1]["text"]
 
@@ -90,7 +90,7 @@ def test_build_web_osgym_prompt_window_emits_live_recent_user_assistant_chain():
                 {"type": "image"},
                 {
                     "type": "text",
-                    "text": "Please generate the next move according to the UI screenshot, instruction and previous actions.\nAll action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner.\n\nInstruction: Open settings\n\nPrevious actions:\nNone",
+                    "text": "Please generate the next move according to the UI screenshot, instruction and previous actions.\n\nInstruction: Open settings\n\nPrevious actions:\nNone",
                 },
             ],
         },
@@ -245,7 +245,7 @@ def test_build_web_osgym_prompt_window_raises_when_selected_step_has_no_content(
         )
 
 
-def test_build_web_osgym_prompt_window_includes_relative_coordinate_guidance():
+def test_build_web_osgym_prompt_window_does_not_include_coordinate_guidance_in_user_prompt():
     prompt_window = build_web_osgym_prompt_window(
         base_messages=[{"role": "user", "content": "Open settings"}],
         images=["obs-1"],
@@ -254,7 +254,7 @@ def test_build_web_osgym_prompt_window_includes_relative_coordinate_guidance():
     )
 
     first_text = prompt_window.messages[0]["content"][-1]["text"]
-    assert "All action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner." in first_text
+    assert "All action coordinates use a 1000x1000 screen coordinate system with origin at the top-left corner." not in first_text
 
 
 def test_build_web_osgym_prompt_window_does_not_include_runtime_resolution_when_available():
@@ -266,5 +266,5 @@ def test_build_web_osgym_prompt_window_does_not_include_runtime_resolution_when_
     )
 
     first_text = prompt_window.messages[0]["content"][-1]["text"]
-    assert "1000x1000" in first_text
+    assert "1000x1000" not in first_text
     assert "1920x1080" not in first_text

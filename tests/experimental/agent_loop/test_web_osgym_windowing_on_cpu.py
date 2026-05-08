@@ -144,7 +144,7 @@ def test_format_previous_actions_formats_numbered_actions_and_none():
         {"action_type": "WAIT", "duration": 1},
     ]
 
-    assert format_previous_actions(actions) == "1. CLICK(x=12, y=34, button='left')\n2. WAIT(duration=1)"
+    assert format_previous_actions(actions) == "Step 1: CLICK(x=12, y=34, button='left')\nStep 2: WAIT(duration=1)"
     assert format_previous_actions([]) == "None"
 
 
@@ -162,4 +162,4 @@ def test_format_previous_actions_flattens_nested_actions_from_normalized_steps()
         ]
     )
 
-    assert format_previous_actions(steps) == "1. CLICK(x=12, y=34, button='left')\n2. WAIT(duration=1)"
+    assert format_previous_actions(steps) == "Step 1: CLICK(x=12, y=34, button='left')\nStep 2: WAIT(duration=1)"
