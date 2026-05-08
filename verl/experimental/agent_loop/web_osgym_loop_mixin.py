@@ -5,12 +5,47 @@ from collections.abc import Mapping
 from copy import deepcopy
 from uuid import uuid4
 
+from verl.experimental.agent_loop.tool_parser import ToolParseError
 from verl.tools.schemas import ToolResponse
 
 
 class WebOsGymLoopMixin:
     shared_tools_kwargs_key = "web_osgym"
     legacy_bundled_tool_name = "computer"
+
+    @staticmethod
+    def _tool_parse_error_rules() -> list[str]:
+        return [
+            "Output only well-formed tool call blocks. Do not include extra chat text before, between, or after them.",
+            "Each tool call must use `<tool_call> ... </tool_call>`.",
+            "Each function block must use `<function=...> ... </function>`.",
+            "Each parameter block must use `<parameter=...> ... </parameter>`.",
+            "The function name must be `computer`.",
+            "The value inside `<parameter=actions>` must be a valid JSON array.",
+            "Keep brackets and braces balanced.",
+            "Do not nest `<parameter=...>` tags inside the `actions` JSON.",
+            "`x` and `y` must be single integers, not lists or tuples.",
+            "If you use `DONE` or `FAIL`, it must be the only action in that `actions` array.",
+        ]
+
+    def _build_tool_parse_error_feedback(self, parse_error: ToolParseError) -> str:
+        lines = [
+            f"Invalid tool call format: {parse_error.message}",
+            "",
+            "Below is an example of a valid tool call format:",
+            "",
+            "<tool_call>",
+            "<function=computer>",
+            "<parameter=actions>",
+            '[{"action_type":"CLICK","x":621,"y":680}]',
+            "</parameter>",
+            "</function>",
+            "</tool_call>",
+            "",
+            "Rules:",
+        ]
+        lines.extend(f"- {rule}" for rule in self._tool_parse_error_rules())
+        return "\n".join(lines)
 
     def _get_active_tool(self, agent_data, tool_name: str | None = None):
         active_tools = getattr(agent_data, "_active_tools", {})

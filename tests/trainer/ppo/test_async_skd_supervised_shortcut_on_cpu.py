@@ -200,3 +200,88 @@ def test_async_skd_generate_with_carryover_can_request_step_end_flush():
     )
 
     assert trainer.async_rollout_manager.last_generate_with_carryover_kwargs["flush_lookahead_before_return"] is True
+
+
+def test_async_skd_resume_drops_web_skd_carryover_but_keeps_promoted():
+    trainer = _make_trainer_for_shortcut(
+        {
+            "algorithm": {
+                "adv_estimator": AdvantageEstimator.GRPO,
+                "use_kl_in_reward": False,
+                "rollout_correction": None,
+            },
+            "distillation": {
+                "enabled": True,
+                "distillation_loss": {
+                    "use_task_rewards": False,
+                    "use_policy_gradient": False,
+                },
+            },
+            "actor_rollout_ref": {
+                "actor": {"use_kl_loss": False},
+                "rollout": {
+                    "agent": {
+                        "async_skd_mode": "lookahead",
+                        "default_agent_loop": "web_skd_agent",
+                    }
+                },
+            },
+        }
+    )
+
+    loaded_state = {
+        "fresh_buffer": "fresh",
+        "fresh_cursor": 3,
+        "carryover_partials": ["partial-a", "partial-b"],
+        "carryover_input_batches": ["input-a", "input-b"],
+        "reserved_input_batches": {"reserved": "value"},
+        "promoted_input_batches": ["promoted-in"],
+        "promoted_output_batches": ["promoted-out"],
+        "trained_reserved_sample_ids": ["uid-0"],
+    }
+
+    sanitized = trainer._drop_async_skd_carryover_from_loaded_state(loaded_state)
+
+    assert sanitized["carryover_partials"] == []
+    assert sanitized["carryover_input_batches"] == []
+    assert sanitized["promoted_input_batches"] == ["promoted-in"]
+    assert sanitized["promoted_output_batches"] == ["promoted-out"]
+    assert sanitized["reserved_input_batches"] == {"reserved": "value"}
+    assert loaded_state["carryover_partials"] == ["partial-a", "partial-b"]
+
+
+def test_async_skd_resume_keeps_carryover_for_non_web_agent_loops():
+    trainer = _make_trainer_for_shortcut(
+        {
+            "algorithm": {
+                "adv_estimator": AdvantageEstimator.GRPO,
+                "use_kl_in_reward": False,
+                "rollout_correction": None,
+            },
+            "distillation": {
+                "enabled": True,
+                "distillation_loss": {
+                    "use_task_rewards": False,
+                    "use_policy_gradient": False,
+                },
+            },
+            "actor_rollout_ref": {
+                "actor": {"use_kl_loss": False},
+                "rollout": {
+                    "agent": {
+                        "async_skd_mode": "lookahead",
+                        "default_agent_loop": "single_turn_agent",
+                    }
+                },
+            },
+        }
+    )
+
+    loaded_state = {
+        "carryover_partials": ["partial-a"],
+        "carryover_input_batches": ["input-a"],
+    }
+
+    sanitized = trainer._drop_async_skd_carryover_from_loaded_state(loaded_state)
+
+    assert sanitized == loaded_state

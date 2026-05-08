@@ -621,6 +621,35 @@ class RayPPOTrainer:
     def _async_skd_base_batch_size(self) -> int:
         return int(self.config.data.get("gen_batch_size", self.config.data.train_batch_size))
 
+    def _uses_web_skd_agent_loop(self) -> bool:
+        agent_name = OmegaConf.select(
+            self.config,
+            "actor_rollout_ref.rollout.agent.default_agent_loop",
+            default=None,
+        )
+        return str(agent_name) == "web_skd_agent"
+
+    def _drop_async_skd_carryover_from_loaded_state(self, state: dict | None) -> dict | None:
+        if state is None:
+            return None
+        if not (self._uses_async_skd_lookahead_training() and self._uses_web_skd_agent_loop()):
+            return state
+
+        carryover_partials = state.get("carryover_partials", [])
+        carryover_input_batches = state.get("carryover_input_batches", [])
+        if not carryover_partials and not carryover_input_batches:
+            return state
+
+        sanitized_state = deepcopy(state)
+        sanitized_state["carryover_partials"] = []
+        sanitized_state["carryover_input_batches"] = []
+        print(
+            "Dropping async-SKD carryover from resumed WebSKD checkpoint: "
+            f"carryover_partials={len(carryover_partials)}, "
+            f"carryover_input_batches={len(carryover_input_batches)}"
+        )
+        return sanitized_state
+
     def _create_async_skd_training_batch_iterator(self, start_epoch: int):
         for epoch in range(start_epoch, self.config.trainer.total_epochs):
             del epoch
@@ -1348,6 +1377,9 @@ class RayPPOTrainer:
                     dataloader_state_dict = dataloader_payload
                     async_skd_data_source_state = None
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
+                async_skd_data_source_state = self._drop_async_skd_carryover_from_loaded_state(
+                    async_skd_data_source_state
+                )
                 self._pending_async_skd_data_source_state = async_skd_data_source_state
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")

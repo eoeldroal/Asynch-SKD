@@ -14,7 +14,12 @@ from verl.experimental.agent_loop.skd_agent_loop import (
     _safe_len,
     _trace_async_skd,
 )
-from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
+from verl.experimental.agent_loop.tool_agent_loop import (
+    _TOOL_PARSE_ERROR_RETRY_COUNT_KEY,
+    AgentData,
+    AgentState,
+)
+from verl.experimental.agent_loop.tool_parser import ToolParseError
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.utils.chat_template import apply_chat_template
 from verl.utils.tokenizer import normalize_token_ids
@@ -277,6 +282,95 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
     def _validate_teacher_state_for_partial(self, agent_data: AgentData) -> None:
         self._require_teacher_messages(agent_data)
         self._require_prompt_stream(agent_data, "teacher_prompt_ids")
+
+    async def _handle_tool_parse_error(self, agent_data: AgentData, parse_error: ToolParseError) -> AgentState:
+        retry_count = int(agent_data.extra_fields.get(_TOOL_PARSE_ERROR_RETRY_COUNT_KEY, 0))
+        if retry_count >= self.max_tool_parse_error_retries:
+            return AgentState.TERMINATED
+
+        feedback_text = self._build_tool_parse_error_feedback(parse_error)
+        student_obs, teacher_obs = self._split_env_observation(feedback_text, None)
+        student_message = self._build_tool_message(student_obs, None)
+        teacher_message = self._build_tool_message(teacher_obs, None)
+
+        response_ids = await self.apply_chat_template(
+            [student_message],
+            images=None,
+            videos=None,
+            remove_system_prompt=True,
+        )
+        teacher_response_ids = await self.apply_chat_template(
+            [teacher_message],
+            images=None,
+            videos=None,
+            remove_system_prompt=True,
+        )
+        if response_ids and len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_response_budget_exhausted")
+            return AgentState.TERMINATED
+
+        next_student_messages, next_teacher_messages, committed_teacher_prompt_ids = (
+            self._resolve_tool_processing_commit_inputs(agent_data)
+        )
+        next_student_messages.append(student_message)
+        next_teacher_messages.append(teacher_message)
+        next_teacher_prompt_ids = list(committed_teacher_prompt_ids)
+        next_teacher_prompt_ids.extend(teacher_response_ids)
+
+        (
+            next_server_prompt_ids,
+            next_teacher_server_prompt_ids,
+            next_teacher_sglang_prefix_surplus,
+        ) = await self._build_request_prompt_views(
+            agent_data,
+            student_messages=next_student_messages,
+            teacher_messages=self._build_teacher_messages(deepcopy(next_teacher_messages)),
+            teacher_prompt_ids=next_teacher_prompt_ids,
+            image_data=agent_data.image_data,
+        )
+        if next_teacher_server_prompt_ids is not None and await self._terminate_if_teacher_prefix_overflows(
+            agent_data,
+            prefix_len=len(next_teacher_server_prompt_ids),
+            stage="tool_parse_error",
+        ):
+            return AgentState.TERMINATED
+
+        appended_len = len(response_ids)
+        next_prompt_ids = list(agent_data.prompt_ids) + response_ids
+        next_response_mask = list(agent_data.response_mask) + ([0] * appended_len)
+        next_response_logprobs = list(agent_data.response_logprobs)
+        if next_response_logprobs:
+            next_response_logprobs.extend([0.0] * appended_len)
+
+        next_teacher_ids_list = None
+        next_teacher_logprobs_list = None
+        if "teacher_ids_list" in agent_data.extra_fields or "teacher_logprobs_list" in agent_data.extra_fields:
+            if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
+                raise ValueError("WebSKD teacher alignment requires both teacher_ids_list and teacher_logprobs_list")
+            assert self.loss_top_k is not None and self.loss_top_k > 0, "SKD dummy rows require distillation topk > 0"
+            next_teacher_ids_list = [list(row) for row in agent_data.extra_fields["teacher_ids_list"]]
+            next_teacher_logprobs_list = [list(row) for row in agent_data.extra_fields["teacher_logprobs_list"]]
+            next_teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(appended_len)])
+            next_teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(appended_len)])
+
+        agent_data.metrics["tool_parse_error"] = 1
+        agent_data.extra_fields[_TOOL_PARSE_ERROR_RETRY_COUNT_KEY] = retry_count + 1
+        agent_data.messages = next_student_messages
+        agent_data.prompt_ids = next_prompt_ids
+        agent_data.response_mask = next_response_mask
+        if next_response_logprobs:
+            agent_data.response_logprobs = next_response_logprobs
+        agent_data.user_turns += 1
+        agent_data.extra_fields["web_osgym_teacher_messages"] = next_teacher_messages
+        agent_data.extra_fields["web_osgym_teacher_observation_text"] = teacher_obs
+        agent_data.extra_fields["teacher_prompt_ids"] = next_teacher_prompt_ids
+        agent_data.extra_fields.pop("server_prompt_ids", None)
+        agent_data.extra_fields.pop("teacher_server_prompt_ids", None)
+        agent_data.extra_fields.pop("teacher_sglang_prefix_surplus", None)
+        if next_teacher_ids_list is not None and next_teacher_logprobs_list is not None:
+            agent_data.extra_fields["teacher_ids_list"] = next_teacher_ids_list
+            agent_data.extra_fields["teacher_logprobs_list"] = next_teacher_logprobs_list
+        return AgentState.GENERATING
 
     async def _terminate_if_teacher_prefix_overflows(
         self,

@@ -1697,9 +1697,12 @@ class SkdAgentLoop(ToolAgentLoop):
         active_tools = getattr(agent_data, "_active_tools", self.tools)
         tools = [tool.tool_schema for tool in active_tools.values()]
         _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+        parse_error = getattr(self.tool_parser, "last_parse_error", None)
 
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
+        if parse_error is not None:
+            return await self._handle_tool_parse_error(agent_data, parse_error)
         return AgentState.TERMINATED
 
     def _log_token_alignment(

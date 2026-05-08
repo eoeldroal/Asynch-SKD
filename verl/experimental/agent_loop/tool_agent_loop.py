@@ -27,7 +27,7 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopOutput,
     register,
 )
-from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParser
+from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParseError, ToolParser
 from verl.experimental.agent_loop.utils import build_gpt_oss_tool_response_text
 from verl.tools.schemas import ToolResponse
 from verl.tools.utils.tool_registry import initialize_tools_from_config
@@ -37,6 +37,8 @@ from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_TOOL_PARSE_ERROR_RETRY_COUNT_KEY = "tool_parse_error_retry_count"
 
 
 class AgentState(Enum):
@@ -87,6 +89,8 @@ class AgentData:
 
 @register("tool_agent")
 class ToolAgentLoop(AgentLoopBase):
+    max_tool_parse_error_retries = 1
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -105,6 +109,11 @@ class ToolAgentLoop(AgentLoopBase):
 
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
+        self.max_tool_parse_error_retries = int(self.max_tool_parse_error_retries)
+
+    async def _handle_tool_parse_error(self, agent_data: AgentData, parse_error: ToolParseError) -> AgentState:
+        del agent_data, parse_error
+        return AgentState.TERMINATED
 
     @staticmethod
     def _merge_generation_extra_fields(agent_data: AgentData, output_extra_fields: dict[str, Any] | None) -> None:
@@ -264,11 +273,13 @@ class ToolAgentLoop(AgentLoopBase):
         active_tools = getattr(agent_data, "_active_tools", self.tools)
         tools = [tool.tool_schema for tool in active_tools.values()]
         _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+        parse_error = getattr(self.tool_parser, "last_parse_error", None)
 
         if agent_data.tool_calls:
             return AgentState.PROCESSING_TOOLS
-        else:
-            return AgentState.TERMINATED
+        if parse_error is not None:
+            return await self._handle_tool_parse_error(agent_data, parse_error)
+        return AgentState.TERMINATED
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         """Handle the processing tools state: execute tool calls and prepare tool responses."""

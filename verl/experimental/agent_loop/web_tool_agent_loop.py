@@ -13,7 +13,13 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.qwen_coder_structured_output import build_qwen_coder_structured_tag_json
-from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
+from verl.experimental.agent_loop.tool_agent_loop import (
+    _TOOL_PARSE_ERROR_RETRY_COUNT_KEY,
+    AgentData,
+    AgentState,
+    ToolAgentLoop,
+)
+from verl.experimental.agent_loop.tool_parser import ToolParseError
 from verl.experimental.agent_loop.web_osgym_rl_prompt_window import build_web_osgym_prompt_window
 from verl.experimental.agent_loop.web_osgym_windowing import build_mini_step_image_spans
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
@@ -666,6 +672,49 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
 
         return AgentState.GENERATING
 
+    async def _handle_tool_parse_error(self, agent_data: AgentData, parse_error: ToolParseError) -> AgentState:
+        retry_count = int(agent_data.extra_fields.get(_TOOL_PARSE_ERROR_RETRY_COUNT_KEY, 0))
+        if retry_count >= self.max_tool_parse_error_retries:
+            return AgentState.TERMINATED
+
+        feedback_text = self._build_tool_parse_error_feedback(parse_error)
+        message = self._build_tool_message(feedback_text, None)
+        response_ids = await self.apply_chat_template(
+            [message],
+            images=None,
+            videos=None,
+            remove_system_prompt=True,
+        )
+        if response_ids and len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+            await self._finalize_with_web_osgym_reward(
+                agent_data,
+                termination_reason="tool_response_budget_exhausted",
+            )
+            return AgentState.TERMINATED
+
+        agent_data.metrics["tool_parse_error"] = 1
+        agent_data.extra_fields[_TOOL_PARSE_ERROR_RETRY_COUNT_KEY] = retry_count + 1
+        image_start = len(agent_data.image_data) if agent_data.image_data else 0
+        image_end = len(agent_data.image_data) if agent_data.image_data else image_start
+        self._record_web_osgym_step(
+            agent_data,
+            phase="tool_parse_error",
+            image_start=image_start,
+            image_end=image_end,
+            text=feedback_text,
+            text_len=len(feedback_text),
+            terminal=False,
+            termination_reason=None,
+            actions=[],
+        )
+        agent_data.messages.append(message)
+        agent_data.prompt_ids += response_ids
+        agent_data.response_mask += [0] * len(response_ids)
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs += [0.0] * len(response_ids)
+        agent_data.user_turns += 1
+        return AgentState.GENERATING
+
     async def _handle_generating_state(
         self,
         agent_data: AgentData,
@@ -725,6 +774,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             active_tools = getattr(agent_data, "_active_tools", self.tools)
             tools = [tool.tool_schema for tool in active_tools.values()]
             _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+            parse_error = getattr(self.tool_parser, "last_parse_error", None)
             latest_step_idx = int((agent_data.extra_fields.get("web_osgym_steps") or [{}])[-1].get("step_idx", 0))
             self._record_web_osgym_assistant_turn(
                 agent_data,
@@ -734,7 +784,12 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 response_text=self._decode_response_text(agent_data.response_ids),
                 actions=self._trace_actions_from_tool_calls(agent_data),
             )
-            next_state = AgentState.PROCESSING_TOOLS if agent_data.tool_calls else AgentState.TERMINATED
+            if agent_data.tool_calls:
+                next_state = AgentState.PROCESSING_TOOLS
+            elif parse_error is not None:
+                next_state = await self._handle_tool_parse_error(agent_data, parse_error)
+            else:
+                next_state = AgentState.TERMINATED
 
         if next_state == AgentState.TERMINATED and "web_osgym_reward_score" not in agent_data.extra_fields:
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")

@@ -41,11 +41,24 @@ class FunctionCall(BaseModel):
     """The name of the function to call."""
 
 
+class ToolParseError(BaseModel):
+    kind: str
+    message: str
+
+
+class _RecoverableToolParseError(ValueError):
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
 class ToolParser(ABC):
     _registry: dict[str, type["ToolParser"]] = {}
 
     def __init__(self, tokenizer) -> None:
         self.tokenizer = tokenizer
+        self.last_parse_error: ToolParseError | None = None
 
     @abstractmethod
     async def extract_tool_calls(
@@ -92,6 +105,7 @@ class HermesToolParser(ToolParser):
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
+        self.last_parse_error = None
         loop = get_event_loop()
         text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
@@ -141,6 +155,7 @@ class GptOssToolParser(ToolParser):
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
+        self.last_parse_error = None
         loop = get_event_loop()
         # We need to keep special tokens for gpt-oss model for better tool call extraction.
         text = await loop.run_in_executor(None, lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False))
@@ -196,7 +211,7 @@ class Qwen3XMLToolParser(ToolParser):
         self, function_call_str: str, tools: Optional[list[OpenAIFunctionToolSchema]]
     ) -> FunctionCall:
         def get_arguments_config(func_name: str) -> dict:
-            for config in tools:
+            for config in tools or []:
                 if config.type == "function" and config.function.name == func_name:
                     properties = config.function.parameters.properties
                     return {k: v.model_dump() for k, v in properties.items()}
@@ -277,13 +292,21 @@ class Qwen3XMLToolParser(ToolParser):
                 return param_value
 
         # Extract function name
-        end_index = function_call_str.index(">")
+        parameter_start = function_call_str.find("<parameter=")
+        newline_start = function_call_str.find("\n")
+        tag_boundary_candidates = [idx for idx in (parameter_start, newline_start) if idx >= 0]
+        tag_boundary = min(tag_boundary_candidates) if tag_boundary_candidates else len(function_call_str)
+        end_index = function_call_str.find(">")
+        if end_index < 0 or end_index > tag_boundary:
+            raise _RecoverableToolParseError("tool_tag_incomplete", "a tool-call tag is incomplete.")
         function_name = function_call_str[:end_index]
         param_config = get_arguments_config(function_name)
         parameters = function_call_str[end_index + 1 :]
         param_dict = {}
         for match in self.tool_call_parameter_regex.findall(parameters):
             match_text = match[0] if match[0] else match[1]
+            if ">" not in match_text:
+                raise _RecoverableToolParseError("parameter_block_malformed", "the parameter block is malformed.")
             idx = match_text.index(">")
             param_name = match_text[:idx]
             param_value = str(match_text[idx + 1 :])
@@ -294,7 +317,54 @@ class Qwen3XMLToolParser(ToolParser):
                 param_value = param_value[:-1]
 
             param_dict[param_name] = convert_param_value(param_value, param_name, param_config, function_name)
+        if function_name == "computer":
+            if "actions" not in param_dict:
+                raise _RecoverableToolParseError("parameter_block_malformed", "the parameter block is malformed.")
+            if not isinstance(param_dict["actions"], list):
+                raise _RecoverableToolParseError("actions_json_malformed", "the actions JSON is malformed.")
         return FunctionCall(name=function_name, arguments=json.dumps(param_dict, ensure_ascii=False))
+
+    @staticmethod
+    def _extract_actions_body(model_output: str) -> str | None:
+        marker = "<parameter=actions>"
+        start = model_output.find(marker)
+        if start < 0:
+            return None
+        start += len(marker)
+        end = model_output.find("</parameter>", start)
+        if end < 0:
+            return model_output[start:]
+        return model_output[start:end]
+
+    def _classify_parse_error(self, model_output: str, exc: Exception) -> ToolParseError:
+        if isinstance(exc, _RecoverableToolParseError):
+            return ToolParseError(kind=exc.kind, message=exc.message)
+
+        actions_body = self._extract_actions_body(model_output)
+        if actions_body and "<parameter=" in actions_body:
+            return ToolParseError(
+                kind="parameter_block_malformed",
+                message="the parameter block is malformed.",
+            )
+        if actions_body is not None:
+            return ToolParseError(
+                kind="actions_json_malformed",
+                message="the actions JSON is malformed.",
+            )
+        if any(marker in model_output for marker in ("<tool_response>", "useruser", "\nuser\n", "\nassistant\n")):
+            return ToolParseError(
+                kind="extra_chat_text_mixed",
+                message="extra chat text was mixed into the tool-call response.",
+            )
+        if any(marker in model_output for marker in (self.tool_call_start_token, self.tool_call_prefix, "<parameter=")):
+            return ToolParseError(
+                kind="tool_tag_incomplete",
+                message="a tool-call tag is incomplete.",
+            )
+        return ToolParseError(
+            kind="unknown_parse_error",
+            message="the tool call could not be parsed.",
+        )
 
     def _get_function_calls(self, model_output: str) -> list[str]:
         # Find all tool calls
@@ -316,6 +386,7 @@ class Qwen3XMLToolParser(ToolParser):
     async def extract_tool_calls(
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
+        self.last_parse_error = None
         loop = get_event_loop()
         text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
         if self.tool_call_start_token not in text:
@@ -337,5 +408,6 @@ class Qwen3XMLToolParser(ToolParser):
 
             return content, tool_calls
         except Exception as e:
+            self.last_parse_error = self._classify_parse_error(text, e)
             logger.exception(f"Error in extracting tool call from response: {e}")
             return text, []

@@ -12,7 +12,7 @@ import verl.experimental.agent_loop.web_skd_agent_loop as web_skd_agent_loop_mod
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
-from verl.experimental.agent_loop.tool_parser import FunctionCall
+from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParseError
 from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.tools.base_tool import ToolResponse
 
@@ -975,6 +975,107 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_response_budget_exhausted")
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+
+    async def test_tool_parse_error_adds_recovery_observation(self):
+        loop = _build_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        async def _fake_apply_chat_template(messages, **kwargs):
+            remove_system_prompt = kwargs.get("remove_system_prompt", False)
+            if remove_system_prompt:
+                return [71, 72]
+            if messages and messages[-1]["role"] == "tool":
+                return [1, 2, 3, 71, 72]
+            return [1, 2, 3]
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            del kwargs
+            if messages and messages[-1]["role"] == "tool":
+                return [21, 22]
+            return [1, 2, 3]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-parse-recovery",
+            tools_kwargs={},
+        )
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.response_logprobs = []
+        agent_data.extra_fields.update(
+            {
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+            }
+        )
+
+        state = await WebSkdAgentLoop._handle_tool_parse_error(
+            loop,
+            agent_data,
+            ToolParseError(kind="actions_json_malformed", message="the actions JSON is malformed."),
+        )
+
+        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(agent_data.user_turns, 1)
+        self.assertEqual(agent_data.extra_fields["tool_parse_error_retry_count"], 1)
+        self.assertEqual(agent_data.metrics["tool_parse_error"], 1)
+        self.assertIn("Invalid tool call format: the actions JSON is malformed.", agent_data.messages[-1]["content"])
+        self.assertIn("Below is an example of a valid tool call format:", agent_data.messages[-1]["content"])
+        self.assertEqual(agent_data.prompt_ids, [1, 2, 3, 71, 72])
+        self.assertEqual(agent_data.response_mask, [0, 0])
+        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 71, 72])
+        self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[0, 0, 0, 0], [0, 0, 0, 0]])
+        self.assertEqual(agent_data.extra_fields["teacher_logprobs_list"], [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+
+    async def test_tool_parse_error_terminates_after_retry_budget_is_used(self):
+        loop = _build_loop()
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="req-parse-recovery-budget",
+            tools_kwargs={},
+        )
+        agent_data.prompt_ids = [1, 2, 3]
+        agent_data.response_mask = []
+        agent_data.extra_fields.update(
+            {
+                "teacher_prompt_ids": [1, 2, 3],
+                "teacher_server_prompt_ids": [1, 2, 3],
+                "server_prompt_ids": [1, 2, 3],
+                "teacher_sglang_prefix_surplus": 0,
+                "teacher_ids_list": [],
+                "teacher_logprobs_list": [],
+                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "tool_parse_error_retry_count": 1,
+            }
+        )
+        before_messages = deepcopy(agent_data.messages)
+        before_prompt_ids = list(agent_data.prompt_ids)
+        before_response_mask = list(agent_data.response_mask)
+
+        state = await WebSkdAgentLoop._handle_tool_parse_error(
+            loop,
+            agent_data,
+            ToolParseError(kind="tool_tag_incomplete", message="a tool-call tag is incomplete."),
+        )
+
+        self.assertEqual(state, AgentState.TERMINATED)
+        self.assertEqual(agent_data.messages, before_messages)
+        self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
+        self.assertEqual(agent_data.response_mask, before_response_mask)
 
     async def test_tool_observation_commit_is_atomic(self):
         loop = _build_loop()

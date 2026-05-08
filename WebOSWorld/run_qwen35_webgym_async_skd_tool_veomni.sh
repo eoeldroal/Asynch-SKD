@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-cd /home/sogang_nlpy/verl
-
 # Known-good actor profile for the Qwen3.5 WebGym SKD setup.
 # The decisive stall fix was upgrading cuDNN from 9.10.2 to 9.15.1.9 in the
 # cloned training env; the settings below are the matched runtime profile that
@@ -39,7 +37,7 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     data.train_batch_size=16 \
     data.max_prompt_length=2048 \
-    data.max_response_length=32768 \
+    data.max_response_length=24576 \
     data.filter_overlong_prompts=True \
     data.filter_overlong_prompts_workers=64 \
     data.truncation=error \
@@ -75,11 +73,9 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.log_prob_min_clamp=-10.0 \
     distillation.skd.chunk_size=128 \
     distillation.skd.verify_top_k=5 \
-    distillation.skd.max_chunks_per_sample=256 \
+    distillation.skd.max_chunks_per_sample=192 \
     "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
-    distillation.skd.windowed_training_enabled=True \
-    distillation.skd.window_history_n=3 \
-    distillation.skd.window_max_images_per_sample=4 \
+    distillation.skd.windowed_training_enabled=False \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
@@ -118,17 +114,17 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.calculate_entropy=False \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=12288 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     actor_rollout_ref.actor.veomni.param_offload=True \
     actor_rollout_ref.actor.veomni.optimizer_offload=True \
     actor_rollout_ref.actor.veomni.enable_full_shard=True \
-    actor_rollout_ref.actor.veomni.ulysses_parallel_size=2 \
+    actor_rollout_ref.actor.veomni.ulysses_parallel_size=4 \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
     'trainer.logger=["console","wandb"]' \
-    trainer.project_name=verl_async_skd_qwen35_webgym_counter_tool_veomni \
-    trainer.experiment_name=qwen35_9b_to_27b_async_skd_webgym_counter_tool \
-    trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym_counter_tool_veomni/qwen35_9b_to_27b_async_skd_webgym_counter_tool \
+    trainer.project_name=verl_async_skd_qwen35_webgym \
+    trainer.experiment_name=qwen35_9b_to_27b_async_skd_webgym \
+    trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool \
     trainer.rollout_data_dir=/home/sogang_nlpy/verl/logs/rollout_data/webgym_async_skd_current \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
