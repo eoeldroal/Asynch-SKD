@@ -175,10 +175,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         image_data: list[Any] | None,
     ) -> list[int]:
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        teacher_images = self._teacher_images_with_runtime(image_data)
         return await self.apply_chat_template(
             teacher_messages,
             tools=schemas,
-            images=image_data,
+            images=teacher_images,
             videos=agent_data.video_data,
         )
 
@@ -193,10 +194,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
     ) -> tuple[list[int], list[int], int]:
         server_prompt_ids = await self._recompute_server_prompt_ids(agent_data, student_messages)
         teacher_server_prompt_ids = await self._recompute_teacher_server_prompt_ids(agent_data, teacher_messages)
+        teacher_images = self._teacher_images_with_runtime(image_data)
         teacher_sglang_prefix_surplus = self._multimodal_prefix_surplus_delta(
             teacher_prompt_ids,
             teacher_server_prompt_ids,
-            image_data,
+            teacher_images,
         )
         return server_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
 
@@ -218,10 +220,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             agent_data,
             teacher_messages,
         )
+        teacher_images = self._teacher_images_with_runtime(image_data)
         teacher_sglang_prefix_surplus = self._multimodal_prefix_surplus_delta(
             committed_teacher_prompt_ids,
             teacher_server_prompt_ids,
-            image_data,
+            teacher_images,
         )
         turn_tokens = list(turn_state.tokens)
         teacher_prompt_ids = list(committed_teacher_prompt_ids) + turn_tokens
@@ -475,10 +478,11 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             image_count=_safe_len(next_image_data),
         )
         teacher_template_t0 = time.monotonic()
+        teacher_images = self._teacher_images_with_runtime(next_image_data)
         teacher_prompt_ids = await self.apply_chat_template(
             teacher_template_messages,
             tools=schemas,
-            images=next_image_data,
+            images=teacher_images,
             videos=agent_data.video_data,
         )
         teacher_template_ms = (time.monotonic() - teacher_template_t0) * 1000

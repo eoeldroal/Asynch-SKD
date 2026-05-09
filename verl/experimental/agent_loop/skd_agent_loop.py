@@ -42,6 +42,7 @@ from verl.experimental.agent_loop.agent_loop import (
     register,
     rollout_trace_op,
 )
+from verl.experimental.agent_loop.teacher_fewshot import load_teacher_fewshot_transcript
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.async_skd.events import emit_async_skd_event
 from verl.experimental.async_skd.state import SkdPartialState
@@ -205,12 +206,14 @@ class SkdAgentLoop(ToolAgentLoop):
         self.skd_verify_top_k = skd_config.get("verify_top_k", 25)
         self.max_chunks_per_sample = skd_config.get("max_chunks_per_sample", 60)
         self.teacher_system_prompt_path = skd_config.get("teacher_system_prompt_path")
+        self.teacher_fewshot_path = skd_config.get("teacher_fewshot_path")
         self.teacher_key = distillation_config.get("teacher_key", "data_source")
 
         # Loss top-K for teacher logprobs accumulation (from distillation_loss config)
         loss_config = distillation_config.get("distillation_loss", {})
         self.loss_top_k = loss_config.get("topk", 128)
         self.teacher_system_prompt = self._load_teacher_system_prompt()
+        self.teacher_fewshot_messages, self.teacher_fewshot_images = self._load_teacher_fewshot()
 
         if self.teacher_server_manager is None:
             raise ValueError("SkdAgentLoop requires teacher_server_manager for teacher verification")
@@ -222,6 +225,20 @@ class SkdAgentLoop(ToolAgentLoop):
         prompt_path = Path(self.teacher_system_prompt_path).expanduser()
         teacher_text = prompt_path.read_text(encoding="utf-8").strip()
         return teacher_text or None
+
+    def _load_teacher_fewshot(self) -> tuple[list[dict[str, Any]], list[Any] | None]:
+        if not self.teacher_fewshot_path:
+            return [], None
+        messages, images = load_teacher_fewshot_transcript(self.teacher_fewshot_path)
+        return messages, images
+
+    def _teacher_images_with_runtime(self, runtime_images: list[Any] | None) -> list[Any] | None:
+        if not self.teacher_fewshot_images:
+            return runtime_images
+        merged = list(self.teacher_fewshot_images)
+        if runtime_images:
+            merged.extend(runtime_images)
+        return merged
 
     def _safe_decode_token(self, token_id: int) -> str:
         try:
@@ -340,21 +357,23 @@ class SkdAgentLoop(ToolAgentLoop):
         """Merge teacher-only system guidance into the initial conversation."""
         teacher_messages = deepcopy(messages)
         teacher_system_prompt = getattr(self, "teacher_system_prompt", None)
-        if not teacher_system_prompt:
-            return teacher_messages
+        if teacher_system_prompt:
+            if teacher_messages and teacher_messages[0].get("role") == "system":
+                content = teacher_messages[0].get("content")
+                if isinstance(content, str):
+                    merged = content.rstrip()
+                    if merged:
+                        merged = f"{merged}\n\n{teacher_system_prompt}"
+                    else:
+                        merged = teacher_system_prompt
+                    teacher_messages[0]["content"] = merged
+            else:
+                teacher_messages.insert(0, {"role": "system", "content": teacher_system_prompt})
 
-        if teacher_messages and teacher_messages[0].get("role") == "system":
-            content = teacher_messages[0].get("content")
-            if isinstance(content, str):
-                merged = content.rstrip()
-                if merged:
-                    merged = f"{merged}\n\n{teacher_system_prompt}"
-                else:
-                    merged = teacher_system_prompt
-                teacher_messages[0]["content"] = merged
-                return teacher_messages
-
-        teacher_messages.insert(0, {"role": "system", "content": teacher_system_prompt})
+        teacher_fewshot_messages = getattr(self, "teacher_fewshot_messages", None) or []
+        if teacher_fewshot_messages:
+            insert_at = 1 if teacher_messages and teacher_messages[0].get("role") == "system" else 0
+            teacher_messages[insert_at:insert_at] = deepcopy(teacher_fewshot_messages)
         return teacher_messages
 
     async def _init_boundary_agent_data(self, **kwargs: Any) -> AgentData:
@@ -1065,13 +1084,14 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data.prompt_ids = prompt_ids
 
         teacher_messages = self._build_teacher_messages(agent_data.messages)
+        teacher_images = self._teacher_images_with_runtime(agent_data.image_data)
         if teacher_messages == agent_data.messages:
             teacher_prompt_ids = list(prompt_ids)
         else:
             teacher_prompt_ids = await self.apply_chat_template(
                 teacher_messages,
                 tools=schemas,
-                images=agent_data.image_data,
+                images=teacher_images,
                 videos=agent_data.video_data,
             )
         agent_data.extra_fields["teacher_prompt_ids"] = teacher_prompt_ids

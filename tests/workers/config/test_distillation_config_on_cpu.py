@@ -75,9 +75,9 @@ def test_distillation_teacher_budget_adds_margin_when_teacher_prompt_enabled():
     distill_cfg = _make_distillation_config(teacher_system_prompt_path="/tmp/teacher_prompt.txt")
 
     teacher = distill_cfg.teacher_models["default"]
-    assert teacher.inference.max_model_len == 9217
-    assert teacher.inference.max_num_batched_tokens == 9217
-    assert teacher.inference.prompt_length == 9216
+    assert teacher.inference.max_model_len == 12801
+    assert teacher.inference.max_num_batched_tokens == 12801
+    assert teacher.inference.prompt_length == 12800
     assert teacher.inference.response_length == 1
 
 

@@ -9,6 +9,7 @@ from unittest.mock import patch
 from PIL import Image
 
 import verl.experimental.agent_loop.web_skd_agent_loop as web_skd_agent_loop_module
+from verl.experimental.agent_loop.teacher_fewshot import load_teacher_fewshot_transcript
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop, SkdTurnChunkState
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState
@@ -119,6 +120,8 @@ def _build_loop():
     loop.tool_parser_name = "qwen3_coder"
     loop.processor = None
     loop.apply_chat_template_kwargs = {}
+    loop.teacher_fewshot_messages = []
+    loop.teacher_fewshot_images = None
 
     async def _fake_apply_server_chat_template(messages, **kwargs):
         return [21, 22]
@@ -141,6 +144,55 @@ async def _derive_request_views(loop, agent_data):
 
 
 class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
+    def test_load_teacher_fewshot_transcript_replaces_image_paths_with_placeholders(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            image_path = tmp_path / "step1.png"
+            Image.new("RGB", (4, 5), "purple").save(image_path)
+            transcript_path = tmp_path / "teacher_fewshot.json"
+            transcript_path.write_text(
+                json.dumps(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "task"},
+                                    {"type": "image", "image": "step1.png"},
+                                ],
+                            },
+                            {
+                                "role": "assistant",
+                                "content": "<think>fewshot</think>\n<tool_call>...</tool_call>",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            messages, images = load_teacher_fewshot_transcript(transcript_path)
+
+        self.assertEqual(
+            messages,
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "task"},
+                        {"type": "image"},
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": "<think>fewshot</think>\n<tool_call>...</tool_call>",
+                },
+            ],
+        )
+        self.assertIsNotNone(images)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0].size, (4, 5))
+
     def test_web_skd_agent_is_still_skd(self):
         self.assertTrue(issubclass(WebSkdAgentLoop, SkdAgentLoop))
 
@@ -183,6 +235,102 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(ValueError, "web_osgym_teacher_messages"):
             loop._resolve_request_prompt_inputs_from_agent_state(agent_data)
+
+    def test_resolve_request_prompt_inputs_prepends_teacher_fewshot_and_teacher_images_only(self):
+        loop = _build_loop()
+        loop.teacher_system_prompt = "teacher-system"
+        fewshot_image = Image.new("RGB", (2, 2), "blue")
+        loop.teacher_fewshot_messages = [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "fewshot user"}]},
+            {"role": "assistant", "content": "<think>fewshot</think>\n<tool_call>...</tool_call>"},
+            {"role": "tool", "content": [{"type": "text", "text": "<tool_response>ok</tool_response>"}]},
+        ]
+        loop.teacher_fewshot_images = [fewshot_image]
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "student-task"}],
+            image_data=["runtime-image"],
+            video_data=[],
+            metrics={},
+            request_id="req-fewshot-resolve",
+            tools_kwargs={},
+        )
+        agent_data.extra_fields["web_osgym_teacher_messages"] = [{"role": "user", "content": "teacher-task"}]
+        agent_data.extra_fields["teacher_prompt_ids"] = [101, 102, 103]
+
+        student_messages, teacher_messages, teacher_prompt_ids, image_data = (
+            loop._resolve_request_prompt_inputs_from_agent_state(agent_data)
+        )
+
+        self.assertEqual(student_messages, [{"role": "user", "content": "student-task"}])
+        self.assertEqual(teacher_messages[0], {"role": "system", "content": "teacher-system"})
+        self.assertEqual(teacher_messages[1:4], loop.teacher_fewshot_messages)
+        self.assertEqual(teacher_messages[4], {"role": "user", "content": "teacher-task"})
+        self.assertEqual(teacher_prompt_ids, [101, 102, 103])
+        self.assertEqual(image_data, ["runtime-image"])
+
+    async def test_build_request_prompt_views_uses_teacher_fewshot_images_only_for_teacher(self):
+        loop = _build_loop()
+        fewshot_image = Image.new("RGB", (2, 2), "green")
+        runtime_image = Image.new("RGB", (3, 3), "red")
+        loop.teacher_fewshot_messages = [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "fewshot user"}]},
+            {"role": "assistant", "content": "<think>fewshot</think>\n<tool_call>...</tool_call>"},
+        ]
+        loop.teacher_fewshot_images = [fewshot_image]
+
+        apply_calls = []
+
+        async def _fake_apply_chat_template(messages, images=None, videos=None, remove_system_prompt=False, tools=None):
+            del videos, remove_system_prompt, tools
+            apply_calls.append(
+                {
+                    "messages": deepcopy(messages),
+                    "images": list(images) if images is not None else None,
+                }
+            )
+            return [11, 12, 13]
+
+        async def _fake_apply_server_chat_template(messages, **kwargs):
+            del kwargs
+            apply_calls.append(
+                {
+                    "messages": deepcopy(messages),
+                    "images": "server",
+                }
+            )
+            return [21, 22, 23]
+
+        loop.apply_chat_template = _fake_apply_chat_template
+        loop._apply_server_chat_template = _fake_apply_server_chat_template
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "student-task"}],
+            image_data=[runtime_image],
+            video_data=[],
+            metrics={},
+            request_id="req-fewshot-images",
+            tools_kwargs={},
+        )
+        agent_data.extra_fields["web_osgym_teacher_messages"] = [{"role": "user", "content": "teacher-task"}]
+        agent_data.extra_fields["teacher_prompt_ids"] = [101, 102, 103]
+
+        await loop._build_request_prompt_views_from_turn_state(
+            agent_data,
+            SkdTurnChunkState(
+                tokens=[],
+                teacher_ids_rows=[],
+                teacher_logprobs_rows=[],
+                raw_chunk=[],
+                verified_chunk=[],
+            ),
+        )
+
+        hf_calls = [call for call in apply_calls if call["images"] != "server"]
+        self.assertEqual(len(hf_calls), 1)
+        # teacher recompute sees teacher few-shot images prepended ahead of runtime images
+        self.assertEqual(hf_calls[0]["images"], [fewshot_image, runtime_image])
 
     def test_resolve_tool_processing_commit_inputs_requires_teacher_messages(self):
         loop = _build_loop()

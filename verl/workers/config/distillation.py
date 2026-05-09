@@ -27,7 +27,7 @@ __all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "SkdConfi
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-_TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET = 512
+_TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET = 4096
 
 
 @dataclass
@@ -242,6 +242,7 @@ class SkdConfig(BaseConfig):
     verify_top_k: int = 25
     max_chunks_per_sample: int = 60
     teacher_system_prompt_path: Optional[str] = None
+    teacher_fewshot_path: Optional[str] = None
     windowed_training_enabled: bool = False
     window_history_n: int = 5
     window_max_images_per_sample: Optional[int] = 6
