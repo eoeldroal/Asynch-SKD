@@ -460,7 +460,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
     def _decode_response_text(self, token_ids: list[int]) -> str:
         decode = getattr(self.tokenizer, "decode", None)
         if callable(decode):
-            return str(decode(token_ids, skip_special_tokens=True)).strip()
+            return str(decode(token_ids, skip_special_tokens=False)).strip()
         return ""
 
     def _latest_web_osgym_assistant_turn(self, agent_data: AgentData) -> dict[str, Any] | None:
@@ -484,6 +484,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         session_dir = logger_obj.session_dir(
             task_id=agent_data.extra_fields.get("web_osgym_task_id"),
             sample_uid=agent_data.extra_fields.get("web_osgym_sample_uid"),
+            global_step=agent_data.extra_fields.get("global_steps"),
             session_id=agent_data.extra_fields.get("web_osgym_session_id"),
         )
         agent_data.extra_fields["web_osgym_trajectory_dir"] = str(session_dir)
@@ -594,6 +595,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             {
                 "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
                 "sample_uid": agent_data.extra_fields.get("web_osgym_sample_uid"),
+                "global_step": agent_data.extra_fields.get("global_steps"),
                 "session_id": agent_data.extra_fields.get("web_osgym_session_id"),
                 "request_id": agent_data.request_id,
                 "reward_score": agent_data.extra_fields.get("web_osgym_reward_score"),

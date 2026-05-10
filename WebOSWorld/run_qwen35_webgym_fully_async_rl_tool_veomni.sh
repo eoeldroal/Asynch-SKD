@@ -3,7 +3,8 @@ set -xeuo pipefail
 
 cd /home/sogang_nlpy/verl
 
-ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni
+RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_${RUN_TIMESTAMP}
 # The referenced parquet files are the fully async RL copies generated from:
 #   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json
 # with localhost tasks included, via:
@@ -34,7 +35,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_40/actor/huggingface \
+    actor_rollout_ref.model.path=/home/sogang_nlpy/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \

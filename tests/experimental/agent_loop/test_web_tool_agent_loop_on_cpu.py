@@ -1112,6 +1112,7 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
                 "web_osgym_task_id": "12345",
                 "web_osgym_session_id": 777,
                 "web_osgym_include_a11y": False,
+                "global_steps": 0,
                 "web_osgym_generation_windows": [
                     {
                         "prompt_ids": [11, 12],
@@ -1149,7 +1150,7 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
         next_state = await loop._handle_processing_tools_state(agent_data)
 
         assert next_state == AgentState.GENERATING
-        session_dir = tmp_path / "12345___uid-123___777"
+        session_dir = tmp_path / "12345___uid-123___global_step_0___777"
         trajectory_path = session_dir / "trajectory.jsonl"
         assert trajectory_path.exists()
         events = [json.loads(line) for line in trajectory_path.read_text().splitlines()]
@@ -1191,6 +1192,7 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
             "web_osgym_task_id": "prozilla_explorer_11",
             "web_osgym_session_id": 987,
             "web_osgym_sample_uid": "uid-xyz",
+            "global_steps": 3,
             "web_osgym_reward_score": 1.0,
             "web_osgym_termination_reason": "model_done",
             "web_osgym_trajectory_counts": {"invalid_action_count": 2, "parse_error_count": 1, "event_count": 4},
@@ -1199,11 +1201,12 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
 
     loop._write_web_osgym_summary(agent_data)
 
-    summary_path = tmp_path / "prozilla_explorer_11___uid-xyz___987" / "summary.json"
+    summary_path = tmp_path / "prozilla_explorer_11___uid-xyz___global_step_3___987" / "summary.json"
     assert summary_path.exists()
     summary = json.loads(summary_path.read_text())
     assert summary["task_id"] == "prozilla_explorer_11"
     assert summary["sample_uid"] == "uid-xyz"
+    assert summary["global_step"] == 3
     assert summary["session_id"] == 987
     assert summary["reward_score"] == 1.0
     assert summary["termination_reason"] == "model_done"
@@ -1214,7 +1217,7 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
     assert summary["has_reward"] is True
 
 
-def test_decode_response_text_hides_special_tokens():
+def test_decode_response_text_preserves_special_tokens():
     loop = _make_loop()
     captured = {}
 
@@ -1227,4 +1230,4 @@ def test_decode_response_text_hides_special_tokens():
     result = loop._decode_response_text([1, 2, 3])
 
     assert result == "readable text"
-    assert captured["skip_special_tokens"] is True
+    assert captured["skip_special_tokens"] is False
