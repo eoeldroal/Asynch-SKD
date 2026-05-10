@@ -75,6 +75,14 @@ WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS = {
     "web_osgym_include_a11y",
     "web_osgym_reward_fetched",
 }
+EXPORTED_EXTRA_FIELD_DEFAULTS = {
+    "turn_scores": None,
+    "tool_rewards": None,
+    "min_global_steps": None,
+    "max_global_steps": None,
+    "extras": None,
+    "tool_parse_error_retry_count": 0,
+}
 
 
 def _trace_async_skd(stage: str, **fields: Any) -> None:
@@ -1354,23 +1362,19 @@ class AgentLoopWorker:
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
         metrics = [input.metrics.model_dump() for input in inputs]
-        # Collect extra fields from all inputs and convert them to np.ndarray
-        # Keep a stable set of keys so downstream batch concat stays consistent across agent loops.
+        # Collect extra fields from all inputs and convert them to np.ndarray.
+        # Stable exported fields get explicit defaults so downstream batch concat
+        # sees the same non-tensor schema even when a field is only populated on
+        # a subset of samples.
         extra_fields = {}
         exported_extra_fields = [_filter_exported_extra_fields(input.extra_fields) for input in inputs]
-        default_extra_keys = {
-            "turn_scores",
-            "tool_rewards",
-            "min_global_steps",
-            "max_global_steps",
-            "extras",
-        }
-        all_keys = set(key for fields in exported_extra_fields for key in fields) | default_extra_keys
+        all_keys = set(key for fields in exported_extra_fields for key in fields) | set(EXPORTED_EXTRA_FIELD_DEFAULTS)
         for key in all_keys:
             if key in hard_identity_keys:
                 continue
             temp_arr = np.empty(len(inputs), dtype=object)
-            temp_arr[:] = [fields.get(key) for fields in exported_extra_fields]
+            default_value = EXPORTED_EXTRA_FIELD_DEFAULTS.get(key)
+            temp_arr[:] = [fields.get(key, default_value) for fields in exported_extra_fields]
             extra_fields[key] = temp_arr
 
         non_tensor_batch.update(extra_fields)

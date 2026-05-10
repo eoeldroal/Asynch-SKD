@@ -218,6 +218,17 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
         response_len=len(out.response_ids),
     )
 
+    internal_b = _to_internal(
+        output_prompt_ids=out.prompt_ids,
+        output_response_ids=out.response_ids,
+        output_response_mask=out.response_mask,
+        metrics=out.metrics,
+        extra_fields={**out.extra_fields, "tool_parse_error_retry_count": 2},
+        num_turns=out.num_turns,
+        prompt_len=len(out.prompt_ids),
+        response_len=len(out.response_ids),
+    )
+
     # Mimic two "worker chunks" and concatenate as in training.
     dummy_worker = type(
         "_DummyWorker",
@@ -226,10 +237,10 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     )()
     merged = AgentLoopWorker._postprocess(
         dummy_worker,
-        inputs=[internal_a],
+        inputs=[internal_a, internal_b],
         input_non_tensor_batch={
-            "index": np.array([0], dtype=object),
-            "agent_name": np.array(["single_turn_agent"], dtype=object),
+            "index": np.array([0, 1], dtype=object),
+            "agent_name": np.array(["single_turn_agent", "single_turn_agent"], dtype=object),
         },
     )
 
@@ -240,16 +251,19 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
         "min_global_steps",
         "max_global_steps",
         "extras",
+        "tool_parse_error_retry_count",
     )
     for key in stable_keys:
         assert key in merged.non_tensor_batch, f"missing key in merged batch: {key}"
-        assert merged.non_tensor_batch[key].shape == (1,), (
+        assert merged.non_tensor_batch[key].shape == (2,), (
             f"invalid shape for {key}: {merged.non_tensor_batch[key].shape}"
         )
 
     # And the list-typed fields are actually lists (not missing / scalar).
     assert merged.non_tensor_batch["turn_scores"][0] == []
     assert merged.non_tensor_batch["tool_rewards"][0] == []
+    assert merged.non_tensor_batch["tool_parse_error_retry_count"][0] == 0
+    assert merged.non_tensor_batch["tool_parse_error_retry_count"][1] == 2
 
 
 @pytest.mark.asyncio
