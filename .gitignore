@@ -136,3 +136,5 @@ flash_attn-*.whl
 flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl.1
 .gitignore
 flash_attn-2.8.1+cu12torch2.8cxx11abiFALSE-cp312-cp312-linux_x86_64.whl.2
+nohup.out
+nohup.out
