@@ -772,7 +772,7 @@ class RayPPOTrainer:
         """
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
@@ -791,6 +791,15 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    @staticmethod
+    def _should_skip_rollout_data_dump_for_webgym_rl(
+        batch: DataProto,
+        reward_extra_infos_dict: dict[str, list] | None,
+    ) -> bool:
+        if reward_extra_infos_dict and "web_osgym_termination_reason" in reward_extra_infos_dict:
+            return True
+        return "web_osgym_termination_reason" in getattr(batch, "non_tensor_batch", {})
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1969,7 +1978,9 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    if rollout_data_dir and not self._should_skip_rollout_data_dump_for_webgym_rl(
+                        batch, reward_extra_infos_dict
+                    ):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate

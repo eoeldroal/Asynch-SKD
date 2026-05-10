@@ -483,6 +483,44 @@ def test_generation_uses_compact_server_prompt_ids_for_image_bearing_sglang_requ
     asyncio.run(_run())
 
 
+def test_non_window_generation_builds_compact_server_prompt_ids_for_image_bearing_sglang_requests():
+    async def _run():
+        loop = _make_loop()
+        loop.rollout_config = SimpleNamespace(
+            name="sglang",
+            skip_tokenizer_init=False,
+            custom={},
+            multi_turn=SimpleNamespace(
+                web_osgym_window_enable=False,
+                web_osgym_window_history_n=1,
+                web_osgym_window_max_images_per_sample=6,
+            ),
+        )
+
+        compact_prompt_ids = [41, 42]
+
+        async def _fake_build_server_prompt_ids(*, messages, images, tools):
+            del messages, tools
+            assert images == ["image-1"]
+            return compact_prompt_ids
+
+        loop._build_server_prompt_ids = _fake_build_server_prompt_ids
+
+        agent_data = _agent_data(_FakeWebTool())
+        agent_data.messages = [{"role": "user", "content": "task"}]
+        agent_data.prompt_ids = [301, 302, 303, 304]
+        agent_data.image_data = ["image-1"]
+
+        generation_inputs = await loop._build_web_osgym_generation_inputs(agent_data)
+
+        assert generation_inputs.prompt_ids == [301, 302, 303, 304]
+        assert generation_inputs.server_prompt_ids == compact_prompt_ids
+        assert generation_inputs.images == ["image-1"]
+        assert generation_inputs.window_used is False
+
+    asyncio.run(_run())
+
+
 def test_pending_starts_one_session_and_hides_visual_a11y_from_student_text():
     async def _run():
         loop = _make_loop()
@@ -965,6 +1003,18 @@ def test_processing_updates_previous_action_history_with_postprocessed_actions()
                 ],
             }
         )
+        agent_data.extra_fields["web_osgym_assistant_turns"] = [
+            {
+                "assistant_turn": 1,
+                "user_turn": 0,
+                "observation_step_idx": 1,
+                "response_start": 0,
+                "response_end": 3,
+                "response_text": "Open the button panel",
+                "actions": [{"action_type": "CLICK", "x": 1, "y": 2}],
+            }
+        ]
+        agent_data.assistant_turns = 1
         tool._instance_dict["instance-1"] = {
             "task_id": "12345",
             "request_id": 777,
@@ -1055,6 +1105,7 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
         tool = _FakeImageObservationTool()
         agent_data = _agent_data(tool)
         agent_data.prompt_ids = [100]
+        agent_data.extra_fields["web_osgym_sample_uid"] = "uid-123"
         agent_data.extra_fields.update(
             {
                 "web_osgym_instance_id": "instance-1",
@@ -1073,6 +1124,18 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
                 ],
             }
         )
+        agent_data.extra_fields["web_osgym_assistant_turns"] = [
+            {
+                "assistant_turn": 1,
+                "user_turn": 0,
+                "observation_step_idx": 1,
+                "response_start": 0,
+                "response_end": 3,
+                "response_text": "Open the button panel",
+                "actions": [{"action_type": "CLICK", "x": 1, "y": 2}],
+            }
+        ]
+        agent_data.assistant_turns = 1
         tool._instance_dict["instance-1"] = {
             "task_id": "12345",
             "request_id": 777,
@@ -1086,18 +1149,18 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
         next_state = await loop._handle_processing_tools_state(agent_data)
 
         assert next_state == AgentState.GENERATING
-        event_files = list(tmp_path.glob("events_*.jsonl"))
-        assert len(event_files) == 1
-        event = json.loads(event_files[0].read_text().strip())
+        session_dir = tmp_path / "12345___uid-123___777"
+        trajectory_path = session_dir / "trajectory.jsonl"
+        assert trajectory_path.exists()
+        events = [json.loads(line) for line in trajectory_path.read_text().splitlines()]
+        assert len(events) == 1
+        event = events[0]
         assert event["session_id"] == 777
         assert event["task_id"] == "12345"
-        assert event["tool_calls"] == [
-            {
-                "name": "computer",
-                "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
-                "parsed_arguments": {"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]},
-            }
-        ]
+        assert event["sample_uid"] == "uid-123"
+        assert event["model_output_text"] == "Open the button panel"
+        assert event["tool_calls_raw"] == ['{"actions":[{"action_type":"CLICK","x":1,"y":2}]}']
+        assert event["tool_calls_parsed"] == [{"actions": [{"action_type": "CLICK", "x": 1, "y": 2}]}]
         assert event["actions"] == [{"action_type": "CLICK", "x": 1, "y": 2}]
         assert event["result"]["terminated"] is False
         assert event["prompt_window"] == {
@@ -1107,10 +1170,61 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
             "recent_assistant_turn_indices": [2],
             "text_only_recent_step_count": 1,
         }
-        assert event["observation"]["text"] == "A11Y_TREE:\nbutton"
-        assert event["observation"]["images"][0]["width"] == 3
-        assert event["observation"]["images"][0]["height"] == 2
-        image_path = tmp_path / event["observation"]["images"][0]["path"]
+        assert event["observation_text"] == "A11Y_TREE:\nbutton"
+        assert event["images"][0]["width"] == 3
+        assert event["images"][0]["height"] == 2
+        image_path = session_dir / event["image_paths"][0]
         assert image_path.exists()
 
     asyncio.run(_run())
+
+
+def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
+    monkeypatch.setenv("WEB_OSGYM_TOOL_TRACE_DIR", str(tmp_path))
+    loop = _make_loop()
+    agent_data = _agent_data(_FakeWebTool())
+    agent_data.request_id = "req-1"
+    agent_data.assistant_turns = 3
+    agent_data.user_turns = 2
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_task_id": "prozilla_explorer_11",
+            "web_osgym_session_id": 987,
+            "web_osgym_sample_uid": "uid-xyz",
+            "web_osgym_reward_score": 1.0,
+            "web_osgym_termination_reason": "model_done",
+            "web_osgym_trajectory_counts": {"invalid_action_count": 2, "parse_error_count": 1, "event_count": 4},
+        }
+    )
+
+    loop._write_web_osgym_summary(agent_data)
+
+    summary_path = tmp_path / "prozilla_explorer_11___uid-xyz___987" / "summary.json"
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text())
+    assert summary["task_id"] == "prozilla_explorer_11"
+    assert summary["sample_uid"] == "uid-xyz"
+    assert summary["session_id"] == 987
+    assert summary["reward_score"] == 1.0
+    assert summary["termination_reason"] == "model_done"
+    assert summary["invalid_action_count"] == 2
+    assert summary["parse_error_count"] == 1
+    assert summary["event_count"] == 4
+    assert summary["completed"] is True
+    assert summary["has_reward"] is True
+
+
+def test_decode_response_text_hides_special_tokens():
+    loop = _make_loop()
+    captured = {}
+
+    def _decode(ids, skip_special_tokens=False):
+        captured["skip_special_tokens"] = skip_special_tokens
+        return "readable text"
+
+    loop.tokenizer.decode = _decode
+
+    result = loop._decode_response_text([1, 2, 3])
+
+    assert result == "readable text"
+    assert captured["skip_special_tokens"] is True

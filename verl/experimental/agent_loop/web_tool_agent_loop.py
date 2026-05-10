@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
 from copy import deepcopy
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.qwen_coder_structured_output import build_qwen_coder_structured_tag_json
+from verl.experimental.agent_loop.web_osgym_trajectory_logger import WebOsGymTrajectoryLogger
 from verl.experimental.agent_loop.tool_agent_loop import (
     _TOOL_PARSE_ERROR_RETRY_COUNT_KEY,
     AgentData,
@@ -317,10 +316,15 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
     ) -> _WebOsGymGenerationInput:
         schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         if not self._web_osgym_window_enabled():
+            server_prompt_ids = await self._build_server_prompt_ids(
+                messages=agent_data.messages,
+                images=agent_data.image_data,
+                tools=schemas,
+            )
             image_count = len(agent_data.image_data or [])
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
-                None,
+                server_prompt_ids,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -334,10 +338,15 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
 
         steps = agent_data.extra_fields.get("web_osgym_steps") or []
         if not steps:
+            server_prompt_ids = await self._build_server_prompt_ids(
+                messages=agent_data.messages,
+                images=agent_data.image_data,
+                tools=schemas,
+            )
             image_count = len(agent_data.image_data or [])
             return _WebOsGymGenerationInput(
                 agent_data.prompt_ids,
-                None,
+                server_prompt_ids,
                 agent_data.image_data,
                 agent_data.video_data,
                 False,
@@ -451,87 +460,153 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
     def _decode_response_text(self, token_ids: list[int]) -> str:
         decode = getattr(self.tokenizer, "decode", None)
         if callable(decode):
-            return str(decode(token_ids, skip_special_tokens=False))
+            return str(decode(token_ids, skip_special_tokens=True)).strip()
         return ""
 
-    @staticmethod
-    def _write_trace_image(trace_dir: Path, image: Any, image_name: str) -> dict[str, Any] | None:
-        if image is None or not hasattr(image, "save"):
+    def _latest_web_osgym_assistant_turn(self, agent_data: AgentData) -> dict[str, Any] | None:
+        turns = list(agent_data.extra_fields.get("web_osgym_assistant_turns") or [])
+        if not turns:
             return None
-        image_dir = trace_dir / "images"
-        image_dir.mkdir(parents=True, exist_ok=True)
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        image_bytes = buffer.getvalue()
-        image_path = image_dir / image_name
-        image_path.write_bytes(image_bytes)
-        width, height = getattr(image, "size", (None, None))
-        return {
-            "path": str(image_path.relative_to(trace_dir)),
-            "width": width,
-            "height": height,
-            "sha256": hashlib.sha256(image_bytes).hexdigest(),
-        }
+        return dict(turns[-1])
 
-    def _dump_web_osgym_tool_trace(
-        self, agent_data: AgentData, tool_response, result: dict, image_data: list[Any] | None
-    ):
+    def _get_web_osgym_trajectory_logger(self, agent_data: AgentData) -> WebOsGymTrajectoryLogger | None:
         trace_dir_value = os.getenv("WEB_OSGYM_TOOL_TRACE_DIR") or agent_data.extra_fields.get(
             "web_osgym_tool_trace_dir"
         )
         if not trace_dir_value:
+            return None
+        return WebOsGymTrajectoryLogger(Path(trace_dir_value))
+
+    def _get_web_osgym_session_dir(self, agent_data: AgentData) -> Path | None:
+        logger_obj = self._get_web_osgym_trajectory_logger(agent_data)
+        if logger_obj is None:
+            return None
+        session_dir = logger_obj.session_dir(
+            task_id=agent_data.extra_fields.get("web_osgym_task_id"),
+            sample_uid=agent_data.extra_fields.get("web_osgym_sample_uid"),
+            session_id=agent_data.extra_fields.get("web_osgym_session_id"),
+        )
+        agent_data.extra_fields["web_osgym_trajectory_dir"] = str(session_dir)
+        return session_dir
+
+    def _current_prompt_window(self, agent_data: AgentData) -> dict[str, Any]:
+        generation_window = (agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1]
+        return {
+            "prompt_image_indices": list(generation_window.get("prompt_image_indices") or []),
+            "old_summary_turn_indices": list(generation_window.get("old_summary_turn_indices") or []),
+            "recent_observation_step_indices": list(generation_window.get("recent_observation_step_indices") or []),
+            "recent_assistant_turn_indices": list(generation_window.get("recent_assistant_turn_indices") or []),
+            "text_only_recent_step_count": int(generation_window.get("text_only_recent_step_count", 0)),
+        }
+
+    def _append_web_osgym_initial_observation(
+        self, agent_data: AgentData, *, observation_text: str | None, image_data: list[Any] | None
+    ) -> None:
+        logger_obj = self._get_web_osgym_trajectory_logger(agent_data)
+        session_dir = self._get_web_osgym_session_dir(agent_data)
+        if logger_obj is None or session_dir is None:
             return
-
-        trace_dir = Path(trace_dir_value)
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        pid = os.getpid()
-        session_id = agent_data.extra_fields.get("web_osgym_session_id")
-        image_records = []
-        for image_index, image in enumerate(image_data or []):
-            image_name = (
-                f"{pid}_{session_id}_a{agent_data.assistant_turns:03d}_"
-                f"u{agent_data.user_turns:03d}_{image_index:02d}.png"
-            )
-            record = self._write_trace_image(trace_dir, image, image_name)
-            if record is not None:
-                image_records.append(record)
-
-        actions = result.get("web_osgym_actions") or self._trace_actions_from_tool_calls(agent_data)
-        event = {
-            "pid": pid,
-            "request_id": agent_data.request_id,
-            "session_id": session_id,
-            "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
-            "instance_id": agent_data.extra_fields.get("web_osgym_instance_id"),
-            "assistant_turn": agent_data.assistant_turns,
-            "user_turn": agent_data.user_turns,
-            "tool_call_count": len(agent_data.tool_calls),
-            "tool_calls": self._trace_tool_calls(agent_data.tool_calls),
-            "actions": actions,
-            "result": {
-                "terminated": result.get("terminated"),
-                "termination_reason": result.get("termination_reason"),
-                "invalid_action": bool(result.get("invalid_action")),
-                "action_count": result.get("action_count"),
-                "error_type": result.get("web_osgym_error_type"),
-            },
-            "prompt_window": {
-                "prompt_image_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("prompt_image_indices") or []),
-                "old_summary_turn_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("old_summary_turn_indices") or []),
-                "recent_observation_step_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("recent_observation_step_indices") or []),
-                "recent_assistant_turn_indices": list((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("recent_assistant_turn_indices") or []),
-                "text_only_recent_step_count": int((agent_data.extra_fields.get("web_osgym_generation_windows") or [{}])[-1].get("text_only_recent_step_count", 0)),
-            },
-            "observation": {
-                "text": tool_response.text,
-                "text_len": len(tool_response.text or ""),
-                "has_image": bool(image_records),
+        image_records = logger_obj.write_images(session_dir, assistant_turn=0, user_turn=0, images=image_data)
+        logger_obj.append_event(
+            session_dir,
+            {
+                "event_type": "initial_observation",
+                "request_id": agent_data.request_id,
+                "session_id": agent_data.extra_fields.get("web_osgym_session_id"),
+                "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
+                "sample_uid": agent_data.extra_fields.get("web_osgym_sample_uid"),
+                "assistant_turn": 0,
+                "user_turn": 0,
+                "observation_text": observation_text,
+                "image_paths": [record["path"] for record in image_records],
                 "images": image_records,
             },
+        )
+
+    def _append_web_osgym_assistant_event(
+        self,
+        agent_data: AgentData,
+        *,
+        tool_response=None,
+        result: dict[str, Any] | None = None,
+        image_data: list[Any] | None = None,
+        parse_error: ToolParseError | None = None,
+    ) -> None:
+        latest_turn = self._latest_web_osgym_assistant_turn(agent_data)
+        logger_obj = self._get_web_osgym_trajectory_logger(agent_data)
+        session_dir = self._get_web_osgym_session_dir(agent_data)
+        if latest_turn is None or logger_obj is None or session_dir is None:
+            return
+        image_records = logger_obj.write_images(
+            session_dir,
+            assistant_turn=int(latest_turn.get("assistant_turn", agent_data.assistant_turns)),
+            user_turn=int(agent_data.user_turns),
+            images=image_data,
+        )
+        traced_tool_calls = self._trace_tool_calls(agent_data.tool_calls)
+        event = {
+            "event_type": "assistant_turn",
+            "request_id": agent_data.request_id,
+            "session_id": agent_data.extra_fields.get("web_osgym_session_id"),
+            "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
+            "sample_uid": agent_data.extra_fields.get("web_osgym_sample_uid"),
+            "instance_id": agent_data.extra_fields.get("web_osgym_instance_id"),
+            "assistant_turn": latest_turn.get("assistant_turn"),
+            "user_turn": latest_turn.get("user_turn"),
+            "observation_step_idx": latest_turn.get("observation_step_idx"),
+            "model_output_text": latest_turn.get("response_text"),
+            "tool_call_count": len(agent_data.tool_calls),
+            "tool_calls_raw": [item.get("arguments") for item in traced_tool_calls],
+            "tool_calls_parsed": [item.get("parsed_arguments") for item in traced_tool_calls],
+            "actions": (result or {}).get("web_osgym_actions")
+            or latest_turn.get("actions")
+            or self._trace_actions_from_tool_calls(agent_data),
+            "result": {
+                "terminated": (result or {}).get("terminated"),
+                "termination_reason": (result or {}).get("termination_reason"),
+                "invalid_action": bool((result or {}).get("invalid_action")),
+                "action_count": (result or {}).get("action_count"),
+                "error_type": (result or {}).get("web_osgym_error_type"),
+            },
+            "parse_error": parse_error.model_dump() if parse_error is not None else None,
+            "prompt_window": self._current_prompt_window(agent_data),
+            "observation_text": getattr(tool_response, "text", None),
+            "image_paths": [record["path"] for record in image_records],
+            "images": image_records,
         }
-        event_path = trace_dir / f"events_{pid}.jsonl"
-        with event_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        logger_obj.append_event(session_dir, event)
+        counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
+        counts["event_count"] = int(counts.get("event_count", 0)) + 1
+        if event["result"]["invalid_action"]:
+            counts["invalid_action_count"] = int(counts.get("invalid_action_count", 0)) + 1
+        if parse_error is not None:
+            counts["parse_error_count"] = int(counts.get("parse_error_count", 0)) + 1
+        agent_data.extra_fields["web_osgym_trajectory_counts"] = counts
+
+    def _write_web_osgym_summary(self, agent_data: AgentData, *, fatal_error: str | None = None) -> None:
+        logger_obj = self._get_web_osgym_trajectory_logger(agent_data)
+        session_dir = self._get_web_osgym_session_dir(agent_data)
+        if logger_obj is None or session_dir is None:
+            return
+        counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
+        logger_obj.write_summary(
+            session_dir,
+            {
+                "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
+                "sample_uid": agent_data.extra_fields.get("web_osgym_sample_uid"),
+                "session_id": agent_data.extra_fields.get("web_osgym_session_id"),
+                "request_id": agent_data.request_id,
+                "reward_score": agent_data.extra_fields.get("web_osgym_reward_score"),
+                "termination_reason": agent_data.extra_fields.get("web_osgym_termination_reason"),
+                "num_turns": agent_data.user_turns + agent_data.assistant_turns + 1,
+                "invalid_action_count": int(counts.get("invalid_action_count", 0)),
+                "parse_error_count": int(counts.get("parse_error_count", 0)),
+                "event_count": int(counts.get("event_count", 0)),
+                "completed": fatal_error is None,
+                "has_reward": "web_osgym_reward_score" in agent_data.extra_fields,
+                "fatal_error": fatal_error,
+            },
+        )
 
     async def _init_web_agent_data(self, **kwargs) -> AgentData:
         messages = list(kwargs["raw_prompt"])
@@ -548,6 +623,10 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             tools_kwargs=kwargs.get("tools_kwargs", {}),
         )
         agent_data._web_osgym_base_messages = deepcopy(messages)
+        if kwargs.get("uid") is not None:
+            agent_data.extra_fields["web_osgym_sample_uid"] = str(kwargs.get("uid"))
+        elif kwargs.get("index") is not None:
+            agent_data.extra_fields["web_osgym_sample_uid"] = f"index_{kwargs.get('index')}"
 
         extra_info = kwargs.get("extra_info", {}) or {}
         tool_selection = extra_info.get("tool_selection")
@@ -598,6 +677,11 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 termination_reason=None,
                 actions=[],
             )
+            self._append_web_osgym_initial_observation(
+                agent_data,
+                observation_text=student_obs,
+                image_data=image_data,
+            )
         return AgentState.GENERATING
 
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
@@ -615,9 +699,14 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
 
         image_data = self._normalize_image_data(tool_response.image)
         try:
-            self._dump_web_osgym_tool_trace(agent_data, tool_response, result, image_data)
+            self._append_web_osgym_assistant_event(
+                agent_data,
+                tool_response=tool_response,
+                result=result,
+                image_data=image_data,
+            )
         except Exception:
-            logger.warning("Failed to dump Web/OSGym tool trace", exc_info=True)
+            logger.warning("Failed to write Web/OSGym trajectory event", exc_info=True)
 
         if result.get("terminated"):
             await self._finalize_with_web_osgym_reward(
@@ -764,31 +853,77 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if output.routed_experts is not None and not generation_inputs.window_used:
             agent_data.routed_experts = output.routed_experts
 
+        latest_step_idx = int((agent_data.extra_fields.get("web_osgym_steps") or [{}])[-1].get("step_idx", 0))
+        self._record_web_osgym_assistant_turn(
+            agent_data,
+            observation_step_idx=latest_step_idx,
+            response_start=response_start,
+            response_end=len(agent_data.response_mask),
+            response_text=self._decode_response_text(agent_data.response_ids),
+            actions=[],
+        )
+
         if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+            self._append_web_osgym_assistant_event(
+                agent_data,
+                result={
+                    "terminated": True,
+                    "termination_reason": "system_stop",
+                    "invalid_action": False,
+                    "action_count": 0,
+                    "web_osgym_error_type": None,
+                },
+            )
             next_state = AgentState.TERMINATED
         elif self.max_assistant_turns and agent_data.assistant_turns >= self.max_assistant_turns:
+            self._append_web_osgym_assistant_event(
+                agent_data,
+                result={
+                    "terminated": True,
+                    "termination_reason": "system_stop",
+                    "invalid_action": False,
+                    "action_count": 0,
+                    "web_osgym_error_type": None,
+                },
+            )
             next_state = AgentState.TERMINATED
         elif self.max_user_turns and agent_data.user_turns >= self.max_user_turns:
+            self._append_web_osgym_assistant_event(
+                agent_data,
+                result={
+                    "terminated": True,
+                    "termination_reason": "system_stop",
+                    "invalid_action": False,
+                    "action_count": 0,
+                    "web_osgym_error_type": None,
+                },
+            )
             next_state = AgentState.TERMINATED
         else:
             active_tools = getattr(agent_data, "_active_tools", self.tools)
             tools = [tool.tool_schema for tool in active_tools.values()]
             _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
             parse_error = getattr(self.tool_parser, "last_parse_error", None)
-            latest_step_idx = int((agent_data.extra_fields.get("web_osgym_steps") or [{}])[-1].get("step_idx", 0))
-            self._record_web_osgym_assistant_turn(
-                agent_data,
-                observation_step_idx=latest_step_idx,
-                response_start=response_start,
-                response_end=len(agent_data.response_mask),
-                response_text=self._decode_response_text(agent_data.response_ids),
-                actions=self._trace_actions_from_tool_calls(agent_data),
-            )
             if agent_data.tool_calls:
+                self._update_latest_web_osgym_assistant_turn_actions(
+                    agent_data,
+                    actions=self._trace_actions_from_tool_calls(agent_data),
+                )
                 next_state = AgentState.PROCESSING_TOOLS
             elif parse_error is not None:
+                self._append_web_osgym_assistant_event(agent_data, parse_error=parse_error)
                 next_state = await self._handle_tool_parse_error(agent_data, parse_error)
             else:
+                self._append_web_osgym_assistant_event(
+                    agent_data,
+                    result={
+                        "terminated": True,
+                        "termination_reason": "system_stop",
+                        "invalid_action": False,
+                        "action_count": 0,
+                        "web_osgym_error_type": None,
+                    },
+                )
                 next_state = AgentState.TERMINATED
 
         if next_state == AgentState.TERMINATED and "web_osgym_reward_score" not in agent_data.extra_fields:
@@ -835,6 +970,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
     @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         agent_data = await self._init_web_agent_data(**kwargs)
+        fatal_error: str | None = None
         try:
             state = AgentState.PENDING
             while state != AgentState.TERMINATED:
@@ -848,5 +984,12 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                     logger.error("Invalid state: %s", state)
                     state = AgentState.TERMINATED
             return self._finalize_web_agent_output(agent_data)
+        except Exception as exc:
+            fatal_error = str(exc)
+            raise
         finally:
+            try:
+                self._write_web_osgym_summary(agent_data, fatal_error=fatal_error)
+            except Exception:
+                logger.warning("Failed to write Web/OSGym trajectory summary", exc_info=True)
             await self._release_web_osgym_session(agent_data)

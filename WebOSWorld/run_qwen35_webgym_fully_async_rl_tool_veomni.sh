@@ -4,7 +4,11 @@ set -xeuo pipefail
 cd /home/sogang_nlpy/verl
 
 ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni
-WEBGYM_ASYNC_RL_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl
+# The referenced parquet files are the fully async RL copies generated from:
+#   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json
+# with localhost tasks included, via:
+#   /home/sogang_nlpy/verl/WebOSWorld/webgym_rl/create_webgym_rl_dataset.py
+WEBGYM_ASYNC_RL_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl
 WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${WEBGYM_SYSTEM_PROMPT_PATH:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
 
@@ -12,16 +16,16 @@ SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
 HYDRA_FULL_ERROR=1 \
 WEB_OSGYM_UNIT_TRACE=1 \
-WEB_OSGYM_TOOL_TRACE_DIR="${ROLLOUT_DATA_DIR}/webgym_tool_trace" \
+WEB_OSGYM_TOOL_TRACE_DIR="${ROLLOUT_DATA_DIR}" \
 python -m verl.experimental.fully_async_policy.fully_async_main \
     model_engine=veomni \
     "data.train_files=['${WEBGYM_ASYNC_RL_DATASET_DIR}/train.parquet']" \
     "data.val_files=['${WEBGYM_ASYNC_RL_DATASET_DIR}/val.parquet']" \
     data.prompt_key=prompt \
     data.truncation=error \
-    data.max_prompt_length=2048 \
+    data.max_prompt_length=3072 \
     data.max_response_length=64000 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=64 \
     data.train_batch_size=0 \
     data.gen_batch_size=1 \
@@ -29,18 +33,19 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.shuffle=False \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    algorithm.kl_ctrl.kl_coef=0.0 \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/models/Qwen3.5-9B \
+    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_40/actor/huggingface \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.use_torch_compile=True \
-    actor_rollout_ref.actor.use_kl_loss=False \
-    actor_rollout_ref.actor.kl_loss_coef=0.0 \
-    actor_rollout_ref.actor.clip_ratio_low=0.2 \
-    actor_rollout_ref.actor.clip_ratio_high=0.28 \
-    actor_rollout_ref.actor.clip_ratio_c=10.0 \
+    actor_rollout_ref.actor.policy_loss.loss_mode=cispo \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.loss_agg_mode=token-mean \
+    actor_rollout_ref.actor.clip_ratio_low=10 \
+    actor_rollout_ref.actor.clip_ratio_high=0.2 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
@@ -62,6 +67,9 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.max_model_len=76800 \
     actor_rollout_ref.rollout.max_num_batched_tokens=76800 \
     actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.top_p=0.95 \
+    actor_rollout_ref.rollout.top_k=20 \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.mm_attention_backend=fa4 \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.grammar_backend=xgrammar \
@@ -70,8 +78,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=38401 \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.95 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=4 \
@@ -96,7 +104,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.project_name=verl_fully_async_qwen35_webgym_tool_veomni \
     trainer.experiment_name=qwen35_9b_fully_async_webgym_tool \
     trainer.val_before_train=False \
-    trainer.save_freq=-1 \
+    trainer.save_freq=4 \
     trainer.test_freq=-1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_fully_async_qwen35_webgym_tool_veomni/qwen35_9b_fully_async_webgym_tool \
