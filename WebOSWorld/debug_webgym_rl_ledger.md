@@ -85,8 +85,9 @@ Track only the facts that still matter for debugging or operating the current We
 
 - Observed failure pattern:
   - model emits unsupported key names such as `win`
-  - runtime normalizes `cmd`, `command`, `meta` to `Meta`
-  - runtime does **not** normalize `win`
+  - older runtime normalized `cmd`, `command`, `meta` to `Meta`
+  - current Linux-focused runtime normalizes `ctrl`, `control`, `cmd`, `command`, `meta`, and `win` to `Control`
+  - current runtime also splits HOTKEY combo strings such as `ctrl+a` into canonical key lists such as `["Control", "A"]`
   - Playwright rejects `Keyboard.down("win")`
 
 - This is a contract gap:
@@ -213,12 +214,12 @@ Track only the facts that still matter for debugging or operating the current We
    - Code and tests are in place.
    - A fresh run should be used to verify that only session directories are produced and legacy row dumps are absent for WebGym RL.
 
-2. **Need a decision on `win` handling.**
-   - Possible fixes:
-     - alias `win -> Meta`
-     - alias `win -> ControlOrMeta`
-     - reject `win` earlier with clearer feedback
-   - Current evidence only proves that raw `win` is invalid in the active Playwright path.
+2. **Need end-to-end confirmation that the new Linux-focused key normalization reduces invalid keyboard actions.**
+   - Current runtime policy:
+     - `ctrl`, `control`, `cmd`, `command`, `meta`, `win` -> `Control`
+     - HOTKEY combo strings are split and canonicalized in `verl`
+     - single-key actions reject combo strings early
+   - Remaining work is empirical validation in a fresh RL run, not a contract decision.
 
 3. **Need an operational answer for `3100`.**
    - Either:

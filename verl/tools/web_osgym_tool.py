@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from collections.abc import Mapping
 from copy import deepcopy
@@ -60,14 +61,18 @@ _PLAYWRIGHT_KEY_ALIASES = {
     "space": "Space",
     "spacebar": "Space",
     "backspace": "Backspace",
+    "bksp": "Backspace",
     "delete": "Delete",
     "del": "Delete",
+    "suppr": "Delete",
     "insert": "Insert",
     "ins": "Insert",
     "home": "Home",
     "end": "End",
     "pageup": "PageUp",
+    "pgup": "PageUp",
     "pagedown": "PageDown",
+    "pgdn": "PageDown",
     "up": "ArrowUp",
     "down": "ArrowDown",
     "left": "ArrowLeft",
@@ -80,7 +85,15 @@ _PLAYWRIGHT_KEY_ALIASES = {
     "cmd": "Control",
     "command": "Control",
     "meta": "Control",
+    "win": "Control",
 }
+
+
+_FUNCTION_KEY_PATTERN = re.compile(r"^f([1-9]|1[0-2])$", re.IGNORECASE)
+
+
+def _is_combo_key_string(value: Any) -> bool:
+    return isinstance(value, str) and "+" in value and len([part for part in value.split("+") if part.strip()]) > 1
 
 
 def _normalize_playwright_key_alias(value: Any) -> Any:
@@ -89,7 +102,20 @@ def _normalize_playwright_key_alias(value: Any) -> Any:
     stripped = value.strip()
     if not stripped:
         return value
-    return _PLAYWRIGHT_KEY_ALIASES.get(stripped.lower(), value)
+    lowered = stripped.lower()
+    alias = _PLAYWRIGHT_KEY_ALIASES.get(lowered)
+    if alias is not None:
+        return alias
+    if _FUNCTION_KEY_PATTERN.fullmatch(lowered):
+        return lowered.upper()
+    return stripped
+
+
+def _canonicalize_hotkey_part(value: Any) -> Any:
+    normalized = _normalize_playwright_key_alias(value)
+    if isinstance(normalized, str) and len(normalized) == 1 and normalized.isalpha():
+        return normalized.upper()
+    return normalized
 
 
 def _normalize_hotkey_keys(value: Any) -> Any:
@@ -101,9 +127,9 @@ def _normalize_hotkey_keys(value: Any) -> Any:
         if isinstance(key, str):
             parts = [part.strip() for part in key.split("+")]
             if len(parts) > 1 and all(parts):
-                normalized_keys.extend(_normalize_playwright_key_alias(part) for part in parts)
+                normalized_keys.extend(_canonicalize_hotkey_part(part) for part in parts)
                 continue
-        normalized_keys.append(_normalize_playwright_key_alias(key))
+        normalized_keys.append(_canonicalize_hotkey_part(key))
     return normalized_keys
 
 
@@ -361,7 +387,9 @@ class WebOsGymTool(BaseTool):
                 self._require_field(action, "text")
 
             elif action_type in {"PRESS", "KEY_DOWN", "KEY_UP"}:
-                self._require_field(action, "key")
+                key = self._require_field(action, "key")
+                if _is_combo_key_string(key):
+                    raise ValueError(f"{action_type} expects a single key name, got combo string {key!r}")
 
             elif action_type == "HOTKEY":
                 keys = self._require_field(action, "keys")

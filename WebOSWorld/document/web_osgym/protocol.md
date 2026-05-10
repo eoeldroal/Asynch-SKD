@@ -269,6 +269,41 @@ DONE:
   no parameters
 ```
 
+### Model-facing keyboard contract
+
+현재 `verl`의 model-facing keyboard contract는 wire-level server contract보다 더 좁다.
+
+- `PRESS`, `KEY_DOWN`, `KEY_UP`
+  - `key`는 **single key name**이어야 한다.
+  - `ctrl+a` 같은 combo string은 허용하지 않는다.
+- `HOTKEY`
+  - `keys`는 **single key name들의 배열**이어야 한다.
+  - `["Control", "A"]`, `["Control", "Shift", "T"]` 같은 형태를 canonical form으로 본다.
+  - `ctrl+a` 같은 combo string은 model-facing 출력에서 나올 수 있지만, 현재 `verl` runtime은 이를
+    `["Control", "A"]` 같은 배열로 분해/정규화한 뒤 server로 보낸다.
+
+현재 Linux-focused canonical key normalization은 다음과 같다.
+
+- modifier canonical form
+  - `ctrl`, `control`, `cmd`, `command`, `meta`, `win` -> `Control`
+  - `option` -> `Alt`
+- special key aliases
+  - `return` -> `Enter`
+  - `esc` -> `Escape`
+  - `del`, `suppr` -> `Delete`
+  - `bksp` -> `Backspace`
+  - `pgup` -> `PageUp`
+  - `pgdn` -> `PageDown`
+- function keys
+  - `f1` .. `f12` -> `F1` .. `F12`
+- HOTKEY alphabetic keys
+  - canonical form은 `A`, `C`, `V`, `T`처럼 대문자를 사용한다.
+
+중요한 점:
+
+- server wire contract는 여전히 concrete Playwright key names를 기대한다.
+- `ControlOrMeta` 같은 cross-platform abstract key name은 현재 canonical wire contract가 아니다.
+
 ## Logging Recommendation
 
 Server-side request logging is strongly recommended for debugging. Each log record should include at least:

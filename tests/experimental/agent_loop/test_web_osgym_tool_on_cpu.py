@@ -397,6 +397,31 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.action_type, "PRESS")
         self.assertEqual(action.key, "Enter")
 
+    async def test_tool_execute_normalizes_press_function_key_and_delete_aliases(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "PRESS", "key": "f3"}]})
+        action = seen["actions"][0]
+        self.assertEqual(action.key, "F3")
+
+        await tool.execute("i1", {"actions": [{"action_type": "PRESS", "key": "suppr"}]})
+        action = seen["actions"][0]
+        self.assertEqual(action.key, "Delete")
+
     async def test_tool_execute_normalizes_hotkey_key_aliases(self):
         seen = {}
 
@@ -441,7 +466,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "HOTKEY")
-        self.assertEqual(action.keys, ["Control", "a"])
+        self.assertEqual(action.keys, ["Control", "A"])
 
     async def test_tool_execute_splits_hotkey_combo_string(self):
         seen = {}
@@ -464,7 +489,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "HOTKEY")
-        self.assertEqual(action.keys, ["Control", "a"])
+        self.assertEqual(action.keys, ["Control", "A"])
 
     async def test_tool_execute_splits_hotkey_combo_string_with_spaces(self):
         seen = {}
@@ -487,7 +512,30 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "HOTKEY")
-        self.assertEqual(action.keys, ["Control", "Shift", "t"])
+        self.assertEqual(action.keys, ["Control", "Shift", "T"])
+
+    async def test_tool_execute_normalizes_hotkey_function_key_and_win_aliases(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["win", "f2"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Control", "F2"])
 
     async def test_action_named_tool_execute_normalizes_press_key_alias(self):
         seen = {}
@@ -552,6 +600,42 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "PRESS")
         self.assertEqual(action.key, "Control")
+
+    async def test_tool_execute_rejects_press_combo_string(self):
+        class _FakeClient:
+            def __init__(self):
+                self.action_called = False
+
+            async def action(self, **kwargs):
+                self.action_called = True
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "PRESS", "key": "ctrl+a"}]})
+
+        self.assertIn("PRESS expects a single key name", response.text)
+        self.assertTrue(metrics["invalid_action"])
+        self.assertFalse(tool.client.action_called)
+
+    async def test_tool_execute_rejects_key_down_combo_string(self):
+        class _FakeClient:
+            def __init__(self):
+                self.action_called = False
+
+            async def action(self, **kwargs):
+                self.action_called = True
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "KEY_DOWN", "key": "ctrl+a"}]})
+
+        self.assertIn("KEY_DOWN expects a single key name", response.text)
+        self.assertTrue(metrics["invalid_action"])
+        self.assertFalse(tool.client.action_called)
 
     async def test_tool_execute_uses_current_cursor_for_click_without_coordinates(self):
         seen = {}

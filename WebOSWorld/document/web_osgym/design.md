@@ -404,6 +404,34 @@ Coordinate contract:
 - `CLICK` / `DOUBLE_CLICK` 등 cursor-relative fallback을 허용하는 action은 cursor state가 없으면
   fail-fast해야 한다. visual grounding을 위해 가능한 한 명시적 좌표를 선호한다.
 
+### Action postprocess boundary
+
+현재 action postprocess는 한 파일에만 있지 않고, 두 계층으로 나뉜다.
+
+1. `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
+   - model tool call들을 실행 가능한 `actions` payload로 묶는다.
+   - named action tool surface를 bundled `computer(actions=[...])` shape로 변환한다.
+   - tool의 `postprocess_tool_arguments()` hook를 호출한다.
+2. `verl/tools/web_osgym_tool.py`
+   - key alias / casing / HOTKEY combo-string split 같은 canonicalization을 수행한다.
+   - single-key action의 combo-string reject, cursor fallback, coordinate projection, terminal-action validation을 수행한다.
+   - 최종 server payload를 만든다.
+
+즉 `web_osgym_loop_mixin.py`는 orchestration layer이고, `web_osgym_tool.py`는 canonicalization +
+validation layer다.
+
+현재 Linux-focused canonical keyboard policy:
+
+- modifier는 `Control` 중심 canonical form을 쓴다.
+- `PRESS`, `KEY_DOWN`, `KEY_UP`는 single key only다.
+- `HOTKEY`는 single key name list를 canonical form으로 쓴다.
+- `HOTKEY(["ctrl+a"])` 같은 combo-string payload는 `verl`에서 `["Control", "A"]`로 분해/정규화한 뒤
+  server에 전달한다.
+
+이 경계는 나중에 benchmark harness를 만들 때도 중요하다. benchmark harness가 현재 training/runtime과 같은
+행동 의미를 재현하려면, server 호출만 맞추는 것이 아니라 **동일한 action postprocess contract**를 재사용하거나
+문서 그대로 복제해야 한다.
+
 ## 17. Failure Semantics
 
 Transport-level failure와 action failure는 다르다.
