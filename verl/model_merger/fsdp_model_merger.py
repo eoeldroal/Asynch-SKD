@@ -65,6 +65,16 @@ class FSDPModelMerger(BaseModelMerger):
         ```
     """
 
+    @staticmethod
+    def _normalize_mesh_dim_names(mesh_dim_names: tuple[str, ...]) -> tuple[str, ...]:
+        normalized_names = []
+        for mesh_dim_name in mesh_dim_names:
+            if mesh_dim_name == "dp_shard_sp":
+                normalized_names.append("fsdp")
+            else:
+                normalized_names.append(mesh_dim_name)
+        return tuple(normalized_names)
+
     def _get_world_size(self) -> int:
         """_summary_
         From FSDP json config file, extract the world size.
@@ -117,6 +127,7 @@ class FSDPModelMerger(BaseModelMerger):
         self, mesh: np.ndarray, mesh_dim_names: tuple[str, ...]
     ) -> tuple[int, tuple[int, ...]]:
         """Calculates the total number of shards and the shape of the device mesh."""
+        mesh_dim_names = self._normalize_mesh_dim_names(mesh_dim_names)
         assert mesh_dim_names in (("fsdp",), ("ddp", "fsdp")), f"Unsupported mesh_dim_names {mesh_dim_names}"
 
         if "tp" in mesh_dim_names:
