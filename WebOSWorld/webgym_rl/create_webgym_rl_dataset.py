@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 from pathlib import Path
 from typing import Any, Iterable
@@ -68,6 +69,14 @@ def _prompt(task: dict[str, Any]) -> list[dict[str, str]]:
     return [{"role": "user", "content": instruction}]
 
 
+def _normalized_website(website: Any) -> list[dict[str, Any]]:
+    if isinstance(website, str):
+        return [{"id": "default", "url": website}]
+    if isinstance(website, list):
+        return deepcopy(website)
+    raise ValueError(f"Unsupported website payload: {website!r}")
+
+
 def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> dict[str, Any]:
     task_id = str(task["task_id"])
     instruction = str(task.get("instruction") or task.get("task_name") or "")
@@ -84,7 +93,7 @@ def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> di
             "index": index,
             "task_id": task_id,
             "task_name": instruction,
-            "website": str(task["website"]),
+            "website": _normalized_website(task["website"]),
             "need_tools_kwargs": True,
             "tools_kwargs": {"web_osgym": {"create_kwargs": {"task_id": task_id}}},
         },

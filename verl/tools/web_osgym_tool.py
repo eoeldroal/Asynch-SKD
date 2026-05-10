@@ -77,9 +77,9 @@ _PLAYWRIGHT_KEY_ALIASES = {
     "alt": "Alt",
     "option": "Alt",
     "shift": "Shift",
-    "cmd": "Meta",
-    "command": "Meta",
-    "meta": "Meta",
+    "cmd": "Control",
+    "command": "Control",
+    "meta": "Control",
 }
 
 
@@ -92,13 +92,28 @@ def _normalize_playwright_key_alias(value: Any) -> Any:
     return _PLAYWRIGHT_KEY_ALIASES.get(stripped.lower(), value)
 
 
+def _normalize_hotkey_keys(value: Any) -> Any:
+    if not isinstance(value, list):
+        return value
+
+    normalized_keys = []
+    for key in value:
+        if isinstance(key, str):
+            parts = [part.strip() for part in key.split("+")]
+            if len(parts) > 1 and all(parts):
+                normalized_keys.extend(_normalize_playwright_key_alias(part) for part in parts)
+                continue
+        normalized_keys.append(_normalize_playwright_key_alias(key))
+    return normalized_keys
+
+
 def _normalize_web_osgym_action_payload(raw_action: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(raw_action)
     action_type = normalized.get("action_type")
     if action_type in {"PRESS", "KEY_DOWN", "KEY_UP"} and "key" in normalized:
         normalized["key"] = _normalize_playwright_key_alias(normalized.get("key"))
     elif action_type == "HOTKEY" and isinstance(normalized.get("keys"), list):
-        normalized["keys"] = [_normalize_playwright_key_alias(key) for key in normalized["keys"]]
+        normalized["keys"] = _normalize_hotkey_keys(normalized.get("keys"))
     return normalized
 
 
@@ -319,15 +334,15 @@ class WebOsGymTool(BaseTool):
             elif action_type == "CLICK":
                 x, y = self._require_coordinates(action, cursor_x, cursor_y)
                 button = action.button or "left"
-                if button.lower() != "left":
-                    raise ValueError(f"CLICK only supports button='left', got {button!r}")
+                if button.lower() not in {"left", "middle", "right"}:
+                    raise ValueError(f"CLICK button must be one of 'left', 'middle', or 'right', got {button!r}")
                 num_clicks = 1 if action.num_clicks is None else int(action.num_clicks)
                 if num_clicks < 1:
                     raise ValueError(f"CLICK requires num_clicks >= 1, got {num_clicks}")
                 click_x, click_y = int(x), int(y)
                 if action.x is not None and action.y is not None:
                     click_x, click_y = self._scale_xy_to_screen(state, click_x, click_y)
-                payload.update({"button": "left", "x": click_x, "y": click_y, "num_clicks": num_clicks})
+                payload.update({"button": button.lower(), "x": click_x, "y": click_y, "num_clicks": num_clicks})
                 cursor_x, cursor_y = click_x, click_y
 
             elif action_type == "DOUBLE_CLICK":

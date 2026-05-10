@@ -326,6 +326,54 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.x, 10)
         self.assertEqual(action.y, 20)
 
+    async def test_tool_execute_allows_right_click_button_in_click_action(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 10, "y": 20, "button": "right"}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "CLICK")
+        self.assertEqual(action.button, "right")
+        self.assertEqual(action.num_clicks, 1)
+
+    async def test_tool_execute_allows_middle_click_button_in_click_action(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "CLICK", "x": 10, "y": 20, "button": "middle"}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "CLICK")
+        self.assertEqual(action.button, "middle")
+        self.assertEqual(action.num_clicks, 1)
+
     async def test_tool_execute_normalizes_press_key_alias(self):
         seen = {}
 
@@ -372,6 +420,75 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.action_type, "HOTKEY")
         self.assertEqual(action.keys, ["Control", "ArrowRight"])
 
+    async def test_tool_execute_normalizes_hotkey_command_alias_to_control(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["cmd", "a"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Control", "a"])
+
+    async def test_tool_execute_splits_hotkey_combo_string(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["ctrl+a"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Control", "a"])
+
+    async def test_tool_execute_splits_hotkey_combo_string_with_spaces(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["cmd + shift + t"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Control", "Shift", "t"])
+
     async def test_action_named_tool_execute_normalizes_press_key_alias(self):
         seen = {}
 
@@ -403,6 +520,38 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "PRESS")
         self.assertEqual(action.key, "Escape")
+
+    async def test_action_named_tool_execute_normalizes_meta_alias_to_control(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(
+            config={"base_url": "http://env"},
+            tool_schema=_action_tool_schema(
+                "PRESS",
+                properties={
+                    "key": {"type": "string"},
+                },
+                required=["key"],
+            ),
+        )
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"key": "meta"})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "PRESS")
+        self.assertEqual(action.key, "Control")
 
     async def test_tool_execute_uses_current_cursor_for_click_without_coordinates(self):
         seen = {}

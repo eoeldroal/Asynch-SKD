@@ -153,7 +153,7 @@ tools:
                         type: "string"
                     required: ["action_type", "text"]
                   - type: "object"
-                    description: "Press the specified single key and release it."
+                    description: "Press the specified single key and release it. Key must be a single key name."
                     additionalProperties: false
                     properties:
                       action_type:
@@ -183,7 +183,7 @@ tools:
                         type: "string"
                     required: ["action_type", "key"]
                   - type: "object"
-                    description: "Press the specified key combination. keys must be an array of string key names, for example ['ctrl', 'c']. For paste, use ['ctrl', 'v']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+v'."
+                    description: "Press the specified key combination. keys must be an array of single string key names, for example ['ctrl', 'c']. For paste, use ['ctrl', 'v']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+v'."
                     additionalProperties: false
                     properties:
                       action_type:

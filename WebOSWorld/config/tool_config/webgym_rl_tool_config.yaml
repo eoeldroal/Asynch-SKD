@@ -157,7 +157,7 @@ tools:
       type: "function"
       function:
         name: "PRESS"
-        description: "Press the specified single key and release it."
+        description: "Press the specified single key and release it. Key must be a single key name."
         parameters:
           type: "object"
           additionalProperties: false
@@ -199,7 +199,7 @@ tools:
       type: "function"
       function:
         name: "HOTKEY"
-        description: "Press the specified key combination. keys must be an array of string key names, for example ['ctrl', 'c']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+c'."
+        description: "Press the specified key combination. keys must be an array of single string key names, for example ['ctrl', 'c']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+c'."
         parameters:
           type: "object"
           additionalProperties: false

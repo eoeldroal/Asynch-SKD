@@ -13,6 +13,12 @@ sys.path.insert(0, str(ROOT))
 from WebOSWorld.webgym_rl.create_webgym_rl_dataset import write_standard_webgym_datasets
 
 
+def _normalize_website(value):
+    if hasattr(value, "tolist"):
+        return value.tolist()
+    return value
+
+
 def _make_task(index: int) -> dict:
     return {
         "task_id": f"task_{index}",
@@ -66,6 +72,7 @@ def test_write_standard_webgym_datasets_creates_skd_and_async_rl_variants(tmp_pa
 
     val_task_ids = [row["task_id"] for row in skd_val["extra_info"]]
     assert val_task_ids == [f"task_{i}" for i in range(15)]
+    assert skd_train.iloc[0]["extra_info"]["website"] == [{"id": "default", "url": "https://example0.kr/"}]
 
 
 def test_write_standard_webgym_datasets_supports_single_target(tmp_path: Path):
@@ -86,3 +93,36 @@ def test_write_standard_webgym_datasets_supports_single_target(tmp_path: Path):
     assert not (tmp_path / "skd_only" / "train.parquet").exists()
     assert (tmp_path / "rl_only" / "train.parquet").exists()
     assert set(pd.read_parquet(tmp_path / "rl_only" / "train.parquet")["agent_name"]) == {"web_tool_agent"}
+
+
+def test_write_standard_webgym_datasets_preserves_multi_website_structure(tmp_path: Path):
+    task_file = tmp_path / "tasks_multi.json"
+    tasks = [
+        {
+            "task_id": "multi_site_task",
+            "instruction": "Use the web and sheet sites together.",
+            "website": [
+                {"id": "web", "url": "https://example.com"},
+                {"id": "sheet", "url": "http://localhost:3000/spreadsheet"},
+            ],
+            "evaluation": {"mode": "spreadsheet", "rules": []},
+        }
+    ]
+    task_file.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    outputs = write_standard_webgym_datasets(
+        task_file=task_file,
+        skd_save_dir=tmp_path / "webgym_skd",
+        async_rl_save_dir=tmp_path / "webgym_rl",
+        num_train_samples=1,
+        num_val_samples=1,
+        target="rl",
+    )
+
+    train_df = pd.read_parquet(outputs["rl"] / "train.parquet")
+    website = _normalize_website(train_df.iloc[0]["extra_info"]["website"])
+
+    assert website == [
+        {"id": "web", "url": "https://example.com"},
+        {"id": "sheet", "url": "http://localhost:3000/spreadsheet"},
+    ]
