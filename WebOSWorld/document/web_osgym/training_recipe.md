@@ -400,6 +400,9 @@ Current RL comparison:
 - Fully async RL uses the bundled `computer(actions=[...])` schema in `webgym_rl_tool_config_bundled.yaml`.
 - Async SKD also uses the bundled `computer(actions=[...])` schema in the current WebGym launcher so future
   constrained decoding work can target the same model-facing contract.
+- Async SKD teacher conditioning is now two-layered:
+  - additive teacher-only system guidance from `teacher_system_prompt_webgym_rl.txt`
+  - optional teacher-only structured few-shot transcript from `distillation.skd.teacher_fewshot_path`
 - The prompt should explicitly describe screenshot grounding, `DONE` / `FAIL`, the action budget, and
   `1000x1000` coordinates; these are no longer deferred experiment notes.
 - RL rollout can now use the same bounded prompt-window builder during generation via:
@@ -411,6 +414,10 @@ Current RL comparison:
 - Async SKD should keep full accumulated rollout generation for now. Its actor-side windowed training remains
   the bounded-backprop mechanism; rollout prompt windowing would require reworking teacher prompt streams,
   server prompt ids, multimodal surplus accounting, and carryover restore.
+- Async SKD still does not share the RL constrained-decoding rollout path. The main conflict is not chunking by
+  itself, but teacher-side token replacement after student chunk generation. The current design therefore keeps
+  constrained decoding as an RL rollout topic and keeps Async SKD on the shared bundled browser-action contract
+  without the RL structured-decoding rollout wiring.
 - The RL-only prompt helper now mirrors the OSWorld Qwen harness topology instead of collapsing everything into a single user turn:
   - old actions outside the recent window go into `Previous actions`
   - recent `history_n` steps stay as live `user(observation)` -> `assistant(response)` messages
@@ -452,6 +459,11 @@ assistant:
 ```
 
 When there is no recent history, the harness attaches the instruction prompt to the current screenshot. Mirror that behavior for early mini-steps.
+
+The current Web/OSGym loop also keeps malformed tool-call recovery in-band. Recoverable parse failures produce an
+`Invalid tool call format: ...` observation and continue generation instead of immediately terminating the
+trajectory. This behavior is loop-level runtime policy, not a separate training target, but it affects the
+observed rollout distribution for Async SKD.
 
 In the current RL implementation, the exact rollout window is recorded per assistant generation through:
 

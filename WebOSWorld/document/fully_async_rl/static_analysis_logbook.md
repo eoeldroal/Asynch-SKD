@@ -1,5 +1,41 @@
 # Fully Async RL Static Analysis Logbook
 
+## Reading note
+
+- 이 문서는 historical logbook이다. 오래된 항목은 당시의 관찰/결정을 보존한다.
+- 현재 canonical 설계와 최신 launch contract는 아래 문서를 우선한다:
+  - `WebOSWorld/document/web_osgym/design.md`
+  - `WebOSWorld/document/web_osgym/protocol.md`
+  - `WebOSWorld/document/web_osgym/training_recipe.md`
+- 특히 아래 표현은 현재 기준으로는 superseded 되었을 수 있다.
+  - action-named `webgym_rl_tool_config.yaml`을 canonical contract로 보는 서술
+  - `http://127.0.0.1:18001` endpoint를 current endpoint로 보는 서술
+  - named-tool `web_tool_agent` prompt surface를 current Qwen3.5 WebGym contract로 보는 서술
+
+## 2026-05-09 - Current canonical state summary
+
+Current canonical state after the recent WebGym / WebSKD prompt and scheduling changes:
+
+- The canonical model-facing tool surface for current WebGym RL and current Async SKD is bundled
+  `computer(actions=[...])` under:
+  - `WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml`
+- The shared runtime browser-control prompt remains:
+  - `WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt`
+- Async SKD adds teacher-only guidance through:
+  - `WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt`
+- Async SKD now also supports teacher-only structured few-shot transcripts through:
+  - `distillation.skd.teacher_fewshot_path`
+  - loaded by `verl/experimental/agent_loop/teacher_fewshot.py`
+- The teacher-side prompt reserve is now intentionally coarse and larger:
+  - `_TEACHER_SYSTEM_PROMPT_TOKEN_BUDGET = 4096`
+  - this is a coarse reserve, not exact few-shot length accounting
+- Web/OSGym tool-parse recovery is active in the Web loops:
+  - malformed tool-call output produces `Invalid tool call format: ...`
+  - the loop continues generation instead of terminating immediately
+  - the current retry budget is effectively very large (`max_tool_parse_error_retries = 9999`)
+- Fully async RL and Async SKD still share the bundled browser-action contract, but constrained decoding is
+  still discussed as an RL rollout policy topic, not as a current Async SKD rollout feature.
+
 ## 2026-05-02 - WebGym fully async RL launch script
 
 - Added `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni.sh`.

@@ -6,6 +6,11 @@ This note records the current theoretical interpretation of applying GRPO-style 
 
 This is not a claim of exact constrained-policy optimization. It is a clarification of what policy is used for data collection and what policy is updated by the current trainer implementation.
 
+This note is intentionally about the fully async RL path. The current Async SKD WebGym path shares the same bundled
+`computer(actions=[...])` action contract, but it does not currently reuse the RL constrained-decoding rollout path.
+The blocker is not prompt surface mismatch; it is the interaction between chunk-local student generation and
+teacher-side token replacement after verification.
+
 ## Policy split
 
 When constrained decoding is enabled, it is useful to distinguish two policies.
@@ -58,3 +63,9 @@ For now, we treat this setup as:
 - theoretically approximate
 - implementation-compatible with the existing fully async RL stack
 - acceptable as a working interpretation for experiments, as long as the approximation is stated clearly
+
+Corollary for current documentation:
+
+- describe constrained decoding as a fully async RL rollout feature
+- do not describe it as an active Async SKD rollout feature
+- keep the shared bundled browser-action surface separate from the constrained-decoding claim

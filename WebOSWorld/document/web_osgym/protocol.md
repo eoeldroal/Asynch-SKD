@@ -93,6 +93,22 @@
 
 `actions`는 한 개 이상의 low-level computer actions를 순서대로 담는다.
 
+### Model-facing vs wire contract
+
+현재 `verl` WebGym RL / Async SKD 경로의 model-facing contract와 server wire contract는 구분된다.
+
+- model-facing contract
+  - bundled `computer(actions=[...])`
+  - `qwen3_coder` tool-call serialization
+  - tool schema source:
+    - `WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml`
+- wire contract
+  - 이 문서에 적힌 `op=start|action|reward`
+  - `actions=[{action_type: ...}]` payload
+
+즉 모델은 직접 wire-level HTTP JSON을 생성하지 않는다. 모델은 bundled `computer` tool 안에 Computer 13
+action list를 내고, `WebOsGymTool`이 이를 server wire request로 바꾼다.
+
 ### Success Response
 
 ```json
