@@ -30,21 +30,22 @@ def test_write_standard_webgym_datasets_creates_skd_and_async_rl_variants(tmp_pa
     tasks = [_make_task(i) for i in range(15)]
     task_file.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    skd_dir, async_rl_dir = write_standard_webgym_datasets(
+    outputs = write_standard_webgym_datasets(
         task_file=task_file,
-        skd_save_dir=tmp_path / "webgym_rl_counter",
-        async_rl_save_dir=tmp_path / "webgym_rl_counter_fully_async_rl",
+        skd_save_dir=tmp_path / "webgym_skd",
+        async_rl_save_dir=tmp_path / "webgym_rl",
         num_train_samples=120,
         num_val_samples=15,
+        target="both",
     )
 
-    assert skd_dir.name == "webgym_rl_counter"
-    assert async_rl_dir.name == "webgym_rl_counter_fully_async_rl"
+    assert outputs["skd"].name == "webgym_skd"
+    assert outputs["rl"].name == "webgym_rl"
 
-    skd_train = pd.read_parquet(skd_dir / "train.parquet")
-    skd_val = pd.read_parquet(skd_dir / "val.parquet")
-    async_train = pd.read_parquet(async_rl_dir / "train.parquet")
-    async_val = pd.read_parquet(async_rl_dir / "val.parquet")
+    skd_train = pd.read_parquet(outputs["skd"] / "train.parquet")
+    skd_val = pd.read_parquet(outputs["skd"] / "val.parquet")
+    async_train = pd.read_parquet(outputs["rl"] / "train.parquet")
+    async_val = pd.read_parquet(outputs["rl"] / "val.parquet")
 
     assert len(skd_train) == 120
     assert len(skd_val) == 15
@@ -65,3 +66,23 @@ def test_write_standard_webgym_datasets_creates_skd_and_async_rl_variants(tmp_pa
 
     val_task_ids = [row["task_id"] for row in skd_val["extra_info"]]
     assert val_task_ids == [f"task_{i}" for i in range(15)]
+
+
+def test_write_standard_webgym_datasets_supports_single_target(tmp_path: Path):
+    task_file = tmp_path / "tasks_kr_sites.json"
+    tasks = [_make_task(i) for i in range(3)]
+    task_file.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    outputs = write_standard_webgym_datasets(
+        task_file=task_file,
+        skd_save_dir=tmp_path / "skd_only",
+        async_rl_save_dir=tmp_path / "rl_only",
+        num_train_samples=9,
+        num_val_samples=3,
+        target="rl",
+    )
+
+    assert set(outputs) == {"rl"}
+    assert not (tmp_path / "skd_only" / "train.parquet").exists()
+    assert (tmp_path / "rl_only" / "train.parquet").exists()
+    assert set(pd.read_parquet(tmp_path / "rl_only" / "train.parquet")["agent_name"]) == {"web_tool_agent"}

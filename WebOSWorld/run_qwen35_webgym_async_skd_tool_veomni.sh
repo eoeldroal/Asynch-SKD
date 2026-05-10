@@ -7,10 +7,10 @@ set -xeuo pipefail
 # was validated after the actor-side multimodal forward stall cleared.
 #
 # The referenced parquet files are the standard SKD copies generated from:
-#   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_kr_sites.json
-# via:
+#   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json
+# with localhost tasks included, via:
 #   /home/sogang_nlpy/verl/WebOSWorld/webgym_rl/create_webgym_rl_dataset.py
-WEBGYM_SKD_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl_counter
+WEBGYM_SKD_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_skd
 WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
 WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
@@ -36,9 +36,9 @@ python3 -m verl.trainer.main_ppo \
     "data.val_files=['${WEBGYM_SKD_DATASET_DIR}/val.parquet']" \
     data.return_raw_chat=True \
     data.train_batch_size=16 \
-    data.max_prompt_length=2048 \
+    data.max_prompt_length=3072 \
     data.max_response_length=24576 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=64 \
     data.truncation=error \
     data.shuffle=False \
@@ -98,7 +98,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.agent.async_skd_teacher_sticky_carryover=True \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=16 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=4 \
-    +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=12 \
+    +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=16 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -129,8 +129,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.val_before_train=False \
-    trainer.resume_mode=disable \
-    trainer.save_freq=3 \
+    trainer.resume_mode=auto \
+    trainer.save_freq=10 \
     trainer.test_freq=-1 \
     trainer.total_epochs=100 \
     trainer.total_training_steps=100 \

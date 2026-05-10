@@ -1,4 +1,4 @@
-"""Create veRL parquet datasets backed by webgym-rl task definitions."""
+"""Create SKD and fully async RL parquet datasets backed by WebGym task definitions."""
 
 from __future__ import annotations
 
@@ -9,13 +9,20 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-DEFAULT_TASK_FILE = "/home/sogang_nlpy/goonco/surfgym/tasks/tasks_kr_sites.json"
-DEFAULT_LOCAL_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_rl_counter"
-DEFAULT_ASYNC_RL_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_rl_counter_fully_async_rl"
+DEFAULT_TASK_FILE = "/home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json"
+DEFAULT_SKD_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_skd"
+DEFAULT_RL_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_rl"
 DEFAULT_TRAIN_REPEATS_PER_TASK = 16
 DEFAULT_VAL_REPEATS_PER_TASK = 1
-DEFAULT_AGENT_NAME = "web_skd_agent"
-DEFAULT_ASYNC_RL_AGENT_NAME = "web_tool_agent"
+DEFAULT_INCLUDE_LOCALHOST = True
+
+SKD_TARGET = "skd"
+RL_TARGET = "rl"
+BOTH_TARGET = "both"
+DATASET_TARGETS = (SKD_TARGET, RL_TARGET, BOTH_TARGET)
+
+SKD_AGENT_NAME = "web_skd_agent"
+RL_AGENT_NAME = "web_tool_agent"
 
 
 def load_tasks(task_file: str | Path) -> list[dict[str, Any]]:
@@ -32,9 +39,9 @@ def select_tasks(
     tasks: Iterable[dict[str, Any]],
     *,
     task_ids: list[str] | None = None,
-    include_localhost: bool = False,
+    include_localhost: bool = DEFAULT_INCLUDE_LOCALHOST,
 ) -> list[dict[str, Any]]:
-    selected = []
+    selected: list[dict[str, Any]] = []
     wanted = set(task_ids or [])
     for task in tasks:
         task_id = str(task.get("task_id", ""))
@@ -66,7 +73,6 @@ def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> di
     instruction = str(task.get("instruction") or task.get("task_name") or "")
     if not instruction:
         raise ValueError(f"Task {task_id} is missing both instruction and task_name")
-    tools_kwargs = {"web_osgym": {"create_kwargs": {"task_id": task_id}}}
     return {
         "data_source": "webgym_rl",
         "prompt": _prompt(task),
@@ -80,7 +86,7 @@ def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> di
             "task_name": instruction,
             "website": str(task["website"]),
             "need_tools_kwargs": True,
-            "tools_kwargs": tools_kwargs,
+            "tools_kwargs": {"web_osgym": {"create_kwargs": {"task_id": task_id}}},
         },
     }
 
@@ -90,7 +96,7 @@ def build_rows(
     split: str,
     tasks: list[dict[str, Any]],
     num_samples: int,
-    agent_name: str = DEFAULT_AGENT_NAME,
+    agent_name: str,
 ) -> list[dict[str, Any]]:
     if num_samples < 1:
         raise ValueError("num_samples must be at least 1")
@@ -111,18 +117,45 @@ def _resolve_num_samples(
     return num_tasks * repeats_per_task
 
 
-def write_split(
+def _write_split(
     *,
-    local_save_dir: Path,
+    output_dir: Path,
     split: str,
     tasks: list[dict[str, Any]],
     num_samples: int,
-    agent_name: str = DEFAULT_AGENT_NAME,
+    agent_name: str,
 ) -> Path:
-    output_path = local_save_dir / f"{split}.parquet"
+    output_path = output_dir / f"{split}.parquet"
     rows = build_rows(split=split, tasks=tasks, num_samples=num_samples, agent_name=agent_name)
     pd.DataFrame(rows).to_parquet(output_path, index=False)
     return output_path
+
+
+def _write_dataset_variant(
+    *,
+    output_dir: str | Path,
+    tasks: list[dict[str, Any]],
+    num_train_samples: int,
+    num_val_samples: int,
+    agent_name: str,
+) -> Path:
+    resolved_dir = Path(output_dir).expanduser()
+    resolved_dir.mkdir(parents=True, exist_ok=True)
+    _write_split(
+        output_dir=resolved_dir,
+        split="train",
+        tasks=tasks,
+        num_samples=num_train_samples,
+        agent_name=agent_name,
+    )
+    _write_split(
+        output_dir=resolved_dir,
+        split="val",
+        tasks=tasks,
+        num_samples=num_val_samples,
+        agent_name=agent_name,
+    )
+    return resolved_dir
 
 
 def write_standard_webgym_datasets(
@@ -132,9 +165,18 @@ def write_standard_webgym_datasets(
     async_rl_save_dir: str | Path,
     num_train_samples: int | None,
     num_val_samples: int | None,
-    include_localhost: bool = False,
-) -> tuple[Path, Path]:
-    tasks = select_tasks(load_tasks(task_file), include_localhost=include_localhost)
+    include_localhost: bool = DEFAULT_INCLUDE_LOCALHOST,
+    target: str = BOTH_TARGET,
+    task_ids: list[str] | None = None,
+) -> dict[str, Path]:
+    if target not in DATASET_TARGETS:
+        raise ValueError(f"Unsupported target: {target}")
+
+    tasks = select_tasks(
+        load_tasks(task_file),
+        task_ids=task_ids,
+        include_localhost=include_localhost,
+    )
     resolved_num_train_samples = _resolve_num_samples(
         num_train_samples,
         num_tasks=len(tasks),
@@ -146,50 +188,32 @@ def write_standard_webgym_datasets(
         repeats_per_task=DEFAULT_VAL_REPEATS_PER_TASK,
     )
 
-    skd_dir = Path(skd_save_dir).expanduser()
-    skd_dir.mkdir(parents=True, exist_ok=True)
-    write_split(
-        local_save_dir=skd_dir,
-        split="train",
-        tasks=tasks,
-        num_samples=resolved_num_train_samples,
-        agent_name=DEFAULT_AGENT_NAME,
-    )
-    write_split(
-        local_save_dir=skd_dir,
-        split="val",
-        tasks=tasks,
-        num_samples=resolved_num_val_samples,
-        agent_name=DEFAULT_AGENT_NAME,
-    )
-
-    async_dir = Path(async_rl_save_dir).expanduser()
-    async_dir.mkdir(parents=True, exist_ok=True)
-    write_split(
-        local_save_dir=async_dir,
-        split="train",
-        tasks=tasks,
-        num_samples=resolved_num_train_samples,
-        agent_name=DEFAULT_ASYNC_RL_AGENT_NAME,
-    )
-    write_split(
-        local_save_dir=async_dir,
-        split="val",
-        tasks=tasks,
-        num_samples=resolved_num_val_samples,
-        agent_name=DEFAULT_ASYNC_RL_AGENT_NAME,
-    )
-
-    return skd_dir, async_dir
+    outputs: dict[str, Path] = {}
+    if target in (SKD_TARGET, BOTH_TARGET):
+        outputs[SKD_TARGET] = _write_dataset_variant(
+            output_dir=skd_save_dir,
+            tasks=tasks,
+            num_train_samples=resolved_num_train_samples,
+            num_val_samples=resolved_num_val_samples,
+            agent_name=SKD_AGENT_NAME,
+        )
+    if target in (RL_TARGET, BOTH_TARGET):
+        outputs[RL_TARGET] = _write_dataset_variant(
+            output_dir=async_rl_save_dir,
+            tasks=tasks,
+            num_train_samples=resolved_num_train_samples,
+            num_val_samples=resolved_num_val_samples,
+            agent_name=RL_AGENT_NAME,
+        )
+    return outputs
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Generate train.parquet and val.parquet files for webgym-rl."
-    )
+    parser = argparse.ArgumentParser(description="Generate WebGym parquet datasets for SKD, RL, or both.")
     parser.add_argument("--task-file", default=DEFAULT_TASK_FILE)
-    parser.add_argument("--local-save-dir", default=DEFAULT_LOCAL_SAVE_DIR)
-    parser.add_argument("--async-rl-save-dir", default=DEFAULT_ASYNC_RL_SAVE_DIR)
+    parser.add_argument("--skd-save-dir", default=DEFAULT_SKD_SAVE_DIR)
+    parser.add_argument("--rl-save-dir", default=DEFAULT_RL_SAVE_DIR)
+    parser.add_argument("--target", choices=DATASET_TARGETS, default=BOTH_TARGET)
     parser.add_argument(
         "--num-train-samples",
         type=int,
@@ -202,77 +226,42 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=f"Defaults to selected_task_count * {DEFAULT_VAL_REPEATS_PER_TASK}.",
     )
-    parser.add_argument("--agent-name", default=DEFAULT_AGENT_NAME)
-    parser.add_argument(
-        "--skip-async-rl-copy",
-        action="store_true",
-        help="Only write the primary dataset instead of also emitting the fully async RL copy.",
-    )
     parser.add_argument(
         "--task-ids",
         nargs="*",
         default=None,
-        help="Optional task_id allowlist. Defaults to all non-localhost tasks.",
+        help="Optional task_id allowlist.",
     )
     parser.add_argument(
         "--include-localhost",
+        dest="include_localhost",
         action="store_true",
+        default=DEFAULT_INCLUDE_LOCALHOST,
         help="Include tasks whose website points at localhost/127.0.0.1.",
+    )
+    parser.add_argument(
+        "--exclude-localhost",
+        dest="include_localhost",
+        action="store_false",
+        help="Exclude tasks whose website points at localhost/127.0.0.1.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.skip_async_rl_copy:
-        local_save_dir = Path(args.local_save_dir).expanduser()
-        local_save_dir.mkdir(parents=True, exist_ok=True)
-
-        tasks = select_tasks(
-            load_tasks(args.task_file),
-            task_ids=args.task_ids,
-            include_localhost=args.include_localhost,
-        )
-        resolved_num_train_samples = _resolve_num_samples(
-            args.num_train_samples,
-            num_tasks=len(tasks),
-            repeats_per_task=DEFAULT_TRAIN_REPEATS_PER_TASK,
-        )
-        resolved_num_val_samples = _resolve_num_samples(
-            args.num_val_samples,
-            num_tasks=len(tasks),
-            repeats_per_task=DEFAULT_VAL_REPEATS_PER_TASK,
-        )
-        train_path = write_split(
-            local_save_dir=local_save_dir,
-            split="train",
-            tasks=tasks,
-            num_samples=resolved_num_train_samples,
-            agent_name=args.agent_name,
-        )
-        val_path = write_split(
-            local_save_dir=local_save_dir,
-            split="val",
-            tasks=tasks,
-            num_samples=resolved_num_val_samples,
-            agent_name=args.agent_name,
-        )
-
-        task_ids = ", ".join(str(task["task_id"]) for task in tasks)
-        print(f"Wrote {resolved_num_train_samples} train rows to {train_path}")
-        print(f"Wrote {resolved_num_val_samples} val rows to {val_path}")
-        print(f"Task ids: {task_ids}")
-        return
-
-    skd_dir, async_dir = write_standard_webgym_datasets(
+    outputs = write_standard_webgym_datasets(
         task_file=args.task_file,
-        skd_save_dir=args.local_save_dir,
-        async_rl_save_dir=args.async_rl_save_dir,
+        skd_save_dir=args.skd_save_dir,
+        async_rl_save_dir=args.rl_save_dir,
         num_train_samples=args.num_train_samples,
         num_val_samples=args.num_val_samples,
         include_localhost=args.include_localhost,
+        target=args.target,
+        task_ids=args.task_ids,
     )
-    print(f"Wrote standard WebGym datasets to {skd_dir} and {async_dir}")
+    for target, output_dir in outputs.items():
+        print(f"Wrote {target} dataset to {output_dir}")
 
 
 if __name__ == "__main__":
