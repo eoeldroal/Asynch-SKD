@@ -1,17 +1,23 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
 from copy import deepcopy
 from uuid import uuid4
 
+import httpx
+
 from verl.experimental.agent_loop.tool_parser import ToolParseError
+from verl.experimental.agent_loop.web_osgym_protocol import WebOsGymRemoteError
 from verl.tools.schemas import ToolResponse
 
 
 class WebOsGymLoopMixin:
     shared_tools_kwargs_key = "web_osgym"
     legacy_bundled_tool_name = "computer"
+    web_osgym_start_max_attempts = 3
+    web_osgym_start_retry_delay_sec = 1.0
 
     @staticmethod
     def _tool_parse_error_rules() -> list[str]:
@@ -194,11 +200,22 @@ class WebOsGymLoopMixin:
         if task_id is None:
             raise ValueError("Web/OS gym session requires task_id in tools_kwargs.create_kwargs or agent_data.extra_fields")
         session_id = int(agent_data.extra_fields.get("web_osgym_session_id") or self._allocate_web_osgym_session_id())
-        instance_id, start_response = await tool.create(
-            task_id=task_id,
-            request_id=session_id,
-            include_a11y=include_a11y,
-        )
+        last_error = None
+        for attempt in range(1, self.web_osgym_start_max_attempts + 1):
+            try:
+                instance_id, start_response = await tool.create(
+                    task_id=task_id,
+                    request_id=session_id,
+                    include_a11y=include_a11y,
+                )
+                break
+            except (WebOsGymRemoteError, httpx.HTTPError) as exc:
+                last_error = exc
+                if attempt >= self.web_osgym_start_max_attempts:
+                    raise
+                await asyncio.sleep(self.web_osgym_start_retry_delay_sec)
+        else:
+            raise RuntimeError("web_osgym start retry loop exited unexpectedly") from last_error
         agent_data.extra_fields["web_osgym_instance_id"] = instance_id
         agent_data.extra_fields["web_osgym_task_id"] = task_id
         agent_data.extra_fields["web_osgym_session_id"] = session_id

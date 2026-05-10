@@ -3,6 +3,7 @@ import unittest
 from PIL import Image
 
 from verl.experimental.agent_loop.tool_agent_loop import AgentData
+from verl.experimental.agent_loop.web_osgym_protocol import WebOsGymRemoteError
 from verl.experimental.agent_loop.web_osgym_loop_mixin import WebOsGymLoopMixin
 from verl.tools.base_tool import ToolResponse
 
@@ -36,6 +37,34 @@ class _FakeTool:
     def restore_instance(self, instance_id, **kwargs):
         self.restored.append((instance_id, kwargs))
         self._instance_dict[instance_id] = dict(kwargs)
+
+
+class _RetryingFakeTool(_FakeTool):
+    def __init__(self, *, failures_before_success: int):
+        super().__init__()
+        self.failures_before_success = failures_before_success
+        self.attempts = 0
+
+    async def create(self, **kwargs):
+        self.attempts += 1
+        self.created.append(kwargs)
+        if self.attempts <= self.failures_before_success:
+            raise WebOsGymRemoteError(
+                op="start",
+                session_id=kwargs["request_id"],
+                task_id=kwargs["task_id"],
+                error_type="fail_request_handle",
+                message=f"attempt {self.attempts} failed",
+            )
+        self._instance_dict["instance-1"] = {
+            "task_id": kwargs["task_id"],
+            "request_id": kwargs["request_id"],
+            "include_a11y": kwargs["include_a11y"],
+            "reward": None,
+            "screen_width": 1920,
+            "screen_height": 1080,
+        }
+        return "instance-1", ToolResponse(text="initial-observation", image=[Image.new("RGB", (2, 2), "blue")])
 
 
 class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
@@ -78,6 +107,51 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         await loop._start_web_osgym_session(agent_data, include_a11y=False)
 
         self.assertEqual(tool.created[0]["task_id"], "shared-task")
+
+    async def test_start_session_retries_until_third_attempt_succeeds(self):
+        loop = WebOsGymLoopMixin()
+        tool = _RetryingFakeTool(failures_before_success=2)
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="loop-req",
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "retry-task"}}},
+        )
+        agent_data._active_tools = {"computer": tool}
+        agent_data.extra_fields["web_osgym_session_id"] = 101
+
+        response = await loop._start_web_osgym_session(agent_data, include_a11y=False)
+
+        self.assertEqual(tool.attempts, 3)
+        self.assertEqual(len(tool.created), 3)
+        self.assertEqual(
+            [kwargs["request_id"] for kwargs in tool.created],
+            [101, 101, 101],
+        )
+        self.assertEqual(agent_data.extra_fields["web_osgym_instance_id"], "instance-1")
+        self.assertEqual(response.text, "initial-observation")
+
+    async def test_start_session_raises_after_three_failed_attempts(self):
+        loop = WebOsGymLoopMixin()
+        tool = _RetryingFakeTool(failures_before_success=3)
+        agent_data = AgentData(
+            messages=[{"role": "user", "content": "task"}],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="loop-req",
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "retry-task"}}},
+        )
+        agent_data._active_tools = {"computer": tool}
+        agent_data.extra_fields["web_osgym_session_id"] = 101
+
+        with self.assertRaises(WebOsGymRemoteError):
+            await loop._start_web_osgym_session(agent_data, include_a11y=False)
+
+        self.assertEqual(tool.attempts, 3)
+        self.assertNotIn("web_osgym_instance_id", agent_data.extra_fields)
 
     async def test_finalize_with_reward_stores_reward_once(self):
         loop = WebOsGymLoopMixin()
