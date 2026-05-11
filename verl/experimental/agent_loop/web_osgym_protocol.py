@@ -1,3 +1,4 @@
+import asyncio
 import base64
 from io import BytesIO
 from typing import Any
@@ -63,6 +64,9 @@ class WebOsGymRemoteError(RuntimeError):
 
 
 class WebOsGymClient:
+    ACTION_MAX_RETRIES = 3
+    ACTION_RETRY_DELAY_SEC = 1.0
+
     def __init__(self, base_url: str, timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -120,15 +124,33 @@ class WebOsGymClient:
         include_a11y: bool,
         actions: list[WebOsGymAction],
     ) -> WebOsGymResponse:
-        return await self._post(
-            {
-                "session_id": request_id,
-                "task_id": task_id,
-                "op": "action",
-                "include_a11y": include_a11y,
-                "actions": [action.model_dump(exclude_none=True) for action in actions],
-            }
-        )
+        payload = {
+            "session_id": request_id,
+            "task_id": task_id,
+            "op": "action",
+            "include_a11y": include_a11y,
+            "actions": [action.model_dump(exclude_none=True) for action in actions],
+        }
+        last_error = None
+        for attempt in range(1, self.ACTION_MAX_RETRIES + 2):
+            try:
+                response = await self._post(payload)
+            except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+                last_error = exc
+            else:
+                if response.status != "error" or response.error_type != "gateway_busy":
+                    return response
+                last_error = WebOsGymRemoteError(
+                    op="action",
+                    session_id=response.session_id,
+                    task_id=response.task_id,
+                    error_type=response.error_type,
+                    message=response.message,
+                )
+            if attempt > self.ACTION_MAX_RETRIES:
+                break
+            await asyncio.sleep(self.ACTION_RETRY_DELAY_SEC)
+        raise last_error
 
     async def reward(self, *, request_id: int, task_id: str) -> float:
         response = await self._post({"session_id": request_id, "task_id": task_id, "op": "reward"})
