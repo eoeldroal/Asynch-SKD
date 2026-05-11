@@ -944,7 +944,7 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
-            return await agent_loop.run(sampling_params, **kwargs)
+            return await agent_loop.run(sampling_params, _trajectory_global_step=trajectory["step"], **kwargs)
 
     def _get_or_create_agent_loop(self, agent_name: str) -> AgentLoopBase:
         assert agent_name in _agent_loop_registry, (

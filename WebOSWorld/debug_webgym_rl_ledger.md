@@ -86,7 +86,8 @@ Track only the facts that still matter for debugging or operating the current We
 - Observed failure pattern:
   - model emits unsupported key names such as `win`
   - older runtime normalized `cmd`, `command`, `meta` to `Meta`
-  - current Linux-focused runtime normalizes `ctrl`, `control`, `cmd`, `command`, `meta`, and `win` to `Control`
+  - current Linux-focused runtime normalizes shortcut intent `ctrl`, `control`, `cmd`, `command`, and `controlormeta` to `Control`
+  - current Linux-focused runtime normalizes literal OS modifier `meta`, `super`, `win`, and `windows` to `Meta`
   - current runtime also splits HOTKEY combo strings such as `ctrl+a` into canonical key lists such as `["Control", "A"]`
   - Playwright rejects `Keyboard.down("win")`
 
@@ -216,7 +217,8 @@ Track only the facts that still matter for debugging or operating the current We
 
 2. **Need end-to-end confirmation that the new Linux-focused key normalization reduces invalid keyboard actions.**
    - Current runtime policy:
-     - `ctrl`, `control`, `cmd`, `command`, `meta`, `win` -> `Control`
+     - shortcut intent `ctrl`, `control`, `cmd`, `command`, `controlormeta` -> `Control`
+     - literal OS modifier `meta`, `super`, `win`, `windows` -> `Meta`
      - HOTKEY combo strings are split and canonicalized in `verl`
      - single-key actions reject combo strings early
    - Remaining work is empirical validation in a fresh RL run, not a contract decision.

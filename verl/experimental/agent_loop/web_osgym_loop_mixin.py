@@ -233,7 +233,18 @@ class WebOsGymLoopMixin:
         self._ensure_web_osgym_session(agent_data)
         tool = self._get_active_tool(agent_data)
         instance_id = agent_data.extra_fields["web_osgym_instance_id"]
-        reward = await tool.calc_reward(instance_id, termination_reason=termination_reason)
+        last_error = None
+        for attempt in range(1, self.web_osgym_start_max_attempts + 1):
+            try:
+                reward = await tool.calc_reward(instance_id, termination_reason=termination_reason)
+                break
+            except (WebOsGymRemoteError, httpx.HTTPError) as exc:
+                last_error = exc
+                if attempt >= self.web_osgym_start_max_attempts:
+                    raise
+                await asyncio.sleep(self.web_osgym_start_retry_delay_sec)
+        else:
+            raise RuntimeError("calc_reward retry loop exited unexpectedly") from last_error
         agent_data.extra_fields["web_osgym_reward_fetched"] = True
         agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
         agent_data.extra_fields["web_osgym_reward_score"] = float(reward)

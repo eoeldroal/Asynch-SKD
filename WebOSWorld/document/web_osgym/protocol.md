@@ -285,7 +285,8 @@ DONE:
 현재 Linux-focused canonical key normalization은 다음과 같다.
 
 - modifier canonical form
-  - `ctrl`, `control`, `cmd`, `command`, `meta`, `win` -> `Control`
+  - shortcut intent: `ctrl`, `control`, `cmd`, `command`, `controlormeta` -> `Control`
+  - literal OS modifier: `meta`, `super`, `win`, `windows` -> `Meta`
   - `option` -> `Alt`
 - special key aliases
   - `return` -> `Enter`

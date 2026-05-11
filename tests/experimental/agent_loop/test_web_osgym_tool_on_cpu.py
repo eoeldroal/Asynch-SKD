@@ -468,6 +468,29 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.action_type, "HOTKEY")
         self.assertEqual(action.keys, ["Control", "A"])
 
+    async def test_tool_execute_normalizes_hotkey_controlormeta_alias_to_control(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["ControlOrMeta", "a"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Control", "A"])
+
     async def test_tool_execute_splits_hotkey_combo_string(self):
         seen = {}
 
@@ -535,7 +558,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "HOTKEY")
-        self.assertEqual(action.keys, ["Control", "F2"])
+        self.assertEqual(action.keys, ["Meta", "F2"])
 
     async def test_action_named_tool_execute_normalizes_press_key_alias(self):
         seen = {}
@@ -569,7 +592,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.action_type, "PRESS")
         self.assertEqual(action.key, "Escape")
 
-    async def test_action_named_tool_execute_normalizes_meta_alias_to_control(self):
+    async def test_action_named_tool_execute_normalizes_meta_alias_to_meta(self):
         seen = {}
 
         class _FakeClient:
@@ -599,7 +622,53 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         action = seen["actions"][0]
         self.assertEqual(action.action_type, "PRESS")
-        self.assertEqual(action.key, "Control")
+        self.assertEqual(action.key, "Meta")
+
+    async def test_tool_execute_normalizes_hotkey_super_alias_to_meta(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["super+e"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Meta", "E"])
+
+    async def test_tool_execute_normalizes_hotkey_windows_alias_to_meta(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "HOTKEY", "keys": ["windows", "left"]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "HOTKEY")
+        self.assertEqual(action.keys, ["Meta", "ArrowLeft"])
 
     async def test_tool_execute_rejects_press_combo_string(self):
         class _FakeClient:

@@ -422,7 +422,8 @@ validation layer다.
 
 현재 Linux-focused canonical keyboard policy:
 
-- modifier는 `Control` 중심 canonical form을 쓴다.
+- shortcut modifier는 `Control` 중심 canonical form을 쓴다.
+- literal OS modifier는 `Meta` canonical form을 쓴다.
 - `PRESS`, `KEY_DOWN`, `KEY_UP`는 single key only다.
 - `HOTKEY`는 single key name list를 canonical form으로 쓴다.
 - `HOTKEY(["ctrl+a"])` 같은 combo-string payload는 `verl`에서 `["Control", "A"]`로 분해/정규화한 뒤

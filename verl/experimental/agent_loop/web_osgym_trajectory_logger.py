@@ -23,9 +23,9 @@ class WebOsGymTrajectoryLogger:
     def session_dir(self, *, task_id: Any, sample_uid: Any, global_step: Any, session_id: Any) -> Path:
         task_part = _safe_component(task_id, fallback="unknown_task")
         sample_part = _safe_component(sample_uid, fallback="unknown_uid")
-        global_step_part = _safe_component(f"global_step_{global_step}", fallback="global_step_unknown")
+        step_part = _safe_component(f"step_{global_step}", fallback="step_unknown")
         session_part = _safe_component(session_id, fallback="unknown_session")
-        path = self.root_dir / f"{task_part}___{sample_part}___{global_step_part}___{session_part}"
+        path = self.root_dir / step_part / f"{task_part}___{sample_part}___{session_part}"
         path.mkdir(parents=True, exist_ok=True)
         return path
 

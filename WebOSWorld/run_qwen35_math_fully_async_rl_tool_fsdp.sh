@@ -2,6 +2,8 @@
 set -xeuo pipefail
 
 cd /home/sogang_nlpy/verl
+HF_HUB_ROOT=/home/sogang_nlpy/.cache/huggingface/hub
+QWEN35_9B_PATH="${QWEN35_9B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
 
 # Fully async RL run based on:
 #   verl/experimental/fully_async_policy/shell/dapo_7b_math_fsdp2_4_4.sh
@@ -31,7 +33,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/models/Qwen3.5-9B \
+    actor_rollout_ref.model.path="${QWEN35_9B_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \

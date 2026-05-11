@@ -2,6 +2,9 @@
 set -xeuo pipefail
 
 cd /home/sogang_nlpy/verl
+HF_HUB_ROOT=/home/sogang_nlpy/.cache/huggingface/hub
+QWEN35_9B_PATH="${QWEN35_9B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
+QWEN35_27B_PATH="${QWEN35_27B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654}"
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -22,7 +25,7 @@ python3 -m verl.trainer.main_ppo \
     data.shuffle=False \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
-    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/models/Qwen3.5-9B \
+    actor_rollout_ref.model.path="${QWEN35_9B_PATH}" \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.use_fused_kernels=False \
@@ -32,7 +35,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.enabled=True \
     distillation.n_gpus_per_node=4 \
     distillation.nnodes=1 \
-    distillation.teacher_models.teacher_model.model_path=/home/sogang_nlpy/verl/models/Qwen3.5-27B \
+    distillation.teacher_models.teacher_model.model_path="${QWEN35_27B_PATH}" \
     distillation.teacher_models.teacher_model.num_replicas=4 \
     distillation.teacher_models.teacher_model.inference.name=sglang \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \

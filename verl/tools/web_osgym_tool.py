@@ -79,13 +79,16 @@ _PLAYWRIGHT_KEY_ALIASES = {
     "right": "ArrowRight",
     "ctrl": "Control",
     "control": "Control",
+    "controlormeta": "Control",
     "alt": "Alt",
     "option": "Alt",
     "shift": "Shift",
     "cmd": "Control",
     "command": "Control",
-    "meta": "Control",
-    "win": "Control",
+    "meta": "Meta",
+    "super": "Meta",
+    "win": "Meta",
+    "windows": "Meta",
 }
 
 

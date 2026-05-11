@@ -1217,6 +1217,57 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
     assert summary["has_reward"] is True
 
 
+def test_init_web_agent_data_stores_trajectory_global_step():
+    loop = _make_loop()
+    loop.processor = None
+
+    async def _run():
+        agent_data = await loop._init_web_agent_data(
+            raw_prompt=[{"role": "user", "content": "task"}],
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
+            uid="uid-trajectory",
+            _trajectory_global_step=7,
+        )
+        assert agent_data.extra_fields["web_osgym_log_global_step"] == 7
+
+    asyncio.run(_run())
+
+
+def test_web_osgym_session_dir_is_stable_after_global_step_changes(monkeypatch, tmp_path):
+    monkeypatch.setenv("WEB_OSGYM_TOOL_TRACE_DIR", str(tmp_path))
+    loop = _make_loop()
+    agent_data = _agent_data(_FakeWebTool())
+    agent_data.request_id = "req-stable"
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_task_id": "nhis_open_sick_pay_income_check",
+            "web_osgym_session_id": 777,
+            "web_osgym_sample_uid": "uid-stable",
+            "global_steps": None,
+            "web_osgym_log_global_step": 0,
+            "web_osgym_reward_score": 0.0,
+            "web_osgym_termination_reason": "system_stop",
+            "web_osgym_trajectory_counts": {"event_count": 1},
+        }
+    )
+
+    loop._append_web_osgym_initial_observation(
+        agent_data,
+        observation_text="A11Y_TREE:\nroot",
+        image_data=[Image.new("RGB", (2, 2), "blue")],
+    )
+
+    first_dir = tmp_path / "nhis_open_sick_pay_income_check___uid-stable___global_step_0___777"
+    assert (first_dir / "trajectory.jsonl").exists()
+
+    agent_data.extra_fields["global_steps"] = 0
+    loop._write_web_osgym_summary(agent_data)
+
+    assert (first_dir / "summary.json").exists()
+    second_dir = tmp_path / "nhis_open_sick_pay_income_check___uid-stable___global_step_None___777"
+    assert not (second_dir / "summary.json").exists()
+
+
 def test_decode_response_text_preserves_special_tokens():
     loop = _make_loop()
     captured = {}

@@ -477,14 +477,35 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             return None
         return WebOsGymTrajectoryLogger(Path(trace_dir_value))
 
+    @staticmethod
+    def _coerce_web_osgym_log_global_step(value: Any) -> int | None:
+        try:
+            step = int(value)
+        except (TypeError, ValueError):
+            return None
+        return step if step >= 0 else None
+
+    def _resolve_web_osgym_log_global_step(self, agent_data: AgentData) -> int:
+        extra_fields = agent_data.extra_fields
+        for key in ("web_osgym_log_global_step", "global_steps", "min_global_steps", "max_global_steps"):
+            resolved = self._coerce_web_osgym_log_global_step(extra_fields.get(key))
+            if resolved is not None:
+                extra_fields["web_osgym_log_global_step"] = resolved
+                return resolved
+        extra_fields["web_osgym_log_global_step"] = 0
+        return 0
+
     def _get_web_osgym_session_dir(self, agent_data: AgentData) -> Path | None:
         logger_obj = self._get_web_osgym_trajectory_logger(agent_data)
         if logger_obj is None:
             return None
+        cached_dir = agent_data.extra_fields.get("web_osgym_trajectory_dir")
+        if cached_dir:
+            return Path(cached_dir)
         session_dir = logger_obj.session_dir(
             task_id=agent_data.extra_fields.get("web_osgym_task_id"),
             sample_uid=agent_data.extra_fields.get("web_osgym_sample_uid"),
-            global_step=agent_data.extra_fields.get("global_steps"),
+            global_step=self._resolve_web_osgym_log_global_step(agent_data),
             session_id=agent_data.extra_fields.get("web_osgym_session_id"),
         )
         agent_data.extra_fields["web_osgym_trajectory_dir"] = str(session_dir)
@@ -595,7 +616,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             {
                 "task_id": agent_data.extra_fields.get("web_osgym_task_id"),
                 "sample_uid": agent_data.extra_fields.get("web_osgym_sample_uid"),
-                "global_step": agent_data.extra_fields.get("global_steps"),
+                "global_step": self._resolve_web_osgym_log_global_step(agent_data),
                 "session_id": agent_data.extra_fields.get("web_osgym_session_id"),
                 "request_id": agent_data.request_id,
                 "reward_score": agent_data.extra_fields.get("web_osgym_reward_score"),
@@ -629,6 +650,9 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             agent_data.extra_fields["web_osgym_sample_uid"] = str(kwargs.get("uid"))
         elif kwargs.get("index") is not None:
             agent_data.extra_fields["web_osgym_sample_uid"] = f"index_{kwargs.get('index')}"
+        trajectory_global_step = self._coerce_web_osgym_log_global_step(kwargs.get("_trajectory_global_step"))
+        if trajectory_global_step is not None:
+            agent_data.extra_fields["web_osgym_log_global_step"] = trajectory_global_step
 
         extra_info = kwargs.get("extra_info", {}) or {}
         tool_selection = extra_info.get("tool_selection")
