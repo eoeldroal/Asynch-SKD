@@ -27,6 +27,10 @@ from verl.utils.tokenizer import normalize_token_ids
 
 @register("web_skd_agent")
 class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
+    def _web_skd_include_a11y(self) -> bool:
+        rollout_custom = getattr(self.rollout_config, "custom", None) or {}
+        return bool(rollout_custom.get("web_skd_include_a11y", False))
+
     def _split_env_observation(self, env_text: str | None, image_data: list[Any] | None) -> tuple[str, str]:
         if not env_text:
             return "", ""
@@ -417,7 +421,10 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             image_count=_safe_len(agent_data.image_data),
         )
         start_t0 = time.monotonic()
-        start_response = await self._start_web_osgym_session(agent_data, include_a11y=True)
+        start_response = await self._start_web_osgym_session(
+            agent_data,
+            include_a11y=self._web_skd_include_a11y(),
+        )
         start_ms = (time.monotonic() - start_t0) * 1000
         _trace_async_skd(
             "web_skd.pending_start_session_done",
