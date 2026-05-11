@@ -346,7 +346,6 @@ student_prompt_policy:
   prompt_semantics_source: osworld_qwen3vl_harness
   tool_semantics_source: computer_13
   observation_type: screenshot_only
-  privileged_a11y_for_student: false
   coordinate_mode: osworld_relative_1000
   coordinate_target_mode: osworld_relative_1000
   add_new_current_observation_label: false

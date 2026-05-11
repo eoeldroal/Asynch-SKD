@@ -27,6 +27,7 @@ eliminating the need for a separate teacher logprob computation in postprocessin
 from copy import deepcopy
 from dataclasses import dataclass
 import inspect
+import json
 import logging
 import os
 from pathlib import Path
@@ -44,7 +45,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.teacher_fewshot import load_teacher_fewshot_transcript
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
-from verl.experimental.async_skd.events import emit_async_skd_event
+from verl.experimental.async_skd.events import emit_async_skd_event, get_async_skd_event_context
 from verl.experimental.async_skd.state import SkdPartialState
 from verl.utils.profiler import simple_timer
 
@@ -58,6 +59,7 @@ _ASYNC_SKD_TRACE = int(os.getenv("VERL_ASYNC_SKD_TRACE", os.getenv("VERL_SKD_DEB
 _SKD_CHUNK_TRACE = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE", "0"))
 _SKD_CHUNK_TRACE_TOPK = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE_TOPK", "5"))
 _SKD_CHUNK_TRACE_MAX_TOKENS = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE_MAX_TOKENS", "64"))
+_SKD_CHUNK_LIVE_TAIL_CHARS = int(os.getenv("VERL_ASYNC_SKD_CHUNK_LIVE_TAIL_CHARS", "256"))
 _SKD_PENDING_TURN_STATE = "skd_pending_turn_state"
 _SKD_PENDING_TURN_CHUNKS = "skd_pending_turn_chunks"
 
@@ -78,6 +80,80 @@ def _safe_len(value: Any) -> int:
         return len(value)
     except TypeError:
         return 1
+
+
+def _chunk_live_log_path() -> str | None:
+    path = os.getenv("VERL_ASYNC_SKD_CHUNK_LIVE_LOG")
+    return path if path else None
+
+
+def _decode_chunk_text(tokenizer: Any, ids: list[int]) -> str:
+    if not ids:
+        return ""
+    for kwargs in (
+        {"skip_special_tokens": False, "clean_up_tokenization_spaces": False},
+        {"skip_special_tokens": False},
+        {},
+    ):
+        try:
+            return tokenizer.decode(ids, **kwargs)
+        except TypeError:
+            continue
+    return " ".join(str(token_id) for token_id in ids)
+
+
+def _tail_text(text: str, max_chars: int) -> str:
+    return text if len(text) <= max_chars else text[-max_chars:]
+
+
+def _count_special_marker(text: str, marker: str) -> int:
+    return text.count(marker)
+
+
+def _append_chunk_live_log(
+    *,
+    tokenizer: Any,
+    request_id: str,
+    chunk_idx: int,
+    student_ms: int,
+    teacher_ms: int,
+    chunk: list[int],
+    new_tokens: list[int],
+    accepted: int,
+    rejected: int,
+    response_len: int,
+    eos_in_new_tokens: bool,
+) -> None:
+    path = _chunk_live_log_path()
+    if path is None:
+        return
+
+    raw_text = _decode_chunk_text(tokenizer, chunk)
+    verified_text = _decode_chunk_text(tokenizer, new_tokens)
+    record = {
+        "ts": time.time(),
+        "pid": os.getpid(),
+        "request_id": request_id,
+        "chunk_idx": chunk_idx,
+        "student_ms": student_ms,
+        "teacher_ms": teacher_ms,
+        "accepted": accepted,
+        "rejected": rejected,
+        "new_tokens": len(new_tokens),
+        "response_len": response_len,
+        "eos_in_new_tokens": eos_in_new_tokens,
+        "raw_text_tail": _tail_text(raw_text, _SKD_CHUNK_LIVE_TAIL_CHARS),
+        "verified_text_tail": _tail_text(verified_text, _SKD_CHUNK_LIVE_TAIL_CHARS),
+        "im_start_count": _count_special_marker(verified_text, "<|im_start|>"),
+        "im_end_count": _count_special_marker(verified_text, "<|im_end|>"),
+        "endoftext_count": _count_special_marker(verified_text, "<|endoftext|>"),
+        **get_async_skd_event_context(),
+    }
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
 
 
 def _token_edges(ids: list[int], *, head: int = 8, tail: int = 8) -> dict[str, list[int]]:
@@ -233,9 +309,10 @@ class SkdAgentLoop(ToolAgentLoop):
         return messages, images
 
     def _teacher_images_with_runtime(self, runtime_images: list[Any] | None) -> list[Any] | None:
-        if not self.teacher_fewshot_images:
+        teacher_fewshot_images = getattr(self, "teacher_fewshot_images", None)
+        if not teacher_fewshot_images:
             return runtime_images
-        merged = list(self.teacher_fewshot_images)
+        merged = list(teacher_fewshot_images)
         if runtime_images:
             merged.extend(runtime_images)
         return merged
@@ -1208,10 +1285,17 @@ class SkdAgentLoop(ToolAgentLoop):
                         video_count=_safe_len(agent_data.video_data),
                     )
                     try:
+                        student_sampling_params = {**sampling_params, "max_tokens": actual_chunk_size}
+                        if "stop_token_ids" not in student_sampling_params:
+                            eos_token_id = self.tokenizer.eos_token_id
+                            if eos_token_id is not None:
+                                student_sampling_params["stop_token_ids"] = (
+                                    list(eos_token_id) if isinstance(eos_token_id, list) else [eos_token_id]
+                                )
                         chunk_output = await self.server_manager.generate(
                             request_id=agent_data.request_id,
                             prompt_ids=student_request_prompt_ids,
-                            sampling_params={**sampling_params, "max_tokens": actual_chunk_size},
+                            sampling_params=student_sampling_params,
                             image_data=agent_data.image_data,
                             video_data=agent_data.video_data,
                         )
@@ -1600,6 +1684,8 @@ class SkdAgentLoop(ToolAgentLoop):
                     teacher_rows_accumulated=len(teacher_ids_list) + len(turn_state.teacher_ids_rows),
                     teacher_logprobs_accumulated=len(teacher_logprobs_list) + len(turn_state.teacher_logprobs_rows),
                 )
+                eos_token_id = self.tokenizer.eos_token_id
+                eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
                 emit_async_skd_event(
                     "chunk_commit",
                     request_id=agent_data.request_id,
@@ -1617,6 +1703,19 @@ class SkdAgentLoop(ToolAgentLoop):
                     verified_chunk=list(new_tokens) if _SKD_CHUNK_TRACE > 0 else None,
                     teacher_rows=int(teacher_ids.shape[0]) if _SKD_CHUNK_TRACE > 0 else None,
                 )
+                _append_chunk_live_log(
+                    tokenizer=self.tokenizer,
+                    request_id=agent_data.request_id,
+                    chunk_idx=skd_metrics["chunk_count"],
+                    student_ms=student_ms,
+                    teacher_ms=teacher_ms,
+                    chunk=list(chunk),
+                    new_tokens=list(new_tokens),
+                    accepted=len(new_tokens) - (1 if rejection_pos is not None else 0),
+                    rejected=1 if rejection_pos is not None else 0,
+                    response_len=len(agent_data.response_mask) + len(turn_state.tokens),
+                    eos_in_new_tokens=any(token_id in new_tokens for token_id in eos_ids),
+                )
                 _trace_async_skd(
                     "loop.chunk_commit",
                     request_id=agent_data.request_id,
@@ -1631,8 +1730,6 @@ class SkdAgentLoop(ToolAgentLoop):
                 # 5. Termination checks within chunk loop
                 # Note: stop_reason == "completed" covers both EOS and max_tokens,
                 # so we check for actual EOS tokens instead.
-                eos_token_id = self.tokenizer.eos_token_id
-                eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id]
                 if any(t in new_tokens for t in eos_ids):
                     termination_reason = "eos"
                     break

@@ -88,6 +88,10 @@ class FakeHermesTokenizer:
         return "".join(text_parts)
 
 
+class FakeListEosTokenizer(FakeTokenizer):
+    eos_token_id = [EOS, EOS + 1]
+
+
 class FakeStudentServer:
     """Returns preconfigured chunks and records the prompt seen by each call."""
 
@@ -118,6 +122,8 @@ class FakeStudentServer:
                 "prompt_ids": list(prompt_ids),
                 "prompt_len": len(prompt_ids),
                 "max_tokens": sampling_params.get("max_tokens"),
+                "ignore_eos": sampling_params.get("ignore_eos"),
+                "stop_token_ids": sampling_params.get("stop_token_ids"),
                 "prompt_text": prompt_text,
                 "image_data": image_data,
                 "chunk": chunk,
@@ -609,7 +615,9 @@ async def test_rejection_at_first_token_discards_suffix():
 @pytest.mark.asyncio
 async def test_skd_chunk_commit_emits_realtime_progress_event(tmp_path, monkeypatch):
     event_path = tmp_path / "async_skd_events.jsonl"
+    chunk_live_path = tmp_path / "async_skd_chunk_live.jsonl"
     monkeypatch.setenv("VERL_ASYNC_SKD_EVENT_LOG", str(event_path))
+    monkeypatch.setenv("VERL_ASYNC_SKD_CHUNK_LIVE_LOG", str(chunk_live_path))
     monkeypatch.setattr(skd_agent_loop_module, "_SKD_CHUNK_TRACE", 1)
     loop = make_skd_loop(
         student_chunks=[[777, 20, 30]],
@@ -652,6 +660,22 @@ async def test_skd_chunk_commit_emits_realtime_progress_event(tmp_path, monkeypa
     assert chunk_event["response_len"] == 1
     assert chunk_event["raw_chunk"] == [777, 20, 30]
     assert chunk_event["verified_chunk"] == [100]
+
+    live_events = [json.loads(line) for line in chunk_live_path.read_text().splitlines()]
+    assert len(live_events) == 1
+    live_event = live_events[0]
+    assert live_event["request_id"] == "req-skd-unit"
+    assert live_event["sample_id"] == "sample-reject"
+    assert live_event["chunk_idx"] == 1
+    assert live_event["accepted"] == 0
+    assert live_event["rejected"] == 1
+    assert live_event["new_tokens"] == 1
+    assert live_event["response_len"] == 1
+    assert live_event["raw_text_tail"] == "777 20 30"
+    assert live_event["verified_text_tail"] == "100"
+    assert live_event["im_start_count"] == 0
+    assert live_event["im_end_count"] == 0
+    assert live_event["endoftext_count"] == 0
 
 
 @pytest.mark.asyncio
@@ -1919,6 +1943,35 @@ async def test_skd_teacher_verification_binds_sticky_request_to_pinned_replica()
         "request_id": agent_data.request_id,
         "server_id": "teacher-replica-7",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tokenizer", "expected_stop_token_ids"),
+    [
+        (FakeTokenizer(), [EOS]),
+        (FakeListEosTokenizer(), [EOS, EOS + 1]),
+    ],
+)
+async def test_skd_student_generation_forwards_tokenizer_eos_as_stop_token_ids(tokenizer, expected_stop_token_ids):
+    loop = make_skd_loop(
+        student_chunks=[[10, EOS]],
+        teacher_topk_by_call=[{}, {}],
+    )
+    loop.tokenizer = tokenizer
+    agent_data = make_agent_data()
+
+    next_state = await loop._handle_generating_state(
+        agent_data,
+        {
+            "max_tokens": 8,
+        },
+    )
+
+    assert next_state == AgentState.TERMINATED
+    assert loop.server_manager.call_log
+    assert loop.server_manager.call_log[0]["ignore_eos"] is None
+    assert loop.server_manager.call_log[0]["stop_token_ids"] == expected_stop_token_ids
 
 
 @pytest.mark.asyncio

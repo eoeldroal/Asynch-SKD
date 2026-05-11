@@ -35,7 +35,7 @@ Session identity:
 1. 기존 `ToolAgentLoop` / `SkdAgentLoop` 상태 기계를 유지한다.
 2. environment lifecycle을 `PENDING -> GENERATING -> PROCESSING_TOOLS -> TERMINATED`에 자연스럽게 대응시킨다.
 3. screenshot image와 a11y/text observation을 모델 입력으로 제공한다.
-4. student와 teacher의 observation visibility를 분리한다.
+4. teacher에게는 request-time에 teacher-only system guidance와 optional few-shot을 주입하고, observation은 student와 teacher가 동일하게 받는다.
 5. `DONE` / `FAIL`과 system cutoff를 모두 reward 회수로 수렴시킨다.
 6. async SKD scheduler/trainer가 Web/OSGym protocol을 직접 알 필요 없게 한다.
 
@@ -104,32 +104,46 @@ request-time compact prompt view도 long-lived truth가 아니다. student / tea
 - 반대로 budget exhaustion / empty chunk / max chunk / teacher context exhaustion 같은 forced cutoff는 pending assistant turn을 canonical prompt state로 commit하지 않는다.
 - 이 경우 final output은 turn-local final text를 flush해서 사용자-visible response에는 포함하되, tool parsing 없이 종료한다.
 
+참고: 이 규칙은 SKD / WebSKD의 assistant-turn boundary 의미다. 반면 explicit RL `web_tool_agent`
+structured SGLang path는 grammar completion으로 tool-call wrapper를 끝까지 쓰게 하기 위해
+`ignore_eos=True`를 사용한다. 즉 RL structured path와 SKD chunk path는 종료 semantics를 동일하게 두지 않는다.
+
+추가로 SKD / WebSKD student generation은 `skip_tokenizer_init=True` token-in 경로를 쓰므로
+`ignore_eos`를 명시적으로 건드리지 않는다. 대신 tokenizer의 `eos_token_id`를
+`stop_token_ids`로 request에 넣어 EOS를 assistant-turn stop boundary로 강제한다.
+
 ## 4. Observation Policy
 
 정상 visual observation:
 
-- student sees screenshot image
-- teacher sees screenshot image + a11y/text
+- student와 teacher 모두 screenshot image만 본다. text/a11y는 포함하지 않는다.
 
 Image-less failure observation:
 
 - image가 없으면 실패 원인이 text에만 있을 수 있다.
-- 이 경우 student와 teacher 모두 text를 본다.
+- 이 경우 student와 teacher 모두 text만 본다.
 
 이 예외는 action failure를 복구 가능한 환경 feedback으로 취급하기 위한 것이다.
 
+즉 observation rule은 단순하다: image가 있으면 image만, image가 없으면 text만. student와 teacher는 동일한 observation을 받는다. teacher differentiation은 observation이 아니라 request-time에 `_build_teacher_messages()`가 주입하는 teacher-only system guidance와 optional few-shot으로만 이루어진다.
+
 정리하면 observation의 정체성은 `image 유무`가 아니라 **commit된 environment feedback bundle**이다. image는 observation의 한 속성일 뿐이며, parser/training logic은 이를 step boundary의 유일한 source-of-truth로 삼으면 안 된다.
 
-## 5. A11y/Text Policy
+## 5. Text Observation Policy
 
-a11y tree는 server가 `text` 필드에 제공하는 observation text다. WebSKD loop는 정상 image-bearing observation에서 이 text를 teacher-only channel에 둔다.
+Web/OSGym server는 `text` 필드로 observation text를 제공할 수 있다. WebSKD loop는 다음 규칙으로 text inclusion을 결정한다.
 
-중요한 점:
+- image-bearing observation: text를 버린다. image만 observation으로 사용한다.
+- image-less observation: text를 observation으로 사용한다. 이 경우 student와 teacher 모두 같은 text를 받는다.
 
-- server가 특정 a11y 포맷을 강제할 필요는 없다.
-- loop는 image 유무를 기준으로 student text visibility를 결정한다.
-- image가 있으면 student는 text/a11y를 보지 않는다.
-- image가 없으면 failure feedback으로 보고 student도 text를 본다.
+이 규칙은 student와 teacher에 동일하게 적용된다. teacher-only text channel은 없다.
+
+teacher differentiation은 observation이 아니라 request-time에 `_build_teacher_messages()`로 주입되는 다음 요소로만 이루어진다.
+
+- teacher-only system guidance: `WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt`
+- optional teacher-only structured few-shot: `distillation.skd.teacher_fewshot_path`
+
+`include_a11y` 플래그는 server가 a11y tree를 `text` 필드에 포함할지를 제어한다. 현재 기본값은 `False`이며, `custom.web_skd_include_a11y=True`로 켤 수 있다. a11y를 켜더라도 teacher-only channel이 되는 것이 아니라, 위의 image/text 선택 규칙에 따라 동일하게 처리된다.
 
 ## 6. Image Handling
 
@@ -179,7 +193,7 @@ image가 포함되면 expanded prompt ids에는 image expansion이 반영될 수
 - SGLang에 보낼 compact request ids는 request 시점의 committed state에 현재 assistant turn state를 합쳐서 만든다.
 - compact request ids와 teacher verify 길이 보정값은 long-lived truth가 아니라 request-time derived values다.
 - active SKD chunk loop는 같은 현재 turn state를 이어 가지만, request prefix는 iteration마다 현재 committed state에서 다시 계산한다.
-- teacher 전용 state가 없으면 student state로 대체하지 않는다. `teacher_prompt_ids`, teacher request prefix, teacher observation messages 중 하나라도 빠지면 바로 오류를 내고 중단한다.
+- teacher 전용 state가 없으면 student state로 대체하지 않는다. `teacher_prompt_ids` 또는 teacher request prefix가 없으면 바로 오류를 내고 중단한다. teacher messages는 request-time에 student messages로부터 파생되므로 별도 committed state로 저장하지 않는다.
 
 ### Teacher-only prompt composition
 
@@ -350,7 +364,7 @@ Teacher verification의 target은 항상 **학생이 방금 생성한 chunk**다
 
 ## 14. Teacher Context Guard
 
-Teacher는 a11y/text와 image expansion 때문에 student보다 긴 context를 가진다.
+Teacher는 teacher-only system guidance, optional few-shot, 그리고 image expansion 때문에 student보다 긴 context를 가질 수 있다.
 
 guard 위치는 두 군데다.
 
@@ -543,10 +557,11 @@ Loop integration:
   - final reward fetch
 - `verl/experimental/agent_loop/web_skd_agent_loop.py`
   - registered as `web_skd_agent`
-  - `include_a11y=True`
+  - `include_a11y` defaults to `False`; configurable via `custom.web_skd_include_a11y`
   - pending initial observation bundle
   - tool observation atomic commit
-  - student/teacher observation split
+  - unified observation rule: image-bearing → image only; image-less failure → text only (same for student and teacher)
+  - request-time teacher messages derived from student messages via `_build_teacher_messages()`
   - server prompt ids and teacher server prompt ids maintenance
   - teacher context guard before non-terminal observation commit
   - final environment reward propagation
@@ -605,4 +620,4 @@ Launcher prompt arguments:
 
 ## 22. One-line Summary
 
-Web / OS Gym integration은 `tool_agent`/`skd_agent` 위에 stateful remote environment session을 얹고, screenshot/a11y observation과 final environment reward를 기존 rollout/training path로 전달하는 구조다. SKD 경로는 `web_skd_agent`, 순수 fully async RL 경로는 `web_tool_agent`를 사용하며, async SKD scheduler와 windowed training은 이 Web observation contract를 깨지 않는 범위에서만 sample scheduling과 actor context를 제한한다.
+Web / OS Gym integration은 `tool_agent`/`skd_agent` 위에 stateful remote environment session을 얹고, screenshot/text observation과 final environment reward를 기존 rollout/training path로 전달하는 구조다. SKD 경로는 `web_skd_agent`, 순수 fully async RL 경로는 `web_tool_agent`를 사용하며, async SKD scheduler와 windowed training은 이 Web observation contract를 깨지 않는 범위에서만 sample scheduling과 actor context를 제한한다.

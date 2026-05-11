@@ -61,9 +61,13 @@ tool/user span은 KD 대상이 아니므로 dummy teacher row와 `response_mask=
 teacher에는 student와 다른 prompt가 들어갈 수 있다.
 
 - math 경로: teacher-only planning system prompt
-- WebSKD 경로: teacher-only a11y/text observation
+- WebSKD 경로: teacher-only system guidance + optional few-shot (observation은 student와 동일)
 
-따라서 student prompt ids와 teacher prompt ids는 별도 stream이다. 특히 WebSKD에서는 local ids와 server ids까지 분리된다.
+따라서 student prompt ids와 teacher prompt ids는 별도 stream이다. 특히 WebSKD에서는 image expansion으로 인해 local ids와 server ids까지 분리된다.
+
+SKD / WebSKD student generation은 `skip_tokenizer_init=True` token-in 경로를 쓰므로
+`ignore_eos`를 명시적으로 넘기지 않는다. 대신 tokenizer의 `eos_token_id`를
+`stop_token_ids`로 request에 넣어 EOS에서 assistant turn이 멈추게 한다.
 
 ```text
 prompt_ids
@@ -227,33 +231,41 @@ fallback은 pin이 불가능해 일반 routing으로 보낸 경우다.
 - `start`로 initial observation 확보
 - `computer` tool action을 environment `action`으로 전송
 - terminal 시 `reward` 회수
-- student/teacher observation split
+- unified observation rule 적용: image → image only; image-less failure → text only (student/teacher 동일)
+- request-time에 `_build_teacher_messages()`로 teacher messages 파생
 - image data 유지
 - server prompt ids 재계산
 
 정상 visual observation:
 
-- student: image
-- teacher: image + a11y/text
+- student와 teacher 모두: image만 본다 (text/a11y 없음)
 
 image-less failure:
 
-- student와 teacher 모두 text를 본다.
+- student와 teacher 모두: text만 본다
+
+teacher differentiation은 observation이 아니라, request-time에 `_build_teacher_messages(deepcopy(student_messages))`가 주입하는 teacher-only system guidance와 optional few-shot으로만 이루어진다.
 
 ## 12. Web observation atomic commit
 
 Pending start observation과 tool observation은 모두 bundle로 처리한다.
 
-Bundle에 포함되는 상태:
+Bundle에 포함되는 상태 (canonical committed state):
 
 - images
 - student messages
-- teacher messages
-- local prompt ids
-- server prompt ids
-- teacher server prompt ids
-- response ids/mask
+- prompt_ids (student local expanded ids)
+- teacher_prompt_ids (teacher local expanded ids)
+- response_mask
 - teacher dummy rows
+
+compact request view (request-time derived, committed state에 저장하지 않음):
+
+- server_prompt_ids
+- teacher_server_prompt_ids
+- teacher_sglang_prefix_surplus
+
+teacher messages는 request-time에 `_build_teacher_messages(deepcopy(student_messages))`로 파생되므로 committed bundle에 포함되지 않는다.
 
 모든 계산과 guard가 성공하면 commit한다. 실패하면 commit하지 않는다.
 
