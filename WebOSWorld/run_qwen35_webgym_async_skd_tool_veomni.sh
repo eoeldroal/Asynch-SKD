@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# Known-good actor profile for the Qwen3.5 WebGym SKD setup.
-# The decisive stall fix was upgrading cuDNN from 9.10.2 to 9.15.1.9 in the
-# cloned training env; the settings below are the matched runtime profile that
-# was validated after the actor-side multimodal forward stall cleared.
-#
-# The referenced parquet files are the standard SKD copies generated from:
-#   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json
-# with localhost tasks included, via:
-#   /home/sogang_nlpy/verl/WebOSWorld/webgym_rl/create_webgym_rl_dataset.py
 WEBGYM_SKD_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_skd
 WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
@@ -72,10 +63,8 @@ python3 -m verl.trainer.main_ppo \
     +distillation.distillation_loss.forward_kl_topk_impl=logsumexp_gather \
     distillation.distillation_loss.use_task_rewards=False \
     distillation.distillation_loss.use_policy_gradient=False \
-    distillation.distillation_loss.loss_max_clamp=10.0 \
-    distillation.distillation_loss.log_prob_min_clamp=-10.0 \
-    distillation.skd.chunk_size=128 \
-    distillation.skd.verify_top_k=5 \
+    distillation.skd.chunk_size=256 \
+    distillation.skd.verify_top_k=10 \
     distillation.skd.max_chunks_per_sample=224 \
     "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=False \
@@ -102,6 +91,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=16 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=4 \
     +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=16 \
+    +actor_rollout_ref.rollout.custom.web_skd_include_a11y=false \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
@@ -116,7 +106,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.calculate_entropy=False \
+    actor_rollout_ref.actor.calculate_entropy=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     actor_rollout_ref.actor.veomni.param_offload=True \
     actor_rollout_ref.actor.veomni.optimizer_offload=True \
@@ -133,8 +123,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.val_before_train=False \
     trainer.resume_mode=auto \
-    trainer.save_freq=10 \
-    trainer.test_freq=-1 \
+    trainer.save_freq=5 \
+    trainer.test_freq=5 \
     trainer.total_epochs=100 \
     trainer.total_training_steps=100 \
     +trainer.use_legacy_worker_impl=disable \
