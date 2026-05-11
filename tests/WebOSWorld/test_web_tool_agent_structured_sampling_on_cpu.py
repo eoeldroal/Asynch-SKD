@@ -61,6 +61,7 @@ def test_build_generation_sampling_params_attaches_structural_tag_for_explicit_r
         "top_p": 0.6,
         "top_k": -1,
         "structural_tag": '{"type": "structural_tag"}',
+        "ignore_eos": True,
     }
     assert base_sampling_params == {"temperature": 0.95, "top_p": 0.6, "top_k": -1}
     assert builder_calls == [active_tool_schemas]

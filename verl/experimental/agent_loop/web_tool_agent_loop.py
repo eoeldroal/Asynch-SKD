@@ -273,6 +273,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if not active_tool_schemas:
             return params
         params["structural_tag"] = build_qwen_coder_structured_tag_json(active_tool_schemas)
+        params["ignore_eos"] = True
         return params
 
     def _should_use_server_prompt_ids(self, images: list[Any] | None) -> bool:
