@@ -13,6 +13,26 @@ from xgrammar.structural_tag import (
 
 
 _BUNDLED_TOOL_NAME = "computer"
+_QWEN_35_SPECIAL_AND_STRUCTURE_TOKENS = [
+    "</think>",
+    "<tool_call>",
+    "<function=",
+    "<parameter=",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|object_ref_start|>",
+    "<|object_ref_end|>",
+    "<|box_start|>",
+    "<|box_end|>",
+    "<|quad_start|>",
+    "<|quad_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+]
 
 
 def _ensure_bundled_computer_tool(tool_schemas: list[dict[str, Any]]) -> None:
@@ -51,7 +71,7 @@ def build_qwen_coder_structured_tag_json(tool_schemas: list[dict[str, Any]]) -> 
     parameters = tool_schemas[0]["function"]["parameters"]
 
     tag = StructuralTag(format=SequenceFormat(elements=[
-        AnyTextFormat(excludes=["</think>"]),
+        AnyTextFormat(excludes=_QWEN_35_SPECIAL_AND_STRUCTURE_TOKENS),
         TagFormat(
             begin="</think>\n<tool_call>\n<function=computer>\n",
             content=QwenXMLParameterFormat(json_schema=parameters),

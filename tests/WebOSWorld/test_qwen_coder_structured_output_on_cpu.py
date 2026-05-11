@@ -9,6 +9,28 @@ from verl.experimental.agent_loop.qwen_coder_structured_output import (
 )
 
 
+_EXPECTED_EXCLUDES = [
+    "</think>",
+    "<tool_call>",
+    "<function=",
+    "<parameter=",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|object_ref_start|>",
+    "<|object_ref_end|>",
+    "<|box_start|>",
+    "<|box_end|>",
+    "<|quad_start|>",
+    "<|quad_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+]
+
+
 def test_build_qwen_coder_structural_tag_json_serializes_reasoning_then_mandatory_tool_call():
     tool_schemas = [
         {
@@ -41,7 +63,7 @@ def test_build_qwen_coder_structural_tag_json_serializes_reasoning_then_mandator
 
     prefix = result["format"]["elements"][0]
     assert prefix["type"] == "any_text"
-    assert prefix["excludes"] == ["</think>"]
+    assert prefix["excludes"] == _EXPECTED_EXCLUDES
 
     tag = result["format"]["elements"][1]
     assert tag["type"] == "tag"
@@ -90,7 +112,7 @@ def test_real_bundled_webgym_tool_config_builds_serialized_structural_tag():
 
     prefix = result["format"]["elements"][0]
     assert prefix["type"] == "any_text"
-    assert prefix["excludes"] == ["</think>"]
+    assert prefix["excludes"] == _EXPECTED_EXCLUDES
 
     tag = result["format"]["elements"][1]
     assert tag["begin"] == "</think>\n<tool_call>\n<function=computer>\n"
