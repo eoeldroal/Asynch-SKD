@@ -24,6 +24,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.trainer.config import CheckpointConfig
 from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.hf_files import resolve_hf_non_weight_source_dir, sync_hf_non_weight_files
 
 
 class BaseCheckpointManager:
@@ -192,6 +193,15 @@ class BaseCheckpointManager:
 
         if get_device_name() != "cpu":
             get_torch_device().set_rng_state(rng_state[get_device_name()])
+
+    @staticmethod
+    def sync_hf_non_weight_artifacts(source_path: str | None, target_path: str) -> bool:
+        source_dir = resolve_hf_non_weight_source_dir(source_path)
+        if source_dir is None:
+            return False
+
+        sync_hf_non_weight_files(source_dir, target_path)
+        return True
 
 
 def find_latest_ckpt_path(path, directory_format="global_step_{}"):

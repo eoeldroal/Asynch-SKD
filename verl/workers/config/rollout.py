@@ -89,6 +89,7 @@ class MultiTurnConfig(BaseConfig):
     web_osgym_window_enable: bool = False
     web_osgym_window_history_n: int = 5
     web_osgym_window_max_images_per_sample: Optional[int] = 6
+    web_osgym_window_supervision_block_size: int = 1
 
 
 @dataclass

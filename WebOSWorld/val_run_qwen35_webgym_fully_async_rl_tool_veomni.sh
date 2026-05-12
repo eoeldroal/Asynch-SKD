@@ -4,7 +4,10 @@ set -xeuo pipefail
 cd /home/sogang_nlpy/verl
 
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_${RUN_TIMESTAMP}
+ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_only_val_${RUN_TIMESTAMP}
+HF_HUB_ROOT="${HF_HUB_ROOT:-/home/sogang_nlpy/.cache/huggingface/hub}"
+QWEN35_9B_PATH="${QWEN35_9B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
+ACTOR_MODEL_PATH="${ACTOR_MODEL_PATH:-${QWEN35_9B_PATH}}"
 # The referenced parquet files are the fully async RL copies generated from:
 #   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json
 # with localhost tasks included, via:
@@ -36,7 +39,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_15/actor/huggingface \
+    actor_rollout_ref.model.path="${ACTOR_MODEL_PATH}" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \
@@ -51,10 +54,10 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size=16 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384 \
     actor_rollout_ref.actor.use_single_actor_mini_batch=True \
-    actor_rollout_ref.actor.veomni.param_offload=True \
-    actor_rollout_ref.actor.veomni.optimizer_offload=True \
+    actor_rollout_ref.actor.veomni.param_offload=False \
+    actor_rollout_ref.actor.veomni.optimizer_offload=False \
     actor_rollout_ref.actor.veomni.enable_full_shard=True \
     actor_rollout_ref.actor.veomni.ulysses_parallel_size=4 \
     actor_rollout_ref.actor.veomni.expert_parallel_size=1 \
@@ -63,12 +66,12 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=38401 \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.n=6 \
+    actor_rollout_ref.rollout.n=4 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.90 \
-    actor_rollout_ref.rollout.max_model_len=102400 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=102400 \
-    actor_rollout_ref.rollout.max_num_seqs=512 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
+    actor_rollout_ref.rollout.max_model_len=76800 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=76800 \
+    actor_rollout_ref.rollout.max_num_seqs=64 \
     actor_rollout_ref.rollout.temperature=0.6 \
     actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.rollout.top_k=20 \
@@ -99,14 +102,14 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     +actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=True \
     actor_rollout_ref.rollout.agent.default_agent_loop=web_tool_agent \
     actor_rollout_ref.rollout.agent.num_workers=4 \
-    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=24 \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.rollout.agent.max_concurrent_samples_per_gpu=16 \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=8192 \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/reward_fn_webgym_rl.py \
     reward.custom_reward_function.name=compute_score_webgym_rl \
     'trainer.logger=["console","wandb"]' \
     trainer.project_name=verl_fully_async_qwen35_webgym_tool_veomni \
-    trainer.experiment_name=qwen35_9b_fully_async_webgym_tool \
-    trainer.val_before_train=False \
+    trainer.experiment_name=qwen35_9b_fully_async_webgym_tool_only_val \
+    trainer.val_before_train=True \
     trainer.save_freq=10 \
     trainer.test_freq=-1 \
     trainer.resume_mode=auto \
@@ -117,7 +120,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.n_gpus_per_node=4 \
     rollout.nnodes=1 \
     rollout.n_gpus_per_node=4 \
-    rollout.total_rollout_steps=1000 \
+    rollout.total_rollout_steps=51200 \
     trainer.total_epochs=100 \
     async_training.staleness_threshold=1.0 \
     async_training.trigger_parameter_sync_step=2 \

@@ -80,6 +80,19 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         schema = _tool_schema().model_dump(exclude_unset=True, exclude_none=True)
         self.assertIn("items", schema["function"]["parameters"]["properties"]["actions"])
 
+    def test_tool_rejects_timeout_below_minimum_safe_action_timeout(self):
+        with self.assertRaises(ValueError) as exc:
+            WebOsGymTool(
+                config={
+                    "base_url": "http://env",
+                    "timeout": 30.0,
+                    "minimum_safe_action_timeout": 45.0,
+                },
+                tool_schema=_tool_schema(),
+            )
+
+        self.assertIn("minimum_safe_action_timeout", str(exc.exception))
+
     async def test_tool_create_starts_session_and_stores_session_request_id(self):
         class _FakeClient:
             async def start(self, **kwargs):
@@ -133,6 +146,33 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
             await tool.create(task_id="12345", request_id=101, include_a11y=True)
 
         self.assertEqual(tool._instance_dict, {})
+
+    async def test_request_reward_detached_uses_copied_identifiers_after_local_release(self):
+        class _FakeClient:
+            def __init__(self):
+                self.reward_calls = []
+
+            async def reward(self, **kwargs):
+                self.reward_calls.append(kwargs)
+                return 0.0
+
+        tool = WebOsGymTool(
+            config={
+                "base_url": "http://env",
+                "timeout": 60.0,
+                "minimum_safe_action_timeout": 45.0,
+            },
+            tool_schema=_tool_schema(),
+        )
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.release("i1")
+        reward_task = tool.request_reward_detached(request_id=101, task_id="12345")
+        await reward_task
+
+        self.assertEqual(tool._instance_dict, {})
+        self.assertEqual(tool.client.reward_calls, [{"request_id": 101, "task_id": "12345"}])
 
     async def test_tool_execute_uses_same_session_request_id(self):
         seen = {}

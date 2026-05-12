@@ -531,6 +531,42 @@ specifying `multi_turn` configurations in the config file.
    ```
 4. **Example**: See `recipe/fully_async_policy/shell/dapo_7b_async_retool.sh`.
 
+### WebOSGym RL Note
+
+For WebOSGym-style agentic RL, the fully async rollout path can also enable rollout-time prompt windowing and
+post-rollout supervision blocks through `actor_rollout_ref.rollout.multi_turn`:
+
+```yaml
+actor_rollout_ref:
+  rollout:
+    multi_turn:
+      web_osgym_window_enable: True
+      web_osgym_window_history_n: 5
+      web_osgym_window_max_images_per_sample: 6
+      web_osgym_window_supervision_block_size: 3
+```
+
+Current behavior:
+
+1. `web_osgym_window_supervision_block_size=1` keeps one update row per assistant generation.
+2. Values `>1` group adjacent assistant generations into one emitted update row and keep older carried turns in the
+   same row with `response_mask=0`.
+3. Depending on the Hydra input tree, `web_osgym_window_supervision_block_size` may need append syntax instead of a
+   plain override:
+
+```bash
++actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size=3
+```
+
+Operational note:
+
+1. WebOSGym tool configs can declare `minimum_safe_action_timeout`; the effective client `timeout` must be at least
+   that value.
+2. If a WebOSGym `action` still hits client-side `ReadTimeout`, the agent loop sends a best-effort `reward` cleanup
+   request and the fully async rollouter drops the whole sample group before queue insertion.
+3. The rollouter exposes these drops through `count/timeout_dropped_samples` and a console log line so timeout loss is
+   visible during training.
+
 ### Experimental Results
 
 To validate the performance of `fully_async_policy` on multi-turn tool-calling tasks, we compared it with the standard

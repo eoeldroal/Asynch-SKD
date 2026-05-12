@@ -74,6 +74,7 @@ WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS = {
     "web_osgym_session_id",
     "web_osgym_include_a11y",
     "web_osgym_reward_fetched",
+    "web_osgym_reward_requested",
 }
 EXPORTED_EXTRA_FIELD_DEFAULTS = {
     "turn_scores": None,
@@ -883,6 +884,14 @@ class AgentLoopWorker:
         multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
         return bool(getattr(multi_turn, "web_osgym_window_enable", False))
 
+    def _web_osgym_window_history_n(self) -> int:
+        multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
+        return max(0, int(getattr(multi_turn, "web_osgym_window_history_n", 5)))
+
+    def _web_osgym_window_supervision_block_size(self) -> int:
+        multi_turn = getattr(getattr(self, "rollout_config", None), "multi_turn", None)
+        return max(1, int(getattr(multi_turn, "web_osgym_window_supervision_block_size", 1)))
+
     def _maybe_window_web_osgym_outputs(
         self,
         output: AgentLoopOutput,
@@ -892,6 +901,8 @@ class AgentLoopWorker:
         return build_web_osgym_windowed_agent_loop_outputs(
             output,
             enabled=self._web_osgym_window_update_enabled(),
+            supervision_block_size=self._web_osgym_window_supervision_block_size(),
+            carry_turn_budget=self._web_osgym_window_history_n() + 1,
         )
 
     async def _run_agent_loop(

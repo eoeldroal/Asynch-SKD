@@ -8,6 +8,9 @@ WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${2:-/home/sogang_nlpy/verl/WebOSWorld/webgym
 HF_HUB_ROOT=/home/sogang_nlpy/.cache/huggingface/hub
 QWEN35_9B_PATH="${QWEN35_9B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
 QWEN35_27B_PATH="${QWEN35_27B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654}"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+ASYNC_SKD_EVENT_LOG_PATH="/home/sogang_nlpy/verl/logs/async_skd_events_webgym_${RUN_TS}.jsonl"
+ASYNC_SKD_CHUNK_LIVE_LOG_PATH="/home/sogang_nlpy/verl/logs/async_skd_chunk_live_webgym_${RUN_TS}.jsonl"
 if [ "$#" -ge 1 ]; then
     shift
 fi
@@ -23,7 +26,8 @@ VERL_ASYNC_SKD_TRACE=2 \
 VERL_ASYNC_SKD_CHUNK_TRACE=2 \
 VERL_ASYNC_SKD_CHUNK_TRACE_TOPK=5 \
 VERL_ASYNC_SKD_CHUNK_TRACE_MAX_TOKENS=64 \
-VERL_ASYNC_SKD_EVENT_LOG=/home/sogang_nlpy/verl/logs/async_skd_events_webgym.jsonl \
+VERL_ASYNC_SKD_EVENT_LOG="${ASYNC_SKD_EVENT_LOG_PATH}" \
+VERL_ASYNC_SKD_CHUNK_LIVE_LOG="${ASYNC_SKD_CHUNK_LIVE_LOG_PATH}" \
 python3 -m verl.trainer.main_ppo \
     model_engine=veomni \
     "data.train_files=['${WEBGYM_SKD_DATASET_DIR}/train.parquet']" \
@@ -106,7 +110,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.calculate_entropy=True \
+    actor_rollout_ref.actor.calculate_entropy=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=9216 \
     actor_rollout_ref.actor.veomni.param_offload=True \
     actor_rollout_ref.actor.veomni.optimizer_offload=True \

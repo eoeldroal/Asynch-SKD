@@ -18,7 +18,9 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pprint import pformat
+from typing import Any
 
+import httpx
 import numpy as np
 import ray
 import torch
@@ -60,6 +62,43 @@ def resolve_max_concurrent_rollout_samples_per_gpu(config) -> int:
             f"actor_rollout_ref.rollout.n={rollout_n}; got {trajectory_budget}."
         )
     return trajectory_budget // rollout_n
+
+
+def _unwrap_read_timeout_failure(exc: Exception) -> httpx.ReadTimeout | None:
+    if isinstance(exc, httpx.ReadTimeout):
+        return exc
+
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            cause = as_instanceof_cause()
+        except Exception:
+            return None
+        if isinstance(cause, httpx.ReadTimeout):
+            return cause
+    return None
+
+
+def _extract_rollout_sample_log_context(rollout_sample: RolloutSample) -> dict[str, Any]:
+    def _first_value(value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return None
+            first = value.reshape(-1)[0]
+            return first.item() if isinstance(first, np.generic) else first
+        if isinstance(value, (list, tuple)):
+            return value[0] if value else None
+        return value
+
+    non_tensor_batch = getattr(getattr(rollout_sample, "full_batch", None), "non_tensor_batch", None)
+    if not isinstance(non_tensor_batch, dict):
+        return {}
+
+    context = {}
+    for key in ("task_id", "index", "uid"):
+        if key in non_tensor_batch:
+            context[key] = _first_value(non_tensor_batch[key])
+    return context
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -179,6 +218,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.total_generated_samples = 0
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
+        self.timeout_dropped_samples = 0
         self.processed_sample_count = 0
         # we start from step 1
         self.global_steps = 1
@@ -575,7 +615,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
         # Calling asynchronous generation methods
-        ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        try:
+            ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
+        except Exception as exc:
+            timeout_exc = _unwrap_read_timeout_failure(exc)
+            if timeout_exc is not None:
+                self.timeout_dropped_samples += 1
+                self.processed_sample_count += 1
+                log_context = _extract_rollout_sample_log_context(rollout_sample)
+                context_suffix = " ".join(f"{key}={value!r}" for key, value in log_context.items() if value is not None)
+                if context_suffix:
+                    context_suffix = f" {context_suffix}"
+                print(
+                    "[FullyAsyncRollouter] Dropped timeout sample group "
+                    f"sample_id={rollout_sample.sample_id!r}{context_suffix} before queue put"
+                )
+                return
+            raise
         rollout_sample.full_batch = ret
         rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
@@ -752,6 +808,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             "count/total_generated_samples": self.total_generated_samples,
             "count/staleness_samples": self.staleness_samples,
             "count/dropped_stale_samples": self.dropped_stale_samples,
+            "count/timeout_dropped_samples": self.timeout_dropped_samples,
             # static stats
             "static/max_required_samples": self.max_required_samples,
             "static/required_samples": self.required_samples,

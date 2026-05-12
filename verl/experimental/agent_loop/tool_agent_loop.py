@@ -426,13 +426,16 @@ class ToolAgentLoop(AgentLoopBase):
                 await tool.release(instance_id)
 
         tool_response_text = tool_execution_response.text
-        if tool_response_text and len(tool_response_text) > self.max_tool_response_length:
-            if self.tool_response_truncate_side == "left":
-                tool_response_text = tool_response_text[: self.max_tool_response_length] + "...(truncated)"
+        max_tool_response_length = self.max_tool_response_length
+        if tool_response_text and len(tool_response_text) > max_tool_response_length:
+            if max_tool_response_length <= 0:
+                tool_response_text = ""
+            elif self.tool_response_truncate_side == "left":
+                tool_response_text = tool_response_text[:max_tool_response_length] + "...(truncated)"
             elif self.tool_response_truncate_side == "right":
-                tool_response_text = "(truncated)..." + tool_response_text[-self.max_tool_response_length :]
+                tool_response_text = "(truncated)..." + tool_response_text[-max_tool_response_length:]
             else:
-                length = self.max_tool_response_length // 2
+                length = max_tool_response_length // 2
                 tool_response_text = tool_response_text[:length] + "...(truncated)..." + tool_response_text[-length:]
 
         # Create ToolResponse from tool execution result

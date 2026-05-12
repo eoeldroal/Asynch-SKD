@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -177,7 +178,17 @@ class WebOsGymTool(BaseTool):
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         super().__init__(config, tool_schema)
-        self.client = WebOsGymClient(base_url=config["base_url"], timeout=config.get("timeout", 30.0))
+        timeout = float(config.get("timeout", 30.0))
+        minimum_safe_action_timeout = config.get("minimum_safe_action_timeout")
+        if minimum_safe_action_timeout is not None:
+            minimum_safe_action_timeout = float(minimum_safe_action_timeout)
+            if timeout < minimum_safe_action_timeout:
+                raise ValueError(
+                    "WebOsGym client timeout must be >= minimum_safe_action_timeout to avoid "
+                    "reward-close requests racing an in-flight action."
+                )
+        self.client = WebOsGymClient(base_url=config["base_url"], timeout=timeout)
+        self.minimum_safe_action_timeout = minimum_safe_action_timeout
         self.include_a11y = config.get("include_a11y", False)
         self._instance_dict: dict[str, dict[str, Any]] = {}
 
@@ -660,6 +671,20 @@ class WebOsGymTool(BaseTool):
         if state["reward"] is None:
             state["reward"] = await self.client.reward(request_id=state["request_id"], task_id=state["task_id"])
         return float(state["reward"])
+
+    def request_reward_detached(self, *, request_id: int, task_id: str) -> asyncio.Task:
+        async def _request_reward() -> None:
+            try:
+                await self.client.reward(request_id=request_id, task_id=task_id)
+            except Exception:
+                logger.warning(
+                    "[WebOsGymTool] best-effort reward close failed request_id=%r task_id=%r",
+                    request_id,
+                    task_id,
+                    exc_info=True,
+                )
+
+        return asyncio.create_task(_request_reward(), name=f"web_osgym_reward_close_{request_id}")
 
     async def release(self, instance_id: str, **kwargs) -> None:
         del kwargs

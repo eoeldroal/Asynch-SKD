@@ -261,12 +261,12 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             local_mkdir_safe(hf_config_tokenizer_path)
             model_config = unwrap_model.config
             generation_config = None
-            if unwrap_model.can_generate() and hasattr(model_config, "name_or_path") and model_config.name_or_path:
+            source_model_path = model_config.name_or_path if hasattr(model_config, "name_or_path") else None
+            if unwrap_model.can_generate() and source_model_path:
                 try:
                     # Some model's name_or_path is empty if not initialized from pretrained,
                     # in this cases, we don't save generation config.
-                    generation_config = GenerationConfig.from_pretrained(model_config.name_or_path)
-                    generation_config.save_pretrained(hf_config_tokenizer_path)
+                    generation_config = GenerationConfig.from_pretrained(source_model_path)
                 except Exception:
                     # if the generation config isn't available, we don't save it
                     pass
@@ -274,9 +274,13 @@ class FSDPCheckpointManager(BaseCheckpointManager):
             if hasattr(model_config, "auto_map") and None in model_config.auto_map:
                 model_config.auto_map = {k: v for k, v in model_config.auto_map.items() if k is not None}
 
-            model_config.save_pretrained(hf_config_tokenizer_path)
-            if self.processing_class is not None:
-                self.processing_class.save_pretrained(hf_config_tokenizer_path)
+            synced_hf_artifacts = self.sync_hf_non_weight_artifacts(source_model_path, hf_config_tokenizer_path)
+            if not synced_hf_artifacts:
+                if generation_config is not None:
+                    generation_config.save_pretrained(hf_config_tokenizer_path)
+                model_config.save_pretrained(hf_config_tokenizer_path)
+                if self.processing_class is not None:
+                    self.processing_class.save_pretrained(hf_config_tokenizer_path)
             log_with_rank(
                 f"Saved model config and tokenizer class to {os.path.abspath(hf_config_tokenizer_path)}",
                 rank=self.rank,
@@ -340,6 +344,8 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                         )
 
                 save_model.save_pretrained(hf_local_path, state_dict=state_dict)
+                if source_model_path:
+                    self.sync_hf_non_weight_artifacts(source_model_path, hf_local_path)
                 log_with_rank(
                     f"Saved hf_model to {os.path.abspath(hf_local_path)}",
                     rank=self.rank,

@@ -15,6 +15,7 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Any, Optional
 import uuid
 
@@ -90,6 +91,57 @@ def addition_process(output: DataProto):
     output.non_tensor_batch["processing_times"] = processing_times_list
     output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
     return output
+
+
+def _validate_rollout_sample_batch(batch: DataProto, *, sample_id: str) -> None:
+    if batch.batch is None:
+        raise ValueError(f"Rollout sample '{sample_id}' is missing tensor batch data.")
+
+    if "response_mask" in batch.batch.keys():
+        response_mask = batch.batch["response_mask"]
+        if response_mask.dim() != 2:
+            raise ValueError(
+                f"Rollout sample '{sample_id}' has invalid response_mask rank {response_mask.dim()}; expected rank 2."
+            )
+        supervised_counts = response_mask.sum(dim=-1)
+        zero_rows = (supervised_counts <= 0).nonzero(as_tuple=True)[0].tolist()
+        if zero_rows:
+            raise ValueError(
+                f"Rollout sample '{sample_id}' has no supervised response tokens in rows {zero_rows} before batch padding."
+            )
+
+
+def _validate_rollout_samples_for_concat(rollout_samples_batch: list[DataProto], rollout_samples: list[RolloutSample]) -> None:
+    if not rollout_samples_batch:
+        return
+
+    reference_keys = set(rollout_samples_batch[0].non_tensor_batch.keys())
+    reference_sample_id = rollout_samples[0].sample_id
+    for rs, batch in zip(rollout_samples, rollout_samples_batch, strict=True):
+        current_keys = set(batch.non_tensor_batch.keys())
+        if current_keys != reference_keys:
+            missing = sorted(reference_keys - current_keys)
+            extra = sorted(current_keys - reference_keys)
+            raise ValueError(
+                "Rollout samples have non_tensor_batch key mismatch before concat: "
+                f"reference_sample='{reference_sample_id}' sample='{rs.sample_id}' "
+                f"missing={missing} extra={extra}."
+            )
+
+
+def _validate_param_version_array(name: str, values: np.ndarray) -> list[int]:
+    normalized: list[int] = []
+    for idx, value in enumerate(values.tolist()):
+        if value is None:
+            raise ValueError(f"{name} contains None at row {idx}; fully async batch assembly requires integer values.")
+        if isinstance(value, np.generic):
+            value = value.item()
+        if not isinstance(value, Integral):
+            raise ValueError(
+                f"{name} contains non-integer value {value!r} at row {idx}; fully async batch assembly requires integers."
+            )
+        normalized.append(int(value))
+    return normalized
 
 
 def _pad_tensor_along_dim(
@@ -254,7 +306,10 @@ def assemble_batch_from_rollout_samples(
 
     for rs in rollout_samples:
         batch = addition_process(rs.full_batch)
+        _validate_rollout_sample_batch(batch, sample_id=rs.sample_id)
         rollout_samples_batch.append(batch)
+
+    _validate_rollout_samples_for_concat(rollout_samples_batch, rollout_samples)
     _align_rollout_sample_widths(rollout_samples_batch, tokenizer)
     final_batch = DataProto.concat(rollout_samples_batch)
     final_batch = _pad_batch_to_required_multiple(final_batch, _infer_required_multiple_from_balance_fn(balance_batch))
@@ -290,8 +345,17 @@ def assemble_batch_from_rollout_samples(
         }
     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
 
-    param_version_start = final_batch.non_tensor_batch["min_global_steps"]
-    param_version_end = final_batch.non_tensor_batch["max_global_steps"]
+    if "min_global_steps" not in final_batch.non_tensor_batch:
+        raise ValueError("min_global_steps is missing from fully async assembled batch.")
+    if "max_global_steps" not in final_batch.non_tensor_batch:
+        raise ValueError("max_global_steps is missing from fully async assembled batch.")
+
+    param_version_start = _validate_param_version_array(
+        "min_global_steps", final_batch.non_tensor_batch["min_global_steps"]
+    )
+    param_version_end = _validate_param_version_array(
+        "max_global_steps", final_batch.non_tensor_batch["max_global_steps"]
+    )
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
     num_diff0 = param_version_diff.count(0)
     partial_stats = {

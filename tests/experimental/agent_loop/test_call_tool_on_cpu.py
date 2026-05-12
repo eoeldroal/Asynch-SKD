@@ -160,6 +160,30 @@ class TestCallToolErrorHandling(unittest.IsolatedAsyncioTestCase):
         assert reward == 1.0
         assert "Enter" in response.text
 
+    async def test_zero_max_tool_response_length_hides_text_for_right_truncation(self):
+        """A zero tool-response limit must not leak the original tool text."""
+        loop = _make_tool_agent_loop({"calculator": FakeTool("calculator")})
+        loop.max_tool_response_length = 0
+        loop.tool_response_truncate_side = "right"
+
+        tool_call = FakeFunctionCall(name="calculator", arguments='{"a": 3, "b": 5}')
+        response, reward, _ = await loop._call_tool(tool_call, {}, self.agent_data)
+
+        assert reward == 1.0
+        assert response.text == ""
+
+    async def test_zero_max_tool_response_length_hides_text_for_left_truncation(self):
+        """A zero tool-response limit should suppress tool text for every truncate side."""
+        loop = _make_tool_agent_loop({"calculator": FakeTool("calculator")})
+        loop.max_tool_response_length = 0
+        loop.tool_response_truncate_side = "left"
+
+        tool_call = FakeFunctionCall(name="calculator", arguments='{"a": 3, "b": 5}')
+        response, reward, _ = await loop._call_tool(tool_call, {}, self.agent_data)
+
+        assert reward == 1.0
+        assert response.text == ""
+
 
 if __name__ == "__main__":
     unittest.main()

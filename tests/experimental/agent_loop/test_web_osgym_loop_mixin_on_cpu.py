@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from PIL import Image
@@ -16,6 +17,7 @@ class _FakeTool:
         self.created = []
         self.rewards = []
         self.restored = []
+        self.detached_reward_requests = []
         self._instance_dict = {}
 
     async def create(self, **kwargs):
@@ -33,6 +35,10 @@ class _FakeTool:
     async def calc_reward(self, instance_id, **kwargs):
         self.rewards.append((instance_id, kwargs))
         return 1.0
+
+    def request_reward_detached(self, *, request_id: int, task_id: str):
+        self.detached_reward_requests.append((request_id, task_id))
+        return asyncio.create_task(asyncio.sleep(0), name=f"reward-close-{request_id}")
 
     def restore_instance(self, instance_id, **kwargs):
         self.restored.append((instance_id, kwargs))
@@ -182,8 +188,10 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
 
         await loop._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
         await loop._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
+        loop._request_web_osgym_reward_best_effort(agent_data, termination_reason="system_stop")
 
         self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+        self.assertTrue(agent_data.extra_fields["web_osgym_reward_requested"])
         self.assertEqual(
             agent_data.extra_fields["reward_extra_info"],
             {
@@ -192,6 +200,35 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
             },
         )
         self.assertEqual(len(tool.rewards), 1)
+        self.assertEqual(tool.detached_reward_requests, [])
+
+    async def test_request_web_osgym_reward_best_effort_sends_once_for_unfetched_session(self):
+        loop = WebOsGymLoopMixin()
+        tool = _FakeTool()
+        agent_data = AgentData(
+            messages=[],
+            image_data=[],
+            video_data=[],
+            metrics={},
+            request_id="loop-req",
+            tools_kwargs={},
+        )
+        agent_data._active_tools = {"computer": tool}
+        agent_data.extra_fields.update(
+            {
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "12345",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": False,
+            }
+        )
+
+        loop._request_web_osgym_reward_best_effort(agent_data, termination_reason="system_stop")
+        loop._request_web_osgym_reward_best_effort(agent_data, termination_reason="system_stop")
+
+        self.assertEqual(tool.detached_reward_requests, [(101, "12345")])
+        self.assertTrue(agent_data.extra_fields["web_osgym_reward_requested"])
+        self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "system_stop")
 
     def test_ensure_session_restores_missing_local_instance_state(self):
         loop = WebOsGymLoopMixin()

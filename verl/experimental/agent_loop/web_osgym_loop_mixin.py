@@ -102,6 +102,26 @@ class WebOsGymLoopMixin:
             screen_height=agent_data.extra_fields.get("web_osgym_screen_height"),
         )
 
+    def _request_web_osgym_reward_best_effort(self, agent_data, termination_reason: str) -> None:
+        if agent_data.extra_fields.get("web_osgym_reward_fetched"):
+            return
+        if agent_data.extra_fields.get("web_osgym_reward_requested"):
+            return
+
+        session_id = agent_data.extra_fields.get("web_osgym_session_id")
+        task_id = agent_data.extra_fields.get("web_osgym_task_id")
+        if session_id is None or task_id is None:
+            return
+
+        tool = self._get_active_tool(agent_data)
+        request_reward_detached = getattr(tool, "request_reward_detached", None)
+        if not callable(request_reward_detached):
+            return
+
+        request_reward_detached(request_id=int(session_id), task_id=str(task_id))
+        agent_data.extra_fields["web_osgym_reward_requested"] = True
+        agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+
     def _bundle_web_osgym_tool_calls(self, agent_data, tool_calls=None) -> tuple[dict | None, ToolResponse | None]:
         active_tools = getattr(agent_data, "_active_tools", {})
         actions = []
@@ -233,6 +253,7 @@ class WebOsGymLoopMixin:
         self._ensure_web_osgym_session(agent_data)
         tool = self._get_active_tool(agent_data)
         instance_id = agent_data.extra_fields["web_osgym_instance_id"]
+        agent_data.extra_fields["web_osgym_reward_requested"] = True
         last_error = None
         for attempt in range(1, self.web_osgym_start_max_attempts + 1):
             try:

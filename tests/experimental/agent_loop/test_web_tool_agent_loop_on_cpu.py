@@ -1,9 +1,11 @@
 import asyncio
+import httpx
 import json
 from copy import deepcopy
 from types import SimpleNamespace
 
 from PIL import Image
+import pytest
 
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
@@ -128,6 +130,48 @@ class _FakeNonTerminalNormalizedActionTool(_FakeWebTool):
         }
 
 
+class _FakeTimeoutWebTool(_FakeWebTool):
+    def __init__(self):
+        super().__init__()
+        self.detached_reward_requests = []
+
+    def request_reward_detached(self, *, request_id, task_id):
+        self.detached_reward_requests.append({"request_id": request_id, "task_id": task_id})
+
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters, kwargs))
+        raise httpx.ReadTimeout("timed out waiting for action response")
+
+
+class _FakeServerManager:
+    def __init__(self):
+        self.calls = []
+
+    async def generate(self, *, request_id, prompt_ids, sampling_params, image_data, video_data):
+        self.calls.append(
+            {
+                "request_id": request_id,
+                "prompt_ids": list(prompt_ids),
+                "sampling_params": dict(sampling_params),
+                "image_data": image_data,
+                "video_data": video_data,
+            }
+        )
+        return TokenOutput(
+            token_ids=[301, 302],
+            log_probs=[-0.1, -0.2],
+            extra_fields={"global_steps": 0, "min_global_steps": 0, "max_global_steps": 0},
+        )
+
+
+class _FakeToolParser:
+    last_parse_error = None
+
+    async def extract_tool_calls(self, response_ids, tools):
+        del response_ids, tools
+        return None, [FunctionCall(name="computer", arguments=json.dumps({"actions": [{"action_type": "CLICK"}]}))]
+
+
 def _make_loop():
     loop = object.__new__(WebOsGymToolAgentLoop)
     loop.tools = {}
@@ -144,6 +188,23 @@ def _make_loop():
         return list(range(10, 10 + len(str(messages)) % 7 + 2))
 
     loop.apply_chat_template = apply_chat_template
+    return loop
+
+
+def _make_integration_loop(tool):
+    loop = _make_loop()
+    loop.processor = None
+    loop.tools = {"computer": tool}
+    loop.tool_schemas = [tool.tool_schema.model_dump()]
+    loop.tool_parser = _FakeToolParser()
+    loop.tool_parser_name = "hermes"
+    loop.server_manager = _FakeServerManager()
+    loop.rollout_config = SimpleNamespace(
+        name="vllm",
+        skip_tokenizer_init=False,
+        custom={},
+        multi_turn=SimpleNamespace(web_osgym_window_enable=False, web_osgym_window_history_n=5, web_osgym_window_max_images_per_sample=6),
+    )
     return loop
 
 
@@ -173,6 +234,34 @@ def _action_agent_data(tool, action_name="CLICK"):
     agent_data._active_tools = {action_name: tool}
     agent_data._active_tool_schemas = [tool.tool_schema.model_dump()]
     return agent_data
+
+
+@pytest.mark.asyncio
+async def test_web_tool_run_requests_reward_close_when_tool_action_times_out_after_real_pending_and_generating_path():
+    tool = _FakeTimeoutWebTool()
+    loop = _make_integration_loop(tool)
+    loop.max_parallel_calls = 1
+    loop._write_web_osgym_summary = lambda *args, **kwargs: None
+
+    with pytest.raises(httpx.ReadTimeout, match="timed out waiting for action response"):
+        await loop.run(
+            {"temperature": 0.3},
+            raw_prompt=[{"role": "user", "content": "task"}],
+            tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
+            uid="uid-timeout",
+            _trajectory_global_step=12,
+        )
+
+    assert tool.created
+    assert loop.server_manager.calls
+    assert tool.executed
+    assert tool.detached_reward_requests == [
+        {
+            "request_id": tool.created[0]["request_id"],
+            "task_id": "12345",
+        }
+    ]
+    assert tool.released == ["instance-1"]
 
 
 def test_web_tool_agent_keeps_tool_agent_layering():
@@ -1150,7 +1239,7 @@ def test_web_osgym_tool_trace_dumps_tool_call_result_and_image(monkeypatch, tmp_
         next_state = await loop._handle_processing_tools_state(agent_data)
 
         assert next_state == AgentState.GENERATING
-        session_dir = tmp_path / "12345___uid-123___global_step_0___777"
+        session_dir = tmp_path / "step_0" / "12345___uid-123___777"
         trajectory_path = session_dir / "trajectory.jsonl"
         assert trajectory_path.exists()
         events = [json.loads(line) for line in trajectory_path.read_text().splitlines()]
@@ -1201,7 +1290,7 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
 
     loop._write_web_osgym_summary(agent_data)
 
-    summary_path = tmp_path / "prozilla_explorer_11___uid-xyz___global_step_3___987" / "summary.json"
+    summary_path = tmp_path / "step_3" / "prozilla_explorer_11___uid-xyz___987" / "summary.json"
     assert summary_path.exists()
     summary = json.loads(summary_path.read_text())
     assert summary["task_id"] == "prozilla_explorer_11"
@@ -1257,14 +1346,14 @@ def test_web_osgym_session_dir_is_stable_after_global_step_changes(monkeypatch, 
         image_data=[Image.new("RGB", (2, 2), "blue")],
     )
 
-    first_dir = tmp_path / "nhis_open_sick_pay_income_check___uid-stable___global_step_0___777"
+    first_dir = tmp_path / "step_0" / "nhis_open_sick_pay_income_check___uid-stable___777"
     assert (first_dir / "trajectory.jsonl").exists()
 
     agent_data.extra_fields["global_steps"] = 0
     loop._write_web_osgym_summary(agent_data)
 
     assert (first_dir / "summary.json").exists()
-    second_dir = tmp_path / "nhis_open_sick_pay_income_check___uid-stable___global_step_None___777"
+    second_dir = tmp_path / "step_None" / "nhis_open_sick_pay_income_check___uid-stable___777"
     assert not (second_dir / "summary.json").exists()
 
 

@@ -408,8 +408,18 @@ Current RL comparison:
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable`
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n`
   - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample`
+  - `actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size`
 - The active WebGym fully async RL launcher enables windowed generation with `history_n=5` and `max_images_per_sample=6`.
-- Actor update now also consumes WebOSGym window rows when `web_osgym_window_enable=True`: each assistant generation records the exact prompt/image slice used at rollout time, and the completed trajectory is expanded into one training row per assistant generation before `_agent_loop_postprocess()`.
+- The current fully async launcher also exposes `WEBGYM_WINDOW_SUPERVISION_BLOCK_SIZE` and uses it to append
+  `actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size` at runtime.
+- Actor update now also consumes WebOSGym window rows when `web_osgym_window_enable=True`: each assistant generation records the exact prompt/image slice used at rollout time, and the completed trajectory is expanded into configurable supervision blocks before `_agent_loop_postprocess()`.
+- `web_osgym_window_supervision_block_size=1` keeps the previous per-generation row behavior.
+- `web_osgym_window_supervision_block_size>1` groups consecutive assistant generations into one training row, keeps earlier carried generations in the same row as `response_mask=0` warmup context, and applies loss only to the final supervised block.
+- When the total assistant-turn count is not divisible by the block size, the shorter prefix block stays at the front and later rows remain tail-aligned to the most recent supervised turns.
+- Block-row metadata now records the full response slice of the emitted row as:
+  - `web_osgym_window_block_response_start`
+  - `web_osgym_window_block_response_end`
+- The single-span fallback path still accepts either `prompt_image_indices` or the older `image_indices` generation-window key and normalizes them to `int` before slicing multimodal data.
 - Async SKD should keep full accumulated rollout generation for now. Its actor-side windowed training remains
   the bounded-backprop mechanism; rollout prompt windowing would require reworking teacher prompt streams,
   server prompt ids, multimodal surplus accounting, and carryover restore.
@@ -424,6 +434,37 @@ Current RL comparison:
   - text-only failure observations remain as text-only `user` messages and do not force fake image placeholders
 
 In this RL mode, `max_model_len` and `max_num_batched_tokens` bound the model-facing windowed generation request. `data.max_response_length` remains the full trajectory rollout cap and termination budget, but WebOSGym window rows are padded to the maximum target response length in the emitted mini-row batch rather than blindly to the full trajectory cap. A large `data.max_response_length` therefore allows long trajectories without making every update row pay the same padding cost.
+
+### Hydra override note
+
+At the time of writing, the Python dataclass config already defines `web_osgym_window_supervision_block_size`, but some
+Hydra input trees may still treat it as an appended key rather than a declared struct field. In that situation:
+
+```bash
+actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size=3
+```
+
+fails with `ConfigCompositionException`, while:
+
+```bash
++actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size=3
+```
+
+works. The recommended fully async WebGym RL launcher syntax therefore uses the `+...=` form for this override.
+
+### Timeout cleanup note
+
+The active WebGym RL tool config also sets a client-side timeout floor:
+
+```yaml
+minimum_safe_action_timeout: 45.0
+timeout: 60.0
+```
+
+This preserves the protocol assumption that the client does not give up on an `action` request before the server-side
+deadline window. If an `action` still ends in client-side `ReadTimeout`, verl does not retry the same action. It sends
+one best-effort `reward` request for cleanup, then the fully async rollouter drops the whole sample group before queue
+insertion so trainer assembly never sees a partial GRPO group from that timeout.
 
 For a target mini-step `i`, the windowed student message order should be:
 

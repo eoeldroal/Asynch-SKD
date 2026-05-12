@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from verl.experimental.fully_async_policy.detach_utils import (
@@ -36,16 +37,18 @@ def _make_rollout_sample(
     sample_id: str,
     prompt_ids: list[int],
     response_ids: list[int],
+    response_mask: list[int] | None = None,
     with_optional_seq_tensors: bool = False,
 ) -> RolloutSample:
     prompt_width = len(prompt_ids)
     response_width = len(response_ids)
     seq_width = prompt_width + response_width
+    response_mask_values = response_mask if response_mask is not None else [1] * response_width
 
     tensors = {
         "prompts": torch.tensor([prompt_ids], dtype=torch.long),
         "responses": torch.tensor([response_ids], dtype=torch.long),
-        "response_mask": torch.ones((1, response_width), dtype=torch.long),
+        "response_mask": torch.tensor([response_mask_values], dtype=torch.long),
         "input_ids": torch.tensor([prompt_ids + response_ids], dtype=torch.long),
         "attention_mask": torch.ones((1, seq_width), dtype=torch.long),
         "position_ids": torch.arange(seq_width, dtype=torch.long).view(1, 1, seq_width).expand(1, 4, seq_width).clone(),
@@ -164,3 +167,48 @@ def test_assemble_batch_from_rollout_samples_pads_to_actor_dp_multiple_before_ba
     assert torch.all(batch.batch["response_mask"][-1] == 0)
     assert torch.all(batch.batch["rm_scores"][-1] == 0)
     assert torch.all(batch.batch["rollout_log_probs"][-1] == 0)
+
+
+def test_assemble_batch_from_rollout_samples_raises_when_sample_has_no_supervised_tokens():
+    with pytest.raises(ValueError, match="no supervised response tokens"):
+        assemble_batch_from_rollout_samples(
+            [
+                _make_rollout_sample(
+                    sample_id="s1",
+                    prompt_ids=[1, 2, 3],
+                    response_ids=[11, 12],
+                    response_mask=[0, 0],
+                )
+            ],
+            tokenizer=_FakeTokenizer(),
+            config=None,
+            balance_batch=None,
+        )
+
+
+def test_assemble_batch_from_rollout_samples_raises_on_non_tensor_key_mismatch_before_concat():
+    sample_a = _make_rollout_sample(sample_id="s1", prompt_ids=[1, 2, 3], response_ids=[11, 12])
+    sample_b = _make_rollout_sample(sample_id="s2", prompt_ids=[4, 5, 6], response_ids=[21, 22])
+    sample_a.full_batch.non_tensor_batch["web_osgym_steps"] = np.array([[{"step_idx": 1}]], dtype=object)
+
+    with pytest.raises(ValueError, match="non_tensor_batch key mismatch"):
+        assemble_batch_from_rollout_samples(
+            [sample_a, sample_b],
+            tokenizer=_FakeTokenizer(),
+            config=None,
+            balance_batch=None,
+        )
+
+
+def test_assemble_batch_from_rollout_samples_raises_on_missing_param_versions():
+    sample = _make_rollout_sample(sample_id="s1", prompt_ids=[1, 2, 3], response_ids=[11, 12])
+    sample.full_batch.non_tensor_batch["min_global_steps"] = np.array([None], dtype=object)
+    sample.full_batch.non_tensor_batch["max_global_steps"] = np.array([None], dtype=object)
+
+    with pytest.raises(ValueError, match="min_global_steps|max_global_steps"):
+        assemble_batch_from_rollout_samples(
+            [sample],
+            tokenizer=_FakeTokenizer(),
+            config=None,
+            balance_batch=None,
+        )

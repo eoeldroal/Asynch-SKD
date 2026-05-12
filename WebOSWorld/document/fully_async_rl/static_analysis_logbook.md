@@ -558,6 +558,7 @@ Implemented:
   - `web_osgym_window_enable`
   - `web_osgym_window_history_n`
   - `web_osgym_window_max_images_per_sample`
+  - `web_osgym_window_supervision_block_size`
 - `WebOsGymToolAgentLoop` now uses the prompt-window builder during generation when `web_osgym_window_enable=True`.
 - The active WebGym fully async RL launcher enables this path with `history_n=5` and `max_images_per_sample=6`.
 - The rollout trace now reports whether the model-facing prompt was `windowed_prompt` or `full_accumulated_prompt`, plus the window settings, fallback count, and recorded generation-window count.
@@ -566,10 +567,20 @@ Implemented:
 Updated boundary:
 
 - Runtime rollout generation is windowed when the config flag is enabled.
-- Update/backprop now uses the same generation-window boundary. Each assistant generation records its exact prompt ids and selected image indices, then the completed trajectory is expanded into one `AgentLoopOutput` row per assistant generation before postprocess. This is visible in `web_osgym_unit_trace` as:
+- Update/backprop now uses the same generation-window boundary. Each assistant generation records its exact prompt ids and selected image indices, then the completed trajectory is expanded into configurable supervision blocks before postprocess. This is visible in `web_osgym_unit_trace` as:
   - `rollout_context=windowed_prompt`
   - `backprop_context=windowed_generation_rows`
+- `web_osgym_window_supervision_block_size=1` keeps one row per assistant generation.
+- `web_osgym_window_supervision_block_size>1` groups adjacent assistant generations into one emitted row, zeroes warmup turns in `response_mask`, and keeps the block response slice in:
+  - `web_osgym_window_block_response_start`
+  - `web_osgym_window_block_response_end`
+- When the total number of assistant generations is not divisible by the block size, the implementation keeps the prefix block shorter so later rows stay aligned to the newest supervised turns.
 - `data.max_response_length` remains the full trajectory output cap. With windowed rollout/update it no longer directly controls the per-step model context or mini-row padding width; those are handled by `max_model_len`, `max_num_batched_tokens`, `web_osgym_window_history_n`, `web_osgym_window_max_images_per_sample`, and the maximum target response length among emitted window rows.
+- The current Hydra runtime caveat is that `web_osgym_window_supervision_block_size` may need to be appended with `+actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size=...` instead of plain override syntax, depending on whether the composed input tree already declares the field.
+- Timeout isolation is now fail-soft at the fully async boundary:
+  - tool config enforces `timeout >= minimum_safe_action_timeout` when the floor is declared
+  - a Web/OSGym `action` `ReadTimeout` triggers a best-effort `reward` cleanup request without retrying the action
+  - the corresponding fully async sample group is dropped before queue put, prints a console line with sample context, and increments `count/timeout_dropped_samples`
 
 Remaining follow-up:
 

@@ -30,6 +30,7 @@ except ImportError:
 from tqdm import tqdm
 
 from .base_model_merger import BaseModelMerger
+from verl.utils.hf_files import resolve_hf_non_weight_source_dir, sync_hf_non_weight_files
 
 
 class FSDPModelMerger(BaseModelMerger):
@@ -236,6 +237,13 @@ class FSDPModelMerger(BaseModelMerger):
                 self.upload_to_huggingface()
         else:
             raise ValueError(f"Unknown operation: {self.config.operation}")
+
+    def save_hf_model_and_tokenizer(self, state_dict: dict[str, torch.Tensor]):
+        super().save_hf_model_and_tokenizer(state_dict)
+
+        source_dir = resolve_hf_non_weight_source_dir(self.hf_model_config_path)
+        if source_dir is not None:
+            sync_hf_non_weight_files(source_dir, self.config.target_dir)
 
     def _validate_state_dict(self, state_dict: dict[str, torch.Tensor]):
         auto_model_class = self.get_transformers_auto_model_class()

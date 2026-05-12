@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.qwen_coder_structured_output import build_qwen_coder_structured_tag_json
 from verl.experimental.agent_loop.web_osgym_trajectory_logger import WebOsGymTrajectoryLogger
@@ -1011,6 +1012,10 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                     logger.error("Invalid state: %s", state)
                     state = AgentState.TERMINATED
             return self._finalize_web_agent_output(agent_data)
+        except httpx.ReadTimeout as exc:
+            fatal_error = str(exc)
+            self._request_web_osgym_reward_best_effort(agent_data, termination_reason="system_stop")
+            raise
         except Exception as exc:
             fatal_error = str(exc)
             raise
