@@ -2019,6 +2019,10 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                for key in ("score/sum", "score/env", "score/format"):
+                    if key in reward_extra_infos_dict and len(reward_extra_infos_dict[key]) > 0:
+                        vals = np.asarray(reward_extra_infos_dict[key], dtype=np.float32)
+                        metrics[key] = float(np.mean(vals))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):

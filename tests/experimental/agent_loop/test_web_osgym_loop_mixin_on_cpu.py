@@ -177,6 +177,10 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                 "web_osgym_task_id": "12345",
                 "web_osgym_session_id": 101,
                 "web_osgym_include_a11y": False,
+                "web_osgym_trajectory_counts": {
+                    "attempted_tool_call_count": 2,
+                    "valid_tool_call_count": 2,
+                },
             }
         )
         tool._instance_dict["instance-1"] = {
@@ -190,15 +194,19 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         await loop._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
         loop._request_web_osgym_reward_best_effort(agent_data, termination_reason="system_stop")
 
-        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+        self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
         self.assertTrue(agent_data.extra_fields["web_osgym_reward_requested"])
         self.assertEqual(
             agent_data.extra_fields["reward_extra_info"],
             {
-                "web_osgym_reward_score": 1.0,
+                "web_osgym_env_reward_score": 1.0,
+                "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_valid_tool_calls": 2,
                 "web_osgym_termination_reason": "system_stop",
             },
         )
+        self.assertNotIn("web_osgym_reward_score", agent_data.extra_fields)
+        self.assertNotIn("web_osgym_format_reward", agent_data.extra_fields)
         self.assertEqual(len(tool.rewards), 1)
         self.assertEqual(tool.detached_reward_requests, [])
 

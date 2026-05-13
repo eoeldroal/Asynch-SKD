@@ -32,6 +32,8 @@ from verl.workers.rollout.replica import TokenOutput
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_QWEN_CODER_TOOL_CALL_STOP = "</tool_call>"
+
 
 @dataclass(frozen=True)
 class _WebOsGymGenerationInput:
@@ -257,6 +259,24 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         value = getattr(multi_turn, "web_osgym_window_max_images_per_sample", 6)
         return None if value is None else int(value)
 
+    @staticmethod
+    def _append_structured_tool_call_stop(params: dict[str, Any]) -> None:
+        stop = params.get("stop")
+        if stop is None:
+            params["stop"] = [_QWEN_CODER_TOOL_CALL_STOP]
+        elif isinstance(stop, str):
+            params["stop"] = [stop] if stop == _QWEN_CODER_TOOL_CALL_STOP else [stop, _QWEN_CODER_TOOL_CALL_STOP]
+        elif isinstance(stop, list):
+            if _QWEN_CODER_TOOL_CALL_STOP not in stop:
+                params["stop"] = [*stop, _QWEN_CODER_TOOL_CALL_STOP]
+        else:
+            raise TypeError(f"SGLang stop must be a string or list of strings, got {type(stop).__name__}.")
+        params["no_stop_trim"] = True
+
+    @staticmethod
+    def _has_qwen_coder_tool_marker(response_text: str) -> bool:
+        return any(marker in response_text for marker in ("<tool_call>", "<function=", "<parameter="))
+
     def _build_generation_sampling_params(
         self,
         base_sampling_params: dict[str, Any],
@@ -275,6 +295,7 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             return params
         params["structural_tag"] = build_qwen_coder_structured_tag_json(active_tool_schemas)
         params["ignore_eos"] = True
+        self._append_structured_tool_call_stop(params)
         return params
 
     def _should_use_server_prompt_ids(self, images: list[Any] | None) -> bool:
@@ -601,6 +622,18 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         logger_obj.append_event(session_dir, event)
         counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
         counts["event_count"] = int(counts.get("event_count", 0)) + 1
+        attempted_tool_call = bool(parse_error is not None or event["tool_call_count"] > 0 or bool(event["actions"]))
+        valid_tool_call = bool(
+            parse_error is None
+            and event["tool_call_count"] > 0
+            and bool(event["actions"])
+            and not event["result"]["invalid_action"]
+            and ((event["result"]["action_count"] or 0) > 0)
+        )
+        if attempted_tool_call:
+            counts["attempted_tool_call_count"] = int(counts.get("attempted_tool_call_count", 0)) + 1
+        if valid_tool_call:
+            counts["valid_tool_call_count"] = int(counts.get("valid_tool_call_count", 0)) + 1
         if event["result"]["invalid_action"]:
             counts["invalid_action_count"] = int(counts.get("invalid_action_count", 0)) + 1
         if parse_error is not None:
@@ -621,14 +654,16 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 "global_step": self._resolve_web_osgym_log_global_step(agent_data),
                 "session_id": agent_data.extra_fields.get("web_osgym_session_id"),
                 "request_id": agent_data.request_id,
-                "reward_score": agent_data.extra_fields.get("web_osgym_reward_score"),
+                "reward_score": agent_data.extra_fields.get("web_osgym_env_reward_score"),
+                "attempted_tool_call_count": int(counts.get("attempted_tool_call_count", 0)),
+                "valid_tool_call_count": int(counts.get("valid_tool_call_count", 0)),
                 "termination_reason": agent_data.extra_fields.get("web_osgym_termination_reason"),
                 "num_turns": agent_data.user_turns + agent_data.assistant_turns + 1,
                 "invalid_action_count": int(counts.get("invalid_action_count", 0)),
                 "parse_error_count": int(counts.get("parse_error_count", 0)),
                 "event_count": int(counts.get("event_count", 0)),
                 "completed": fatal_error is None,
-                "has_reward": "web_osgym_reward_score" in agent_data.extra_fields,
+                "has_reward": bool(agent_data.extra_fields.get("web_osgym_reward_fetched")),
                 "fatal_error": fatal_error,
             },
         )
@@ -882,16 +917,37 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             agent_data.routed_experts = output.routed_experts
 
         latest_step_idx = int((agent_data.extra_fields.get("web_osgym_steps") or [{}])[-1].get("step_idx", 0))
+        response_text = self._decode_response_text(agent_data.response_ids)
         self._record_web_osgym_assistant_turn(
             agent_data,
             observation_step_idx=latest_step_idx,
             response_start=response_start,
             response_end=len(agent_data.response_mask),
-            response_text=self._decode_response_text(agent_data.response_ids),
+            response_text=response_text,
             actions=[],
         )
 
-        if not ignore_termination and len(agent_data.response_mask) >= self.response_length:
+        active_tools = getattr(agent_data, "_active_tools", self.tools)
+        tools = [tool.tool_schema for tool in active_tools.values()]
+        agent_data.tool_calls = []
+        _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
+        parse_error = getattr(self.tool_parser, "last_parse_error", None)
+        if parse_error is None and not agent_data.tool_calls and self._has_qwen_coder_tool_marker(response_text):
+            parse_error = ToolParseError(
+                kind="tool_call_incomplete",
+                message="the tool-call markup is incomplete.",
+            )
+
+        if agent_data.tool_calls:
+            self._update_latest_web_osgym_assistant_turn_actions(
+                agent_data,
+                actions=self._trace_actions_from_tool_calls(agent_data),
+            )
+            next_state = AgentState.PROCESSING_TOOLS
+        elif parse_error is not None:
+            self._append_web_osgym_assistant_event(agent_data, parse_error=parse_error)
+            next_state = await self._handle_tool_parse_error(agent_data, parse_error)
+        elif not ignore_termination and len(agent_data.response_mask) >= self.response_length:
             self._append_web_osgym_assistant_event(
                 agent_data,
                 result={
@@ -928,33 +984,19 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             )
             next_state = AgentState.TERMINATED
         else:
-            active_tools = getattr(agent_data, "_active_tools", self.tools)
-            tools = [tool.tool_schema for tool in active_tools.values()]
-            _, agent_data.tool_calls = await self.tool_parser.extract_tool_calls(agent_data.response_ids, tools)
-            parse_error = getattr(self.tool_parser, "last_parse_error", None)
-            if agent_data.tool_calls:
-                self._update_latest_web_osgym_assistant_turn_actions(
-                    agent_data,
-                    actions=self._trace_actions_from_tool_calls(agent_data),
-                )
-                next_state = AgentState.PROCESSING_TOOLS
-            elif parse_error is not None:
-                self._append_web_osgym_assistant_event(agent_data, parse_error=parse_error)
-                next_state = await self._handle_tool_parse_error(agent_data, parse_error)
-            else:
-                self._append_web_osgym_assistant_event(
-                    agent_data,
-                    result={
-                        "terminated": True,
-                        "termination_reason": "system_stop",
-                        "invalid_action": False,
-                        "action_count": 0,
-                        "web_osgym_error_type": None,
-                    },
-                )
-                next_state = AgentState.TERMINATED
+            self._append_web_osgym_assistant_event(
+                agent_data,
+                result={
+                    "terminated": True,
+                    "termination_reason": "system_stop",
+                    "invalid_action": False,
+                    "action_count": 0,
+                    "web_osgym_error_type": None,
+                },
+            )
+            next_state = AgentState.TERMINATED
 
-        if next_state == AgentState.TERMINATED and "web_osgym_reward_score" not in agent_data.extra_fields:
+        if next_state == AgentState.TERMINATED and not agent_data.extra_fields.get("web_osgym_reward_fetched"):
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
         return next_state
 
@@ -990,9 +1032,6 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             extra_fields=agent_data.extra_fields,
         )
         output.extra_fields.update({"turn_scores": agent_data.turn_scores, "tool_rewards": agent_data.tool_rewards})
-        reward_score = output.extra_fields.get("web_osgym_reward_score")
-        if reward_score is not None:
-            output.reward_score = float(reward_score)
         return output
 
     @rollout_trace_op

@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import logging
 import os
 import random
 import time
+from dataclasses import dataclass
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 from uuid import uuid4
@@ -76,6 +78,13 @@ WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS = {
     "web_osgym_reward_fetched",
     "web_osgym_reward_requested",
 }
+WEB_OSGYM_ROLLOUT_TRACE_EXTRA_FIELD_KEYS = {
+    "web_osgym_generation_windows",
+    "web_osgym_steps",
+    "mini_step_image_spans",
+    "web_osgym_assistant_turns",
+    "web_osgym_unit_trace",
+}
 EXPORTED_EXTRA_FIELD_DEFAULTS = {
     "turn_scores": None,
     "tool_rewards": None,
@@ -98,7 +107,8 @@ def _trace_async_skd(stage: str, **fields: Any) -> None:
 def _filter_exported_extra_fields(extra_fields: dict[str, Any] | None) -> dict[str, Any]:
     if not extra_fields:
         return {}
-    return {key: value for key, value in extra_fields.items() if key not in WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS}
+    blocked_keys = WEB_OSGYM_RUNTIME_EXTRA_FIELD_KEYS | WEB_OSGYM_ROLLOUT_TRACE_EXTRA_FIELD_KEYS
+    return {key: value for key, value in extra_fields.items() if key not in blocked_keys}
 
 
 def _select_config(config, path: str, default=None):
@@ -475,11 +485,230 @@ class _InternalAgentLoopOutput(AgentLoopOutput):
     """Extra fields for dynamic addition."""
 
 
+@dataclass
+class DeferredAgentLoopOutputs:
+    """Compact fully-async payload carrying raw trajectories before row materialization."""
+
+    raw_outputs: list[AgentLoopOutput]
+    input_non_tensor_batch: dict[str, np.ndarray]
+    validate: bool
+
+
 class DictConfigWrap:
     """Wrapper for DictConfig to avoid hydra.utils.instantiate recursive resolve."""
 
     def __init__(self, config: DictConfig):
         self.config = config
+
+
+class AgentLoopOutputMaterializerMixin:
+    async def materialize_raw_outputs(
+        self,
+        raw_outputs: list[AgentLoopOutput],
+        input_non_tensor_batch: dict[str, np.ndarray],
+        *,
+        validate: bool,
+    ) -> DataProto:
+        outputs: list[AgentLoopOutput] = []
+        source_indices: list[int] = []
+        window_metrics: list[dict[str, float]] = []
+        for source_idx, raw_output in enumerate(raw_outputs):
+            windowed_outputs, metrics = self._maybe_window_web_osgym_outputs(raw_output)
+            outputs.extend(windowed_outputs)
+            source_indices.extend([source_idx] * len(windowed_outputs))
+            if metrics:
+                window_metrics.append(metrics)
+
+        expanded_non_tensor_batch = self._expand_input_non_tensor_batch(input_non_tensor_batch, source_indices)
+        has_window_rows = any(output.extra_fields.get("web_osgym_window_row") for output in outputs)
+        prompt_length_override = int(self.rollout_config.prompt_length)
+        if has_window_rows:
+            prompt_length_override = max(
+                prompt_length_override,
+                max((len(output.prompt_ids) for output in outputs), default=0),
+            )
+        response_length_override = None
+        if has_window_rows:
+            response_length_override = max(1, max((len(output.response_ids) for output in outputs), default=0))
+
+        postprocess_tasks = []
+        for output_item, source_idx in zip(outputs, source_indices, strict=True):
+            kwargs = {key: value[source_idx] for key, value in input_non_tensor_batch.items()}
+            if prompt_length_override:
+                kwargs["_prompt_length_override"] = prompt_length_override
+            if response_length_override is not None:
+                kwargs["_response_length_override"] = response_length_override
+            postprocess_tasks.append(asyncio.create_task(self._agent_loop_postprocess(output_item, validate, **kwargs)))
+        internal_outputs = await asyncio.gather(*postprocess_tasks)
+
+        output = self._postprocess(
+            internal_outputs,
+            input_non_tensor_batch=expanded_non_tensor_batch,
+            validate=validate,
+        )
+        if window_metrics and output.meta_info.get("metrics"):
+            output.meta_info["metrics"][0].update(self._merge_window_metric_dicts(window_metrics))
+        return output
+
+    def materialize_raw_outputs_sync(
+        self,
+        raw_outputs: list[AgentLoopOutput],
+        input_non_tensor_batch: dict[str, np.ndarray],
+        *,
+        validate: bool,
+    ) -> DataProto:
+        outputs: list[AgentLoopOutput] = []
+        source_indices: list[int] = []
+        window_metrics: list[dict[str, float]] = []
+        for source_idx, raw_output in enumerate(raw_outputs):
+            windowed_outputs, metrics = self._maybe_window_web_osgym_outputs(raw_output)
+            outputs.extend(windowed_outputs)
+            source_indices.extend([source_idx] * len(windowed_outputs))
+            if metrics:
+                window_metrics.append(metrics)
+
+        expanded_non_tensor_batch = self._expand_input_non_tensor_batch(input_non_tensor_batch, source_indices)
+        has_window_rows = any(output.extra_fields.get("web_osgym_window_row") for output in outputs)
+        prompt_length_override = int(self.rollout_config.prompt_length)
+        if has_window_rows:
+            prompt_length_override = max(
+                prompt_length_override,
+                max((len(output.prompt_ids) for output in outputs), default=0),
+            )
+        response_length_override = None
+        if has_window_rows:
+            response_length_override = max(1, max((len(output.response_ids) for output in outputs), default=0))
+
+        internal_outputs = []
+        for output_item, source_idx in zip(outputs, source_indices, strict=True):
+            kwargs = {key: value[source_idx] for key, value in input_non_tensor_batch.items()}
+            if prompt_length_override:
+                kwargs["_prompt_length_override"] = prompt_length_override
+            if response_length_override is not None:
+                kwargs["_response_length_override"] = response_length_override
+            internal_outputs.append(self._agent_loop_postprocess_sync(output_item, validate, **kwargs))
+
+        output = self._postprocess(
+            internal_outputs,
+            input_non_tensor_batch=expanded_non_tensor_batch,
+            validate=validate,
+        )
+        if window_metrics and output.meta_info.get("metrics"):
+            output.meta_info["metrics"][0].update(self._merge_window_metric_dicts(window_metrics))
+        return output
+
+    def _agent_loop_postprocess_sync(self, output, validate, **kwargs) -> _InternalAgentLoopOutput:
+        if self.reward_loop_worker_handles is not None:
+            raise ValueError("Deferred synchronous materialization does not support async reward computation.")
+        if self.distillation_enabled:
+            raise ValueError("Deferred synchronous materialization does not support distillation.")
+
+        prompt_length = int(kwargs.pop("_prompt_length_override", self.rollout_config.prompt_length))
+        response_length = int(kwargs.pop("_response_length_override", self.rollout_config.response_length))
+        output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
+
+        self.tokenizer.padding_side = "left"
+        prompt_output = self.tokenizer.pad(
+            {"input_ids": output.prompt_ids},
+            padding="max_length",
+            max_length=prompt_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        if prompt_output["input_ids"].dim() == 1:
+            prompt_output["input_ids"] = prompt_output["input_ids"].unsqueeze(0)
+            prompt_output["attention_mask"] = prompt_output["attention_mask"].unsqueeze(0)
+
+        self.tokenizer.padding_side = "right"
+        response_output = self.tokenizer.pad(
+            {"input_ids": output.response_ids},
+            padding="max_length",
+            max_length=response_length,
+            return_tensors="pt",
+            return_attention_mask=True,
+        )
+        if response_output["input_ids"].dim() == 1:
+            response_output["input_ids"] = response_output["input_ids"].unsqueeze(0)
+            response_output["attention_mask"] = response_output["attention_mask"].unsqueeze(0)
+
+        response_mask_output = self.tokenizer.pad(
+            {"input_ids": output.response_mask},
+            padding="max_length",
+            max_length=response_length,
+            return_tensors="pt",
+            return_attention_mask=False,
+        )
+        if response_mask_output["input_ids"].dim() == 1:
+            response_mask_output["input_ids"] = response_mask_output["input_ids"].unsqueeze(0)
+
+        response_logprobs = None
+        if output.response_logprobs is not None:
+            pad_size = response_length - len(output.response_logprobs)
+            response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
+
+        response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
+        attention_mask = torch.cat([prompt_output["attention_mask"], response_output["attention_mask"]], dim=1)
+        input_ids = torch.cat([prompt_output["input_ids"], response_output["input_ids"]], dim=1)
+
+        routed_experts = None
+        if output.routed_experts is not None:
+            total_length = input_ids.shape[1]
+            length, layer_num, topk_num = output.routed_experts.shape
+            if isinstance(output.routed_experts, np.ndarray):
+                routed_experts_array = output.routed_experts
+                if not routed_experts_array.flags.writeable:
+                    routed_experts_array = routed_experts_array.copy()
+                experts_tensor = torch.from_numpy(routed_experts_array)
+            elif isinstance(output.routed_experts, torch.Tensor):
+                experts_tensor = output.routed_experts
+            else:
+                raise TypeError(f"Unsupported type for routed_experts: {type(output.routed_experts)}")
+            routed_experts = torch.zeros(1, total_length, layer_num, topk_num, dtype=experts_tensor.dtype)
+            start_pos = prompt_output["input_ids"].shape[1] - len(output.prompt_ids)
+            end_pos = min(start_pos + length, total_length)
+            if start_pos < 0 or end_pos > total_length:
+                raise ValueError(
+                    f"Invalid position range: start_pos={start_pos}, end_pos={end_pos}, total_length={total_length}"
+                )
+            routed_experts[:, start_pos:end_pos] = experts_tensor.unsqueeze(0)
+
+        multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+        position_ids = self._compute_position_ids(input_ids, attention_mask, multi_modal_inputs)
+        teacher_ids, teacher_logprobs = (
+            output.extra_fields.pop("teacher_ids", None),
+            output.extra_fields.pop("teacher_logprobs", None),
+        )
+        if teacher_ids is not None and teacher_logprobs is not None:
+            from verl.experimental.teacher_loop.teacher_manager import _pad_teacher_outputs
+
+            teacher_ids, teacher_logprobs = _pad_teacher_outputs(
+                teacher_ids,
+                teacher_logprobs,
+                prompt_width=prompt_output["input_ids"].shape[1],
+                response_width=response_output["input_ids"].shape[1],
+                prompt_length=len(output.prompt_ids),
+                response_length=len(output.response_ids),
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+
+        return _InternalAgentLoopOutput(
+            prompt_ids=prompt_output["input_ids"],
+            response_ids=response_output["input_ids"],
+            input_ids=input_ids,
+            position_ids=position_ids,
+            response_mask=response_mask,
+            attention_mask=attention_mask,
+            response_logprobs=response_logprobs,
+            routed_experts=routed_experts,
+            multi_modal_inputs=multi_modal_inputs,
+            multi_modal_data=output.multi_modal_data,
+            teacher_logprobs=teacher_logprobs,
+            teacher_ids=teacher_ids,
+            reward_score=output.reward_score,
+            num_turns=output.num_turns,
+            metrics=output.metrics,
+            extra_fields=output.extra_fields,
+        )
 
 
 class AgentLoopBase(ABC):
@@ -643,7 +872,7 @@ def register(agent_name: str):
     return decorator
 
 
-class AgentLoopWorker:
+class AgentLoopWorker(AgentLoopOutputMaterializerMixin):
     """Agent loop worker takes a batch of messages and run each message in an agent loop.
 
     Args:
@@ -755,22 +984,33 @@ class AgentLoopWorker:
             responses:     |<- LLM generation ->|<- tool_calls ->|<- LLM generation ->|<- padding ->|
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
+        raw_outputs, validate = await self._collect_raw_outputs(batch)
+        return await self.materialize_raw_outputs(raw_outputs, batch.non_tensor_batch, validate=validate)
+
+    async def generate_sequences_compact(self, batch: DataProto) -> DeferredAgentLoopOutputs:
+        raw_outputs, validate = await self._collect_raw_outputs(batch)
+        return DeferredAgentLoopOutputs(
+            raw_outputs=raw_outputs,
+            input_non_tensor_batch={key: copy.deepcopy(value) for key, value in batch.non_tensor_batch.items()},
+            validate=validate,
+        )
+
+    async def _collect_raw_outputs(self, batch: DataProto) -> tuple[list[AgentLoopOutput], bool]:
         config = self.rollout_config
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
             top_k=config.top_k,
-            repetition_penalty=1.0,
+            repetition_penalty=config.repetition_penalty,
             logprobs=config.calculate_log_probs,
         )
 
-        # override sampling params for validation
-        if batch.meta_info.get("validate", False):
+        validate = batch.meta_info.get("validate", False)
+        if validate:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
 
-        # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
             default_agent_loop = config.agent.default_agent_loop
             batch.non_tensor_batch["agent_name"] = np.array([default_agent_loop] * len(batch), dtype=object)
@@ -781,9 +1021,6 @@ class AgentLoopWorker:
             index = np.arange(len(batch))
 
         max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
-
-        # For n rollouts per sample, we trace all n rollouts for selected samples
-        # Note: This sampling happens per-worker, so total traces = max_samples_per_worker * num_workers * n
         if max_samples_per_worker is not None:
             unique_sample_indices = np.unique(index)
             if max_samples_per_worker < len(unique_sample_indices):
@@ -797,7 +1034,7 @@ class AgentLoopWorker:
             traced_indices = set(range(len(batch)))
 
         trajectory_info = await get_trajectory_info(
-            batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
+            batch.meta_info.get("global_steps", -1), index.tolist(), validate
         )
 
         tasks = []
@@ -809,49 +1046,7 @@ class AgentLoopWorker:
                     self._run_raw_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        raw_outputs = await asyncio.gather(*tasks)
-
-        outputs: list[AgentLoopOutput] = []
-        source_indices: list[int] = []
-        window_metrics: list[dict[str, float]] = []
-        for source_idx, raw_output in enumerate(raw_outputs):
-            windowed_outputs, metrics = self._maybe_window_web_osgym_outputs(raw_output)
-            outputs.extend(windowed_outputs)
-            source_indices.extend([source_idx] * len(windowed_outputs))
-            if metrics:
-                window_metrics.append(metrics)
-
-        expanded_non_tensor_batch = self._expand_input_non_tensor_batch(batch.non_tensor_batch, source_indices)
-        has_window_rows = any(output.extra_fields.get("web_osgym_window_row") for output in outputs)
-        prompt_length_override = int(self.rollout_config.prompt_length)
-        if has_window_rows:
-            prompt_length_override = max(
-                prompt_length_override,
-                max((len(output.prompt_ids) for output in outputs), default=0),
-            )
-        response_length_override = None
-        if has_window_rows:
-            response_length_override = max(1, max((len(output.response_ids) for output in outputs), default=0))
-
-        postprocess_tasks = []
-        validate = batch.meta_info.get("validate", False)
-        for output_item, source_idx in zip(outputs, source_indices, strict=True):
-            kwargs = {key: value[source_idx] for key, value in batch.non_tensor_batch.items()}
-            if prompt_length_override:
-                kwargs["_prompt_length_override"] = prompt_length_override
-            if response_length_override is not None:
-                kwargs["_response_length_override"] = response_length_override
-            postprocess_tasks.append(asyncio.create_task(self._agent_loop_postprocess(output_item, validate, **kwargs)))
-        internal_outputs = await asyncio.gather(*postprocess_tasks)
-
-        output = self._postprocess(
-            internal_outputs,
-            input_non_tensor_batch=expanded_non_tensor_batch,
-            validate=validate,
-        )
-        if window_metrics and output.meta_info.get("metrics"):
-            output.meta_info["metrics"][0].update(self._merge_window_metric_dicts(window_metrics))
-        return output
+        return await asyncio.gather(*tasks), validate
 
     @staticmethod
     def _expand_input_non_tensor_batch(
@@ -1366,6 +1561,19 @@ class AgentLoopWorker:
         reward_extra_keys = list(reward_extra_infos[0].keys())
         for key in reward_extra_keys:
             non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        base_extra_infos = non_tensor_batch.get("extra_info")
+        merged_extra_infos = []
+        for idx, reward_extra_info in enumerate(reward_extra_infos):
+            merged_extra_info = {}
+            if base_extra_infos is not None:
+                base_extra_info = base_extra_infos[idx]
+                if isinstance(base_extra_info, dict):
+                    merged_extra_info.update(base_extra_info)
+            if isinstance(reward_extra_info, dict):
+                merged_extra_info.update(reward_extra_info)
+            merged_extra_infos.append(merged_extra_info)
+        if merged_extra_infos:
+            non_tensor_batch["extra_info"] = np.array(merged_extra_infos, dtype=object)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

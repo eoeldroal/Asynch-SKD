@@ -745,15 +745,12 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             ignore_termination=ignore_termination,
             stop_after_skd_chunk=stop_after_skd_chunk,
         )
-        if next_state == AgentState.TERMINATED and "web_osgym_reward_score" not in agent_data.extra_fields:
+        if next_state == AgentState.TERMINATED and not agent_data.extra_fields.get("web_osgym_reward_fetched"):
             await self._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
         return next_state
 
     def _finalize_boundary_agent_output(self, agent_data: AgentData) -> AgentLoopOutput:
         output = super()._finalize_boundary_agent_output(agent_data)
-        reward_score = output.extra_fields.get("web_osgym_reward_score")
-        if reward_score is not None:
-            output.reward_score = float(reward_score)
         return output
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:

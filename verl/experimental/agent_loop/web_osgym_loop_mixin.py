@@ -95,7 +95,7 @@ class WebOsGymLoopMixin:
             task_id=agent_data.extra_fields["web_osgym_task_id"],
             request_id=agent_data.extra_fields["web_osgym_session_id"],
             include_a11y=agent_data.extra_fields["web_osgym_include_a11y"],
-            reward=agent_data.extra_fields.get("web_osgym_reward_score"),
+            reward=agent_data.extra_fields.get("web_osgym_env_reward_score"),
             cursor_x=agent_data.extra_fields.get("web_osgym_cursor_x"),
             cursor_y=agent_data.extra_fields.get("web_osgym_cursor_y"),
             screen_width=agent_data.extra_fields.get("web_osgym_screen_width"),
@@ -268,13 +268,19 @@ class WebOsGymLoopMixin:
             raise RuntimeError("calc_reward retry loop exited unexpectedly") from last_error
         agent_data.extra_fields["web_osgym_reward_fetched"] = True
         agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
-        agent_data.extra_fields["web_osgym_reward_score"] = float(reward)
+        counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
+        attempted_tool_calls = int(counts.get("attempted_tool_call_count", 0))
+        valid_tool_calls = int(counts.get("valid_tool_call_count", 0))
+        env_reward = float(reward)
+        agent_data.extra_fields["web_osgym_env_reward_score"] = env_reward
         reward_extra_info = agent_data.extra_fields.get("reward_extra_info") or {}
         if not isinstance(reward_extra_info, dict):
             reward_extra_info = {}
         agent_data.extra_fields["reward_extra_info"] = {
             **reward_extra_info,
-            "web_osgym_reward_score": float(reward),
+            "web_osgym_env_reward_score": env_reward,
+            "web_osgym_attempted_tool_calls": attempted_tool_calls,
+            "web_osgym_valid_tool_calls": valid_tool_calls,
             "web_osgym_termination_reason": termination_reason,
         }
 

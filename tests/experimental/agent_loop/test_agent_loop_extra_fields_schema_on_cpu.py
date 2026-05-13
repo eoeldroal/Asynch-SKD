@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import warnings
+from functools import partial
 from typing import Any, Optional
 
 import numpy as np
@@ -22,6 +23,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from WebOSWorld.webgym_rl.reward_fn_webgym_rl import compute_score_webgym_rl
 from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     AgentLoopOutput,
@@ -31,6 +33,7 @@ from verl.experimental.agent_loop.agent_loop import (
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.dataset.rl_dataset import RLHFDataset
+from verl.workers.reward_manager.naive import NaiveRewardManager
 from verl.workers.rollout.replica import TokenOutput
 
 
@@ -313,3 +316,68 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+def test_web_osgym_training_reward_is_computed_by_reward_manager_from_extra_info():
+    metrics = AgentLoopMetrics()
+    internal = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[11, 12],
+        output_response_mask=[1, 1],
+        metrics=metrics,
+        extra_fields={
+            "reward_extra_info": {
+                "web_osgym_env_reward_score": 1.0,
+                "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_valid_tool_calls": 2,
+                "web_osgym_termination_reason": "model_done",
+            }
+        },
+        num_turns=4,
+        prompt_len=2,
+        response_len=2,
+    )
+
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
+    batch = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[internal],
+        input_non_tensor_batch={
+            "index": np.array([0], dtype=object),
+            "agent_name": np.array(["web_tool_agent"], dtype=object),
+            "data_source": np.array(["webgym_rl"], dtype=object),
+            "reward_model": np.array([{"ground_truth": "env_reward"}], dtype=object),
+            "extra_info": np.array([{"task_id": "demo-task"}], dtype=object),
+        },
+    )
+
+    assert "rm_scores" not in batch.batch
+    merged_extra_info = batch.non_tensor_batch["extra_info"][0]
+    assert merged_extra_info["task_id"] == "demo-task"
+    assert merged_extra_info["web_osgym_env_reward_score"] == 1.0
+    assert merged_extra_info["web_osgym_attempted_tool_calls"] == 2
+    assert merged_extra_info["web_osgym_valid_tool_calls"] == 2
+
+    reward_manager = NaiveRewardManager(
+        tokenizer=_FakeTokenizer(),
+        num_examine=0,
+        compute_score=partial(
+            compute_score_webgym_rl,
+            format_reward_alpha=0.03,
+            format_reward_min_denominator=5,
+        ),
+    )
+    reward_result = reward_manager(batch, return_dict=True)
+
+    expected_score = 1.0 + 0.03 * (2.0 / 5.0)
+    reward_tensor = reward_result["reward_tensor"]
+    assert reward_tensor.shape == batch.batch["responses"].shape
+    assert reward_tensor[0, 1].item() == pytest.approx(expected_score)
+    assert reward_result["reward_extra_info"]["web_osgym_env_reward_score"] == [1.0]
+    assert reward_result["reward_extra_info"]["web_osgym_format_reward"] == [2.0 / 5.0]
+    assert reward_result["reward_extra_info"]["web_osgym_attempted_tool_calls"] == [2]
+    assert reward_result["reward_extra_info"]["web_osgym_valid_tool_calls"] == [2]

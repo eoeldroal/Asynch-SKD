@@ -1098,7 +1098,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             agent_data.extra_fields["web_osgym_teacher_messages"], before_extra["web_osgym_teacher_messages"]
         )
         self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_response_budget_exhausted")
-        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+        self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
 
     async def test_tool_parse_error_adds_recovery_observation(self):
         loop = _build_loop()
@@ -1564,7 +1564,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.extra_fields["web_osgym_teacher_messages"], before_extra["web_osgym_teacher_messages"])
         self.assertEqual(agent_data.extra_fields["mini_step_image_spans"], before_extra["mini_step_image_spans"])
         self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "model_done")
-        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+        self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
 
     async def test_system_stop_fetches_reward_on_skd_loop(self):
         loop = _build_loop()
@@ -1600,7 +1600,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             SkdAgentLoop._handle_generating_state = original
 
         self.assertEqual(state, AgentState.TERMINATED)
-        self.assertEqual(agent_data.extra_fields["web_osgym_reward_score"], 1.0)
+        self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
 
     async def test_student_observation_commit_appends_compact_delta_ids_for_image_boundary(self):
         loop = _build_loop()

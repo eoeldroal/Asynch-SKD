@@ -9,7 +9,7 @@ import pytest
 
 from verl.experimental.agent_loop.skd_agent_loop import SkdAgentLoop
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
-from verl.experimental.agent_loop.tool_parser import FunctionCall
+from verl.experimental.agent_loop.tool_parser import FunctionCall, ToolParseError
 from verl.experimental.agent_loop.web_tool_agent_loop import WebOsGymToolAgentLoop, _WebOsGymGenerationInput
 from verl.tools.schemas import ToolResponse
 from verl.workers.rollout.replica import TokenOutput
@@ -24,7 +24,28 @@ class _FakeWebTool:
         self.released = []
         self.rewards = []
         self._instance_dict = {}
-        self.tool_schema = SimpleNamespace(model_dump=lambda **_: {"function": {"name": "computer"}})
+        self.tool_schema = SimpleNamespace(
+            model_dump=lambda **_: {
+                "type": "function",
+                "function": {
+                    "name": "computer",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "actions": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {"action_type": {"type": "string"}},
+                                    "required": ["action_type"],
+                                },
+                            }
+                        },
+                        "required": ["actions"],
+                    },
+                },
+            }
+        )
 
     async def create(self, *, task_id, request_id, include_a11y, **kwargs):
         self.created.append(
@@ -556,7 +577,8 @@ def test_generation_uses_compact_server_prompt_ids_for_image_bearing_sglang_requ
 
         agent_data = _agent_data(_FakeWebTool())
         agent_data.prompt_ids = [100]
-        agent_data.extra_fields["web_osgym_reward_score"] = 0.0
+        agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+        agent_data.extra_fields["web_osgym_reward_fetched"] = True
 
         state = await loop._handle_generating_state(agent_data, {})
 
@@ -568,6 +590,102 @@ def test_generation_uses_compact_server_prompt_ids_for_image_bearing_sglang_requ
         assert agent_data.extra_fields["web_osgym_generation_windows"][0]["window_used"] is True
         assert agent_data.prompt_ids == [100, 201]
         assert agent_data.response_mask == [1]
+
+    asyncio.run(_run())
+
+
+def test_generation_parses_tool_call_before_budget_system_stop():
+    class _FakeServerManager:
+        async def generate(self, **kwargs):
+            del kwargs
+            return TokenOutput(
+                token_ids=[201, 202],
+                log_probs=[-0.1, -0.2],
+                num_preempted=0,
+                stop_reason="length",
+                extra_fields={"global_steps": 0},
+            )
+
+    class _FakeToolParser:
+        def __init__(self):
+            self.calls = []
+            self.last_parse_error = None
+
+        async def extract_tool_calls(self, response_ids, tools):
+            self.calls.append((list(response_ids), tools))
+            self.last_parse_error = ToolParseError(
+                kind="actions_json_malformed",
+                message="the actions JSON is malformed.",
+            )
+            return "", []
+
+    async def _run():
+        loop = _make_loop()
+        loop.response_length = 4
+        loop.max_assistant_turns = 10
+        loop.max_user_turns = 10
+        loop.rollout_config = SimpleNamespace(
+            name="sglang",
+            skip_tokenizer_init=True,
+            custom={"enable_qwen3_coder_structured_output": True},
+            multi_turn=SimpleNamespace(
+                web_osgym_window_enable=False,
+                web_osgym_window_history_n=1,
+                web_osgym_window_max_images_per_sample=6,
+            ),
+        )
+        loop.server_manager = _FakeServerManager()
+        loop.tool_parser = _FakeToolParser()
+        loop.tool_parser_name = "qwen3_coder"
+        loop.tokenizer.decode = (
+            lambda ids, skip_special_tokens=False: '</think>\n<tool_call>\n<function=computer>\n'
+            '<parameter=actions>\n[{"action_type": "MOVE_TO", "x": 463,'
+        )
+        events = []
+        parse_errors = []
+
+        loop._append_web_osgym_assistant_event = lambda agent_data, **kwargs: events.append(kwargs)
+
+        async def _handle_tool_parse_error(agent_data, parse_error):
+            parse_errors.append(parse_error)
+            return AgentState.TERMINATED
+
+        loop._handle_tool_parse_error = _handle_tool_parse_error
+
+        async def _finalize_with_web_osgym_reward(agent_data, termination_reason):
+            agent_data.extra_fields.update(
+                {
+                    "web_osgym_env_reward_score": 0.0,
+                    "web_osgym_reward_fetched": True,
+                    "web_osgym_termination_reason": termination_reason,
+                }
+            )
+
+        loop._finalize_with_web_osgym_reward = _finalize_with_web_osgym_reward
+
+        agent_data = _agent_data(_FakeWebTool())
+        agent_data.prompt_ids = [100]
+        agent_data.response_mask = [1, 1]
+        agent_data.extra_fields["web_osgym_steps"] = [
+            {
+                "step_idx": 1,
+                "phase": "tool_observation",
+                "text": "",
+                "actions": [],
+                "image_start": 0,
+                "image_end": 0,
+            }
+        ]
+
+        state = await loop._handle_generating_state(agent_data, {})
+
+        assert state == AgentState.TERMINATED
+        assert loop.tool_parser.calls == [([201, 202], [agent_data._active_tools["computer"].tool_schema])]
+        assert parse_errors == [
+            ToolParseError(kind="actions_json_malformed", message="the actions JSON is malformed.")
+        ]
+        assert events == [{"parse_error": parse_errors[0]}]
+        assert agent_data.extra_fields["web_osgym_termination_reason"] == "system_stop"
 
     asyncio.run(_run())
 
@@ -685,7 +803,7 @@ def test_processing_reuses_session_and_sets_reward_score_on_terminal_action():
         assert tool.executed[0][0] == "instance-1"
         assert tool.executed[0][1]["actions"][0]["action_type"] == "DONE"
         assert tool.rewards == [("instance-1", {"termination_reason": "model_done"})]
-        assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+        assert agent_data.extra_fields["web_osgym_env_reward_score"] == 1.0
         assert agent_data.response_mask == []
 
     asyncio.run(_run())
@@ -980,7 +1098,7 @@ def test_tool_response_budget_exhaustion_fetches_reward_without_committing_obser
         assert agent_data.prompt_ids == [100]
         assert agent_data.response_mask == [1]
         assert agent_data.extra_fields["web_osgym_termination_reason"] == "tool_response_budget_exhausted"
-        assert agent_data.extra_fields["web_osgym_reward_score"] == 1.0
+        assert agent_data.extra_fields["web_osgym_env_reward_score"] == 1.0
 
     asyncio.run(_run())
 
@@ -1282,9 +1400,16 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
             "web_osgym_session_id": 987,
             "web_osgym_sample_uid": "uid-xyz",
             "global_steps": 3,
-            "web_osgym_reward_score": 1.0,
+            "web_osgym_env_reward_score": 0.97,
+            "web_osgym_reward_fetched": True,
             "web_osgym_termination_reason": "model_done",
-            "web_osgym_trajectory_counts": {"invalid_action_count": 2, "parse_error_count": 1, "event_count": 4},
+            "web_osgym_trajectory_counts": {
+                "invalid_action_count": 2,
+                "parse_error_count": 1,
+                "attempted_tool_call_count": 4,
+                "valid_tool_call_count": 4,
+                "event_count": 4,
+            },
         }
     )
 
@@ -1297,13 +1422,91 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
     assert summary["sample_uid"] == "uid-xyz"
     assert summary["global_step"] == 3
     assert summary["session_id"] == 987
-    assert summary["reward_score"] == 1.0
+    assert summary["reward_score"] == 0.97
     assert summary["termination_reason"] == "model_done"
     assert summary["invalid_action_count"] == 2
     assert summary["parse_error_count"] == 1
+    assert summary["attempted_tool_call_count"] == 4
+    assert summary["valid_tool_call_count"] == 4
     assert summary["event_count"] == 4
     assert summary["completed"] is True
     assert summary["has_reward"] is True
+
+
+def test_append_web_osgym_assistant_event_tracks_attempted_and_valid_tool_call_counts(monkeypatch, tmp_path):
+    monkeypatch.setenv("WEB_OSGYM_TOOL_TRACE_DIR", str(tmp_path))
+    loop = _make_loop()
+    agent_data = _agent_data(_FakeWebTool())
+    agent_data.request_id = "req-counts"
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_task_id": "warn_prozilla_calc_02",
+            "web_osgym_session_id": 321,
+            "web_osgym_sample_uid": "uid-counts",
+            "global_steps": 0,
+        }
+    )
+
+    loop._record_web_osgym_assistant_turn(
+        agent_data,
+        observation_step_idx=1,
+        response_start=0,
+        response_end=1,
+        response_text='</think>\n<tool_call>\n<function=computer>\n<parameter=actions>\n[{"action_type":"CLICK"}]\n</parameter>\n</function>\n</tool_call>',
+        actions=[],
+    )
+    agent_data.tool_calls = [FunctionCall(name="computer", arguments='{"actions":[{"action_type":"CLICK"}]}')]
+    loop._append_web_osgym_assistant_event(
+        agent_data,
+        result={
+            "terminated": False,
+            "termination_reason": None,
+            "invalid_action": False,
+            "action_count": 1,
+            "web_osgym_error_type": None,
+            "web_osgym_actions": [{"action_type": "CLICK", "x": 1, "y": 2, "button": "left", "num_clicks": 1}],
+        },
+    )
+
+    loop._record_web_osgym_assistant_turn(
+        agent_data,
+        observation_step_idx=2,
+        response_start=1,
+        response_end=2,
+        response_text='</think>\n<tool_call>\n<function=computer>\n<parameter=actions>\n[{"action_type":"MOVE_TO","x":123,',
+        actions=[],
+    )
+    loop._append_web_osgym_assistant_event(
+        agent_data,
+        parse_error=ToolParseError(kind="actions_json_malformed", message="the actions JSON is malformed."),
+    )
+
+    loop._record_web_osgym_assistant_turn(
+        agent_data,
+        observation_step_idx=3,
+        response_start=2,
+        response_end=3,
+        response_text="</think>\n<tool_call>\n<function=computer<|im_end|>",
+        actions=[],
+    )
+    agent_data.tool_calls = [FunctionCall(name="computer<|im_end|", arguments="{}")]
+    loop._append_web_osgym_assistant_event(
+        agent_data,
+        result={
+            "terminated": False,
+            "termination_reason": None,
+            "invalid_action": True,
+            "action_count": 0,
+            "web_osgym_error_type": None,
+        },
+    )
+
+    counts = agent_data.extra_fields["web_osgym_trajectory_counts"]
+    assert counts["attempted_tool_call_count"] == 3
+    assert counts["valid_tool_call_count"] == 1
+    assert counts["invalid_action_count"] == 1
+    assert counts["parse_error_count"] == 1
+    assert counts["event_count"] == 3
 
 
 def test_init_web_agent_data_stores_trajectory_global_step():
@@ -1334,7 +1537,8 @@ def test_web_osgym_session_dir_is_stable_after_global_step_changes(monkeypatch, 
             "web_osgym_sample_uid": "uid-stable",
             "global_steps": None,
             "web_osgym_log_global_step": 0,
-            "web_osgym_reward_score": 0.0,
+            "web_osgym_env_reward_score": 0.0,
+            "web_osgym_reward_fetched": True,
             "web_osgym_termination_reason": "system_stop",
             "web_osgym_trajectory_counts": {"event_count": 1},
         }
