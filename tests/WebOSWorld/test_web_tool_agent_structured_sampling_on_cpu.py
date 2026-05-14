@@ -62,9 +62,30 @@ def test_build_generation_sampling_params_attaches_structural_tag_for_explicit_r
         "top_k": -1,
         "structural_tag": '{"type": "structural_tag"}',
         "ignore_eos": True,
+        "stop": ["</tool_call>"],
+        "no_stop_trim": True,
     }
     assert base_sampling_params == {"temperature": 0.95, "top_p": 0.6, "top_k": -1}
     assert builder_calls == [active_tool_schemas]
+
+
+def test_build_generation_sampling_params_preserves_existing_stop_strings(monkeypatch):
+    loop = _make_loop(custom={"enable_qwen3_coder_structured_output": True})
+
+    def _fake_builder(tool_schemas):
+        del tool_schemas
+        return '{"type": "structural_tag"}'
+
+    monkeypatch.setattr(web_tool_agent_loop_module, "build_qwen_coder_structured_tag_json", _fake_builder)
+
+    result = WebOsGymToolAgentLoop._build_generation_sampling_params(
+        loop,
+        {"temperature": 0.95, "stop": ["custom-stop", "</tool_call>"]},
+        _bundled_tool_schemas(),
+    )
+
+    assert result["stop"] == ["custom-stop", "</tool_call>"]
+    assert result["no_stop_trim"] is True
 
 
 @pytest.mark.parametrize(

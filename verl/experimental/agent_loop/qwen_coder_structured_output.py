@@ -3,36 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from xgrammar.structural_tag import (
-    AnyTextFormat,
-    QwenXMLParameterFormat,
-    SequenceFormat,
-    StructuralTag,
-    TagFormat,
-)
+from xgrammar import get_builtin_structural_tag
 
 
 _BUNDLED_TOOL_NAME = "computer"
-_QWEN_35_SPECIAL_AND_STRUCTURE_TOKENS = [
-    "</think>",
-    "<tool_call>",
-    "<function=",
-    "<parameter=",
-    "<|im_start|>",
-    "<|im_end|>",
-    "<|endoftext|>",
-    "<|object_ref_start|>",
-    "<|object_ref_end|>",
-    "<|box_start|>",
-    "<|box_end|>",
-    "<|quad_start|>",
-    "<|quad_end|>",
-    "<|vision_start|>",
-    "<|vision_end|>",
-    "<|vision_pad|>",
-    "<|image_pad|>",
-    "<|video_pad|>",
-]
 
 
 def _ensure_bundled_computer_tool(tool_schemas: list[dict[str, Any]]) -> None:
@@ -48,34 +22,10 @@ def _ensure_bundled_computer_tool(tool_schemas: list[dict[str, Any]]) -> None:
 
 
 def build_qwen_coder_structured_tag_json(tool_schemas: list[dict[str, Any]]) -> str:
-    """Build a structural_tag JSON for Qwen3.5-Coder WebOSWorld RL rollout.
-
-    The Qwen3.5 chat template unconditionally appends ``<think>\\n`` to the
-    prompt when ``add_generation_prompt=True``.  The grammar therefore must NOT
-    force another ``<think>`` token at generation start.  Instead it assumes the
-    opening tag is already in the prompt and constrains only what the model
-    generates after it:
-
-      [reasoning content]</think>
-      <tool_call>\\n<function=computer>\\n
-      <parameter=actions>\\n[JSON array]\\n</parameter>
-      \\n</function>\\n</tool_call>
-      <|im_end|>
-
-    Key properties enforced by the grammar:
-    - reasoning text remains unconstrained until ``</think>``.
-    - the first tool call is mandatory before EOS.
-    - ``actions`` array must contain at least one object (``minItems: 1``).
-    """
     _ensure_bundled_computer_tool(tool_schemas)
-    parameters = tool_schemas[0]["function"]["parameters"]
-
-    tag = StructuralTag(format=SequenceFormat(elements=[
-        AnyTextFormat(excludes=_QWEN_35_SPECIAL_AND_STRUCTURE_TOKENS),
-        TagFormat(
-            begin="</think>\n<tool_call>\n<function=computer>\n",
-            content=QwenXMLParameterFormat(json_schema=parameters),
-            end="\n</function>\n</tool_call>",
-        ),
-    ]))
-    return json.dumps(tag.model_dump(exclude_none=True))
+    structural_tag = get_builtin_structural_tag(
+        "qwen_coder",
+        tools=tool_schemas,
+        reasoning=False,
+    )
+    return json.dumps(structural_tag.model_dump(exclude_none=True))

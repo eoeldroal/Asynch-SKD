@@ -8,30 +8,7 @@ from verl.experimental.agent_loop.qwen_coder_structured_output import (
     build_qwen_coder_structured_tag_json,
 )
 
-
-_EXPECTED_EXCLUDES = [
-    "</think>",
-    "<tool_call>",
-    "<function=",
-    "<parameter=",
-    "<|im_start|>",
-    "<|im_end|>",
-    "<|endoftext|>",
-    "<|object_ref_start|>",
-    "<|object_ref_end|>",
-    "<|box_start|>",
-    "<|box_end|>",
-    "<|quad_start|>",
-    "<|quad_end|>",
-    "<|vision_start|>",
-    "<|vision_end|>",
-    "<|vision_pad|>",
-    "<|image_pad|>",
-    "<|video_pad|>",
-]
-
-
-def test_build_qwen_coder_structural_tag_json_serializes_reasoning_then_mandatory_tool_call():
+def test_build_qwen_coder_structural_tag_json_uses_builtin_qwen_coder_suffix_only():
     tool_schemas = [
         {
             "type": "function",
@@ -59,22 +36,22 @@ def test_build_qwen_coder_structural_tag_json_serializes_reasoning_then_mandator
 
     assert isinstance(raw, str)
     assert result["type"] == "structural_tag"
-    assert result["format"]["type"] == "sequence"
+    assert result["format"]["type"] == "triggered_tags"
+    assert result["format"]["triggers"] == ["<tool_call>\n<function="]
+    assert result["format"]["at_least_one"] is False
+    assert result["format"]["stop_after_first"] is False
+    assert result["format"]["excludes"] == ["<think>", "</think>"]
 
-    prefix = result["format"]["elements"][0]
-    assert prefix["type"] == "any_text"
-    assert prefix["excludes"] == _EXPECTED_EXCLUDES
-
-    tag = result["format"]["elements"][1]
+    tag = result["format"]["tags"][0]
     assert tag["type"] == "tag"
-    assert tag["begin"] == "</think>\n<tool_call>\n<function=computer>\n"
+    assert tag["begin"] == "<tool_call>\n<function=computer>\n"
     assert tag["end"] == "\n</function>\n</tool_call>"
     assert tag["content"]["type"] == "qwen_xml_parameter"
 
     grammar = str(Grammar.from_structural_tag(result))
-    assert "sequence ::= ((any_text tag))" in grammar
-    assert 'tag ::= (("</think>\\n<tool_call>\\n<function=computer>\\n"' in grammar
-    assert "triggered_tags ::= ((" not in grammar
+    assert "triggered_tags" in grammar
+    assert "loop_after_dispatch=true" in grammar
+    assert "</think>\\n<tool_call>" not in grammar
 
 
 def test_build_qwen_coder_structural_tag_json_rejects_non_bundled_tools():
@@ -110,10 +87,10 @@ def test_real_bundled_webgym_tool_config_builds_serialized_structural_tag():
     raw = build_qwen_coder_structured_tag_json(tool_schemas)
     result = json.loads(raw)
 
-    prefix = result["format"]["elements"][0]
-    assert prefix["type"] == "any_text"
-    assert prefix["excludes"] == _EXPECTED_EXCLUDES
+    assert result["format"]["type"] == "triggered_tags"
+    assert result["format"]["triggers"] == ["<tool_call>\n<function="]
+    assert result["format"]["excludes"] == ["<think>", "</think>"]
 
-    tag = result["format"]["elements"][1]
-    assert tag["begin"] == "</think>\n<tool_call>\n<function=computer>\n"
+    tag = result["format"]["tags"][0]
+    assert tag["begin"] == "<tool_call>\n<function=computer>\n"
     assert tag["content"]["type"] == "qwen_xml_parameter"
