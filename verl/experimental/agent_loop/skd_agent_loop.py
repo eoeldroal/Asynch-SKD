@@ -62,6 +62,7 @@ _SKD_CHUNK_TRACE_MAX_TOKENS = int(os.getenv("VERL_ASYNC_SKD_CHUNK_TRACE_MAX_TOKE
 _SKD_CHUNK_LIVE_TAIL_CHARS = int(os.getenv("VERL_ASYNC_SKD_CHUNK_LIVE_TAIL_CHARS", "256"))
 _SKD_PENDING_TURN_STATE = "skd_pending_turn_state"
 _SKD_PENDING_TURN_CHUNKS = "skd_pending_turn_chunks"
+_SKD_LAST_ASSISTANT_TURN = "skd_last_assistant_turn"
 
 
 def _trace_async_skd(stage: str, **fields: Any) -> None:
@@ -87,6 +88,11 @@ def _chunk_live_log_path() -> str | None:
     return path if path else None
 
 
+def _turn_log_path() -> str | None:
+    path = os.getenv("VERL_ASYNC_SKD_TURN_LOG")
+    return path if path else None
+
+
 def _decode_chunk_text(tokenizer: Any, ids: list[int]) -> str:
     if not ids:
         return ""
@@ -108,6 +114,25 @@ def _tail_text(text: str, max_chars: int) -> str:
 
 def _count_special_marker(text: str, marker: str) -> int:
     return text.count(marker)
+
+
+def _append_turn_log(*, event: str, **fields: Any) -> None:
+    path = _turn_log_path()
+    if path is None:
+        return
+
+    record = {
+        "ts": time.time(),
+        "pid": os.getpid(),
+        "event": event,
+        **get_async_skd_event_context(),
+        **{key: value for key, value in fields.items() if value is not None},
+    }
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as turn_file:
+        turn_file.write(json.dumps(record, ensure_ascii=False, default=str, separators=(",", ":")) + "\n")
 
 
 def _append_chunk_live_log(
@@ -743,6 +768,9 @@ class SkdAgentLoop(ToolAgentLoop):
             f"rows={len(turn_state.teacher_logprobs_rows)} tokens={len(turn_state.tokens)}"
         )
 
+        response_start = len(agent_data.response_mask)
+        response_end = response_start + len(turn_state.tokens)
+        assistant_turn_idx = agent_data.assistant_turns + (1 if finalize_assistant_turn else 0)
         agent_data.prompt_ids.extend(turn_state.tokens)
         agent_data.response_mask.extend([1] * len(turn_state.tokens))
         teacher_ids_list.extend([list(row) for row in turn_state.teacher_ids_rows])
@@ -754,6 +782,11 @@ class SkdAgentLoop(ToolAgentLoop):
         agent_data.response_ids = list(turn_state.tokens)
         if finalize_assistant_turn:
             agent_data.assistant_turns += 1
+        agent_data.extra_fields[_SKD_LAST_ASSISTANT_TURN] = {
+            "assistant_turn": int(assistant_turn_idx),
+            "response_start": int(response_start),
+            "response_end": int(response_end),
+        }
         self._increment_skd_prefix_stats(agent_data, gen_chunks=pending_chunks, tokens=len(turn_state.tokens))
         turn_state.tokens = []
         turn_state.teacher_ids_rows = []
@@ -762,6 +795,116 @@ class SkdAgentLoop(ToolAgentLoop):
         turn_state.verified_chunk = []
         self._set_pending_turn_state(agent_data, turn_state, pending_chunks=0, clear_response_ids=False)
         self._assert_teacher_alignment(agent_data)
+
+    @staticmethod
+    def _get_last_assistant_turn_span(agent_data: AgentData) -> dict[str, int] | None:
+        payload = agent_data.extra_fields.get(_SKD_LAST_ASSISTANT_TURN)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            assistant_turn = int(payload["assistant_turn"])
+            response_start = int(payload["response_start"])
+            response_end = int(payload["response_end"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if response_start < 0 or response_end < response_start or response_end > len(agent_data.response_mask):
+            return None
+        return {
+            "assistant_turn": assistant_turn,
+            "response_start": response_start,
+            "response_end": response_end,
+        }
+
+    def _mask_assistant_turn_span(
+        self,
+        agent_data: AgentData,
+        *,
+        response_start: int,
+        response_end: int,
+    ) -> tuple[list[int], list[int]]:
+        before = list(agent_data.response_mask[response_start:response_end])
+        if response_end <= response_start:
+            return before, before
+
+        for idx in range(response_start, response_end):
+            agent_data.response_mask[idx] = 0
+
+        teacher_ids_list = agent_data.extra_fields.get("teacher_ids_list")
+        teacher_logprobs_list = agent_data.extra_fields.get("teacher_logprobs_list")
+        if isinstance(teacher_ids_list, list) and isinstance(teacher_logprobs_list, list):
+            assert self.loss_top_k is not None and self.loss_top_k > 0, "SKD masking requires distillation topk > 0"
+            for idx in range(response_start, response_end):
+                if idx < len(teacher_ids_list):
+                    teacher_ids_list[idx] = [0] * self.loss_top_k
+                if idx < len(teacher_logprobs_list):
+                    teacher_logprobs_list[idx] = [0.0] * self.loss_top_k
+
+        after = list(agent_data.response_mask[response_start:response_end])
+        self._assert_teacher_alignment(agent_data)
+        return before, after
+
+    def _log_assistant_turn_decision(
+        self,
+        agent_data: AgentData,
+        *,
+        parse_status: str,
+        tool_exec_status: str,
+        mask_decision: str,
+        termination_reason: str | None,
+        turn_mask_before: list[int],
+        turn_mask_after: list[int],
+    ) -> None:
+        span = self._get_last_assistant_turn_span(agent_data)
+        if span is None:
+            return
+
+        response_len = len(agent_data.response_mask)
+        response_ids = agent_data.prompt_ids[-response_len:] if response_len > 0 else []
+        response_start = span["response_start"]
+        response_end = span["response_end"]
+        turn_ids = list(response_ids[response_start:response_end])
+        turn_text = _decode_chunk_text(getattr(self, "tokenizer", None), turn_ids)
+        _append_turn_log(
+            event="assistant_turn_decision",
+            request_id=agent_data.request_id,
+            assistant_turn=span["assistant_turn"],
+            response_start=response_start,
+            response_end=response_end,
+            response_token_count=max(0, response_end - response_start),
+            parse_status=parse_status,
+            tool_exec_status=tool_exec_status,
+            mask_decision=mask_decision,
+            termination_reason=termination_reason,
+            turn_mask_before=turn_mask_before,
+            turn_mask_after=turn_mask_after,
+            verified_text_tail=_tail_text(turn_text, _SKD_CHUNK_LIVE_TAIL_CHARS),
+        )
+
+    async def _handle_no_tool_call(self, agent_data: AgentData) -> AgentState:
+        span = self._get_last_assistant_turn_span(agent_data)
+        if span is not None:
+            keep_mask = list(agent_data.response_mask[span["response_start"] : span["response_end"]])
+            self._log_assistant_turn_decision(
+                agent_data,
+                parse_status="no_tool_call",
+                tool_exec_status="not_executed",
+                mask_decision="keep",
+                termination_reason="no_tool_call",
+                turn_mask_before=keep_mask,
+                turn_mask_after=keep_mask,
+            )
+        return AgentState.TERMINATED
+
+    def _mask_last_committed_assistant_turn(self, agent_data: AgentData) -> tuple[dict[str, int], list[int], list[int]]:
+        span = self._get_last_assistant_turn_span(agent_data)
+        if span is None:
+            raise ValueError("SKD masking requires a committed assistant turn span")
+        before, after = self._mask_assistant_turn_span(
+            agent_data,
+            response_start=span["response_start"],
+            response_end=span["response_end"],
+        )
+        return span, before, after
 
     def _teacher_max_model_len(self, routing_key: Any = None) -> int | None:
         """Return the configured teacher context limit when the manager exposes it."""
@@ -1820,7 +1963,7 @@ class SkdAgentLoop(ToolAgentLoop):
             return AgentState.PROCESSING_TOOLS
         if parse_error is not None:
             return await self._handle_tool_parse_error(agent_data, parse_error)
-        return AgentState.TERMINATED
+        return await self._handle_no_tool_call(agent_data)
 
     def _log_token_alignment(
         self,

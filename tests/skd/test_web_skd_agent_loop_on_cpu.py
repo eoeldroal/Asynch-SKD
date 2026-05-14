@@ -18,6 +18,23 @@ from verl.experimental.agent_loop.web_skd_agent_loop import WebSkdAgentLoop
 from verl.tools.base_tool import ToolResponse
 
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_FEWSHOT_PATH = (
+    REPO_ROOT
+    / "WebOSWorld"
+    / "webgym_rl"
+    / "teacher_fewshot"
+    / "prozilla_task_B_22_minimal"
+    / "teacher_fewshot.json"
+)
+
+
+class _SimpleTokenizer:
+    def decode(self, ids, **kwargs):
+        del kwargs
+        return " ".join(str(token_id) for token_id in ids)
+
+
 class _FakeTool:
     name = "computer"
     tool_schema = None
@@ -104,10 +121,22 @@ class _ActionFakeTool(_FakeTool):
         }
 
 
+class _InvalidActionFakeTool(_FakeTool):
+    async def execute(self, instance_id, parameters, **kwargs):
+        self.executed.append((instance_id, parameters))
+        return ToolResponse(text="Invalid Web/OSGym action payload"), None, {
+            "terminated": False,
+            "termination_reason": None,
+            "action_count": len(parameters["actions"]),
+            "invalid_action": True,
+        }
+
+
 def _build_loop():
     loop = WebSkdAgentLoop.__new__(WebSkdAgentLoop)
     loop.tools = {"computer": _FakeTool()}
     loop.tool_schemas = []
+    loop.distillation_config = None
     loop.teacher_key = "data_source"
     loop.response_length = 64
     loop.loss_top_k = 4
@@ -122,6 +151,7 @@ def _build_loop():
     loop.apply_chat_template_kwargs = {}
     loop.teacher_fewshot_messages = []
     loop.teacher_fewshot_images = None
+    loop.tokenizer = _SimpleTokenizer()
 
     async def _fake_apply_server_chat_template(messages, **kwargs):
         return [21, 22]
@@ -265,6 +295,24 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(student_messages, [{"role": "user", "content": "student-task"}])
         self.assertEqual(teacher_prompt_ids, [101, 102, 103])
         self.assertEqual(image_data, ["runtime-image"])
+
+    def test_build_teacher_messages_prepends_repo_teacher_fewshot_before_runtime_messages(self):
+        loop = _build_loop()
+        fewshot_messages, fewshot_images = load_teacher_fewshot_transcript(REPO_FEWSHOT_PATH)
+        loop.teacher_fewshot_messages = fewshot_messages
+        loop.teacher_fewshot_images = fewshot_images
+
+        runtime_messages = [
+            {"role": "system", "content": "runtime-system"},
+            {"role": "user", "content": "List the contents of the current home directory using the terminal."},
+            {"role": "tool", "content": [{"type": "image"}]},
+        ]
+
+        teacher_messages = loop._build_teacher_messages(runtime_messages)
+
+        self.assertEqual(teacher_messages[0], {"role": "system", "content": "runtime-system"})
+        self.assertEqual(teacher_messages[1 : 1 + len(fewshot_messages)], fewshot_messages)
+        self.assertEqual(teacher_messages[1 + len(fewshot_messages) :], runtime_messages[1:])
 
     async def test_build_request_prompt_views_uses_teacher_fewshot_images_only_for_teacher(self):
         loop = _build_loop()
@@ -1100,67 +1148,95 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_response_budget_exhausted")
         self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
 
-    async def test_tool_parse_error_adds_recovery_observation(self):
+    async def test_tool_parse_error_masks_last_assistant_turn_and_terminates(self):
         loop = _build_loop()
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"VERL_ASYNC_SKD_TURN_LOG": str(Path(tmpdir) / "turns.jsonl")},
+        ):
+            loop.loop = __import__("asyncio").get_running_loop()
 
-        async def _fake_apply_chat_template(messages, **kwargs):
-            remove_system_prompt = kwargs.get("remove_system_prompt", False)
-            if remove_system_prompt:
+            async def _fake_apply_chat_template(messages, **kwargs):
+                del messages, kwargs
                 return [71, 72]
-            if messages and messages[-1]["role"] == "tool":
-                return [1, 2, 3, 71, 72]
-            return [1, 2, 3]
 
-        async def _fake_apply_server_chat_template(messages, **kwargs):
-            del kwargs
-            if messages and messages[-1]["role"] == "tool":
+            async def _fake_apply_server_chat_template(messages, **kwargs):
+                del messages, kwargs
                 return [21, 22]
-            return [1, 2, 3]
 
-        loop.apply_chat_template = _fake_apply_chat_template
-        loop._apply_server_chat_template = _fake_apply_server_chat_template
+            async def _fake_finalize(agent_data, termination_reason):
+                agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+                agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+                agent_data.extra_fields["web_osgym_reward_fetched"] = True
 
-        agent_data = AgentData(
-            messages=[{"role": "user", "content": "task"}],
-            image_data=[],
-            video_data=[],
-            metrics={},
-            request_id="req-parse-recovery",
-            tools_kwargs={},
-        )
-        agent_data.prompt_ids = [1, 2, 3]
-        agent_data.response_mask = []
-        agent_data.response_logprobs = []
-        agent_data.extra_fields.update(
-            {
-                "teacher_prompt_ids": [1, 2, 3],
-                "teacher_server_prompt_ids": [1, 2, 3],
-                "server_prompt_ids": [1, 2, 3],
-                "teacher_sglang_prefix_surplus": 0,
-                "teacher_ids_list": [],
-                "teacher_logprobs_list": [],
-                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
-            }
-        )
+            loop.apply_chat_template = _fake_apply_chat_template
+            loop._apply_server_chat_template = _fake_apply_server_chat_template
+            loop._finalize_with_web_osgym_reward = _fake_finalize
 
-        state = await WebSkdAgentLoop._handle_tool_parse_error(
-            loop,
-            agent_data,
-            ToolParseError(kind="actions_json_malformed", message="the actions JSON is malformed."),
-        )
+            agent_data = AgentData(
+                messages=[{"role": "user", "content": "task"}],
+                image_data=[],
+                video_data=[],
+                metrics={},
+                request_id="req-parse-recovery",
+                tools_kwargs={},
+            )
+            agent_data.prompt_ids = [1, 2, 3, 41, 42]
+            agent_data.response_ids = [41, 42]
+            agent_data.response_mask = [1, 1]
+            agent_data.response_logprobs = [-0.1, -0.2]
+            agent_data.assistant_turns = 1
+            agent_data.extra_fields.update(
+                {
+                    "teacher_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_server_prompt_ids": [1, 2, 3, 41, 42],
+                    "server_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_sglang_prefix_surplus": 0,
+                    "teacher_ids_list": [[41, 410, 411, 0], [42, 420, 421, 0]],
+                    "teacher_logprobs_list": [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+                    "skd_last_assistant_turn": {
+                        "assistant_turn": 1,
+                        "response_start": 0,
+                        "response_end": 2,
+                    },
+                    "web_osgym_instance_id": "instance-1",
+                    "web_osgym_task_id": "task-1",
+                    "web_osgym_session_id": 101,
+                    "web_osgym_include_a11y": True,
+                }
+            )
+            before_messages = deepcopy(agent_data.messages)
+            before_prompt_ids = list(agent_data.prompt_ids)
 
-        self.assertEqual(state, AgentState.GENERATING)
-        self.assertEqual(agent_data.user_turns, 1)
-        self.assertEqual(agent_data.extra_fields["tool_parse_error_retry_count"], 1)
-        self.assertEqual(agent_data.metrics["tool_parse_error"], 1)
-        self.assertIn("Invalid tool call format: the actions JSON is malformed.", agent_data.messages[-1]["content"])
-        self.assertIn("Below is an example of a valid tool call format:", agent_data.messages[-1]["content"])
-        self.assertEqual(agent_data.prompt_ids, [1, 2, 3, 71, 72])
-        self.assertEqual(agent_data.response_mask, [0, 0])
-        self.assertEqual(agent_data.extra_fields["teacher_prompt_ids"], [1, 2, 3, 71, 72])
-        self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[0, 0, 0, 0], [0, 0, 0, 0]])
-        self.assertEqual(agent_data.extra_fields["teacher_logprobs_list"], [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+            state = await WebSkdAgentLoop._handle_tool_parse_error(
+                loop,
+                agent_data,
+                ToolParseError(kind="actions_json_malformed", message="the actions JSON is malformed."),
+            )
+
+            self.assertEqual(state, AgentState.TERMINATED)
+            self.assertEqual(agent_data.messages, before_messages)
+            self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
+            self.assertEqual(agent_data.user_turns, 0)
+            self.assertEqual(agent_data.extra_fields["tool_parse_error_retry_count"], 1)
+            self.assertEqual(agent_data.metrics["tool_parse_error"], 1)
+            self.assertEqual(agent_data.response_mask, [0, 0])
+            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[0, 0, 0, 0], [0, 0, 0, 0]])
+            self.assertEqual(
+                agent_data.extra_fields["teacher_logprobs_list"],
+                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            )
+            self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "tool_parse_error")
+
+            records = [json.loads(line) for line in Path(tmpdir, "turns.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["event"], "assistant_turn_decision")
+            self.assertEqual(records[0]["parse_status"], "parse_error")
+            self.assertEqual(records[0]["tool_exec_status"], "not_executed")
+            self.assertEqual(records[0]["mask_decision"], "mask_and_terminate")
+            self.assertEqual(records[0]["turn_mask_before"], [1, 1])
+            self.assertEqual(records[0]["turn_mask_after"], [0, 0])
 
     async def test_tool_parse_error_terminates_after_retry_budget_is_used(self):
         loop = _build_loop()
@@ -1201,26 +1277,15 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
         self.assertEqual(agent_data.response_mask, before_response_mask)
 
-    async def test_tool_parse_error_keeps_retrying_until_large_retry_budget_is_used(self):
+    async def test_tool_parse_error_terminates_even_when_large_retry_budget_remains(self):
         loop = _build_loop()
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        async def _fake_finalize(agent_data, termination_reason):
+            agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+            agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+            agent_data.extra_fields["web_osgym_reward_fetched"] = True
 
-        async def _fake_apply_chat_template(messages, **kwargs):
-            remove_system_prompt = kwargs.get("remove_system_prompt", False)
-            if remove_system_prompt:
-                return [71, 72]
-            if messages and messages[-1]["role"] == "tool":
-                return [1, 2, 3, 71, 72]
-            return [1, 2, 3]
-
-        async def _fake_apply_server_chat_template(messages, **kwargs):
-            del kwargs
-            if messages and messages[-1]["role"] == "tool":
-                return [21, 22]
-            return [1, 2, 3]
-
-        loop.apply_chat_template = _fake_apply_chat_template
-        loop._apply_server_chat_template = _fake_apply_server_chat_template
+        loop._finalize_with_web_osgym_reward = _fake_finalize
 
         agent_data = AgentData(
             messages=[{"role": "user", "content": "task"}],
@@ -1230,18 +1295,28 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             request_id="req-parse-recovery-large-budget",
             tools_kwargs={},
         )
-        agent_data.prompt_ids = [1, 2, 3]
-        agent_data.response_mask = []
+        agent_data.prompt_ids = [1, 2, 3, 41, 42]
+        agent_data.response_ids = [41, 42]
+        agent_data.response_mask = [1, 1]
+        agent_data.assistant_turns = 1
         agent_data.extra_fields.update(
             {
-                "teacher_prompt_ids": [1, 2, 3],
-                "teacher_server_prompt_ids": [1, 2, 3],
-                "server_prompt_ids": [1, 2, 3],
+                "teacher_prompt_ids": [1, 2, 3, 41, 42],
+                "teacher_server_prompt_ids": [1, 2, 3, 41, 42],
+                "server_prompt_ids": [1, 2, 3, 41, 42],
                 "teacher_sglang_prefix_surplus": 0,
-                "teacher_ids_list": [],
-                "teacher_logprobs_list": [],
-                "web_osgym_teacher_messages": [{"role": "user", "content": "task"}],
+                "teacher_ids_list": [[41, 410, 411, 0], [42, 420, 421, 0]],
+                "teacher_logprobs_list": [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
                 "tool_parse_error_retry_count": 9998,
+                "skd_last_assistant_turn": {
+                    "assistant_turn": 1,
+                    "response_start": 0,
+                    "response_end": 2,
+                },
+                "web_osgym_instance_id": "instance-1",
+                "web_osgym_task_id": "task-1",
+                "web_osgym_session_id": 101,
+                "web_osgym_include_a11y": True,
             }
         )
 
@@ -1251,8 +1326,318 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             ToolParseError(kind="tool_tag_incomplete", message="a tool-call tag is incomplete."),
         )
 
-        self.assertEqual(state, AgentState.GENERATING)
+        self.assertEqual(state, AgentState.TERMINATED)
         self.assertEqual(agent_data.extra_fields["tool_parse_error_retry_count"], 9999)
+        self.assertEqual(agent_data.response_mask, [0, 0])
+
+    async def test_invalid_action_masks_last_assistant_turn_and_terminates(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _InvalidActionFakeTool()}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"VERL_ASYNC_SKD_TURN_LOG": str(Path(tmpdir) / "turns.jsonl")},
+        ):
+            loop.loop = __import__("asyncio").get_running_loop()
+
+            async def _fake_apply_chat_template(messages, **kwargs):
+                del messages, kwargs
+                return [71, 72]
+
+            async def _fake_apply_server_chat_template(messages, **kwargs):
+                del messages, kwargs
+                return [21, 22]
+
+            async def _fake_finalize(agent_data, termination_reason):
+                agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+                agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+                agent_data.extra_fields["web_osgym_reward_fetched"] = True
+
+            loop.apply_chat_template = _fake_apply_chat_template
+            loop._apply_server_chat_template = _fake_apply_server_chat_template
+            loop._finalize_with_web_osgym_reward = _fake_finalize
+
+            agent_data = AgentData(
+                messages=[{"role": "user", "content": "task"}],
+                image_data=[],
+                video_data=[],
+                metrics={},
+                request_id="req-invalid-action",
+                tools_kwargs={},
+            )
+            agent_data._active_tools = loop.tools
+            agent_data._active_tool_schemas = []
+            agent_data.prompt_ids = [1, 2, 3, 41, 42]
+            agent_data.response_ids = [41, 42]
+            agent_data.response_mask = [1, 1]
+            agent_data.response_logprobs = [-0.1, -0.2]
+            agent_data.assistant_turns = 1
+            agent_data.extra_fields.update(
+                {
+                    "teacher_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_server_prompt_ids": [1, 2, 3, 41, 42],
+                    "server_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_sglang_prefix_surplus": 0,
+                    "teacher_ids_list": [[41, 410, 411, 0], [42, 420, 421, 0]],
+                    "teacher_logprobs_list": [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+                    "skd_last_assistant_turn": {
+                        "assistant_turn": 1,
+                        "response_start": 0,
+                        "response_end": 2,
+                    },
+                    "web_osgym_instance_id": "instance-1",
+                    "web_osgym_task_id": "task-1",
+                    "web_osgym_session_id": 101,
+                    "web_osgym_include_a11y": True,
+                }
+            )
+            agent_data.tool_calls = [
+                type(
+                    "Call",
+                    (),
+                    {
+                        "name": "computer",
+                        "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                    },
+                )()
+            ]
+            before_messages = deepcopy(agent_data.messages)
+            before_prompt_ids = list(agent_data.prompt_ids)
+
+            state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+            self.assertEqual(state, AgentState.TERMINATED)
+            self.assertEqual(agent_data.messages, before_messages)
+            self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
+            self.assertEqual(agent_data.user_turns, 0)
+            self.assertEqual(agent_data.response_mask, [0, 0])
+            self.assertEqual(agent_data.metrics["web_osgym/invalid_action"], 1)
+            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[0, 0, 0, 0], [0, 0, 0, 0]])
+            self.assertEqual(
+                agent_data.extra_fields["teacher_logprobs_list"],
+                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            )
+            self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "invalid_action")
+
+            records = [json.loads(line) for line in Path(tmpdir, "turns.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["event"], "assistant_turn_decision")
+            self.assertEqual(records[0]["parse_status"], "ok")
+            self.assertEqual(records[0]["tool_exec_status"], "invalid_action")
+            self.assertEqual(records[0]["mask_decision"], "mask_and_terminate")
+            self.assertEqual(records[0]["turn_mask_before"], [1, 1])
+            self.assertEqual(records[0]["turn_mask_after"], [0, 0])
+
+    async def test_invalid_action_can_keep_last_assistant_turn_when_masking_is_disabled(self):
+        loop = _build_loop()
+        loop.tools = {"computer": _InvalidActionFakeTool()}
+        loop.distillation_config = {"skd": {"mask_invalid_action": False}}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"VERL_ASYNC_SKD_TURN_LOG": str(Path(tmpdir) / "turns.jsonl")},
+        ):
+            async def _fake_finalize(agent_data, termination_reason):
+                agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+                agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+                agent_data.extra_fields["web_osgym_reward_fetched"] = True
+
+            loop._finalize_with_web_osgym_reward = _fake_finalize
+
+            agent_data = AgentData(
+                messages=[{"role": "user", "content": "task"}],
+                image_data=[],
+                video_data=[],
+                metrics={},
+                request_id="req-invalid-action-keep",
+                tools_kwargs={},
+            )
+            agent_data._active_tools = loop.tools
+            agent_data._active_tool_schemas = []
+            agent_data.prompt_ids = [1, 2, 3, 41, 42]
+            agent_data.response_ids = [41, 42]
+            agent_data.response_mask = [1, 1]
+            agent_data.response_logprobs = [-0.1, -0.2]
+            agent_data.assistant_turns = 1
+            agent_data.extra_fields.update(
+                {
+                    "teacher_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_server_prompt_ids": [1, 2, 3, 41, 42],
+                    "server_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_sglang_prefix_surplus": 0,
+                    "teacher_ids_list": [[41, 410, 411, 0], [42, 420, 421, 0]],
+                    "teacher_logprobs_list": [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+                    "skd_last_assistant_turn": {
+                        "assistant_turn": 1,
+                        "response_start": 0,
+                        "response_end": 2,
+                    },
+                    "web_osgym_instance_id": "instance-1",
+                    "web_osgym_task_id": "task-1",
+                    "web_osgym_session_id": 101,
+                    "web_osgym_include_a11y": True,
+                }
+            )
+            agent_data.tool_calls = [
+                type(
+                    "Call",
+                    (),
+                    {
+                        "name": "computer",
+                        "arguments": '{"actions":[{"action_type":"CLICK","x":1,"y":2}]}',
+                    },
+                )()
+            ]
+
+            state = await WebSkdAgentLoop._handle_processing_tools_state(loop, agent_data)
+
+            self.assertEqual(state, AgentState.TERMINATED)
+            self.assertEqual(agent_data.response_mask, [1, 1])
+            self.assertEqual(agent_data.metrics["web_osgym/invalid_action"], 1)
+            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[41, 410, 411, 0], [42, 420, 421, 0]])
+            self.assertEqual(
+                agent_data.extra_fields["teacher_logprobs_list"],
+                [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+            )
+            self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "invalid_action")
+
+            records = [json.loads(line) for line in Path(tmpdir, "turns.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["mask_decision"], "keep")
+            self.assertEqual(records[0]["turn_mask_before"], [1, 1])
+            self.assertEqual(records[0]["turn_mask_after"], [1, 1])
+
+    async def test_no_tool_call_masks_last_assistant_turn_and_terminates(self):
+        loop = _build_loop()
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"VERL_ASYNC_SKD_TURN_LOG": str(Path(tmpdir) / "turns.jsonl")},
+        ):
+            loop.loop = __import__("asyncio").get_running_loop()
+
+            async def _fake_finalize(agent_data, termination_reason):
+                agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+                agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+                agent_data.extra_fields["web_osgym_reward_fetched"] = True
+
+            loop._finalize_with_web_osgym_reward = _fake_finalize
+
+            agent_data = AgentData(
+                messages=[{"role": "user", "content": "task"}],
+                image_data=[],
+                video_data=[],
+                metrics={},
+                request_id="req-no-tool-call",
+                tools_kwargs={},
+            )
+            agent_data.prompt_ids = [1, 2, 3, 41, 42]
+            agent_data.response_ids = [41, 42]
+            agent_data.response_mask = [1, 1]
+            agent_data.assistant_turns = 1
+            agent_data.extra_fields.update(
+                {
+                    "teacher_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_server_prompt_ids": [1, 2, 3, 41, 42],
+                    "server_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_sglang_prefix_surplus": 0,
+                    "teacher_ids_list": [[41, 410, 411, 0], [42, 420, 421, 0]],
+                    "teacher_logprobs_list": [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+                    "skd_last_assistant_turn": {
+                        "assistant_turn": 1,
+                        "response_start": 0,
+                        "response_end": 2,
+                    },
+                    "web_osgym_instance_id": "instance-1",
+                    "web_osgym_task_id": "task-1",
+                    "web_osgym_session_id": 101,
+                    "web_osgym_include_a11y": True,
+                }
+            )
+
+            state = await WebSkdAgentLoop._handle_no_tool_call(loop, agent_data)
+
+            self.assertEqual(state, AgentState.TERMINATED)
+            self.assertEqual(agent_data.response_mask, [0, 0])
+            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[0, 0, 0, 0], [0, 0, 0, 0]])
+            self.assertEqual(
+                agent_data.extra_fields["teacher_logprobs_list"],
+                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+            )
+            self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "no_tool_call")
+
+            records = [json.loads(line) for line in Path(tmpdir, "turns.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["event"], "assistant_turn_decision")
+            self.assertEqual(records[0]["parse_status"], "no_tool_call")
+            self.assertEqual(records[0]["tool_exec_status"], "not_executed")
+            self.assertEqual(records[0]["mask_decision"], "mask_and_terminate")
+            self.assertEqual(records[0]["turn_mask_before"], [1, 1])
+            self.assertEqual(records[0]["turn_mask_after"], [0, 0])
+
+    async def test_no_tool_call_can_keep_last_assistant_turn_when_masking_is_disabled(self):
+        loop = _build_loop()
+        loop.distillation_config = {"skd": {"mask_no_tool_call": False}}
+        loop._build_teacher_messages = lambda messages: deepcopy(messages)
+        with tempfile.TemporaryDirectory() as tmpdir, patch.dict(
+            os.environ,
+            {"VERL_ASYNC_SKD_TURN_LOG": str(Path(tmpdir) / "turns.jsonl")},
+        ):
+            async def _fake_finalize(agent_data, termination_reason):
+                agent_data.extra_fields["web_osgym_termination_reason"] = termination_reason
+                agent_data.extra_fields["web_osgym_env_reward_score"] = 0.0
+                agent_data.extra_fields["web_osgym_reward_fetched"] = True
+
+            loop._finalize_with_web_osgym_reward = _fake_finalize
+
+            agent_data = AgentData(
+                messages=[{"role": "user", "content": "task"}],
+                image_data=[],
+                video_data=[],
+                metrics={},
+                request_id="req-no-tool-call-keep",
+                tools_kwargs={},
+            )
+            agent_data.prompt_ids = [1, 2, 3, 41, 42]
+            agent_data.response_ids = [41, 42]
+            agent_data.response_mask = [1, 1]
+            agent_data.assistant_turns = 1
+            agent_data.extra_fields.update(
+                {
+                    "teacher_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_server_prompt_ids": [1, 2, 3, 41, 42],
+                    "server_prompt_ids": [1, 2, 3, 41, 42],
+                    "teacher_sglang_prefix_surplus": 0,
+                    "teacher_ids_list": [[41, 410, 411, 0], [42, 420, 421, 0]],
+                    "teacher_logprobs_list": [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+                    "skd_last_assistant_turn": {
+                        "assistant_turn": 1,
+                        "response_start": 0,
+                        "response_end": 2,
+                    },
+                    "web_osgym_instance_id": "instance-1",
+                    "web_osgym_task_id": "task-1",
+                    "web_osgym_session_id": 101,
+                    "web_osgym_include_a11y": True,
+                }
+            )
+
+            state = await WebSkdAgentLoop._handle_no_tool_call(loop, agent_data)
+
+            self.assertEqual(state, AgentState.TERMINATED)
+            self.assertEqual(agent_data.response_mask, [1, 1])
+            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[41, 410, 411, 0], [42, 420, 421, 0]])
+            self.assertEqual(
+                agent_data.extra_fields["teacher_logprobs_list"],
+                [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
+            )
+            self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "no_tool_call")
+
+            records = [json.loads(line) for line in Path(tmpdir, "turns.jsonl").read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["mask_decision"], "keep")
+            self.assertEqual(records[0]["turn_mask_before"], [1, 1])
+            self.assertEqual(records[0]["turn_mask_after"], [1, 1])
 
     async def test_tool_observation_commit_is_atomic(self):
         loop = _build_loop()

@@ -120,6 +120,9 @@ skd:
   max_chunks_per_sample: 60
   teacher_system_prompt_path: null
   teacher_fewshot_path: null
+  mask_invalid_action: true
+  mask_tool_parse_error: true
+  mask_no_tool_call: true
   windowed_training_enabled: false
   window_history_n: 5
   window_max_images_per_sample: 6

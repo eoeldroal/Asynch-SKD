@@ -243,6 +243,9 @@ class SkdConfig(BaseConfig):
     max_chunks_per_sample: int = 60
     teacher_system_prompt_path: Optional[str] = None
     teacher_fewshot_path: Optional[str] = None
+    mask_invalid_action: bool = True
+    mask_tool_parse_error: bool = True
+    mask_no_tool_call: bool = True
     windowed_training_enabled: bool = False
     window_history_n: int = 5
     window_max_images_per_sample: Optional[int] = 6

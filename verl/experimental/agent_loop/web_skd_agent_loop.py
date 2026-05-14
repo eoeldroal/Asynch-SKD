@@ -27,6 +27,32 @@ from verl.utils.tokenizer import normalize_token_ids
 
 @register("web_skd_agent")
 class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
+    def _skd_mask_setting(self, name: str, default: bool = True) -> bool:
+        distillation_config = getattr(self, "distillation_config", None)
+        if isinstance(distillation_config, dict):
+            skd_config = distillation_config.get("skd", {})
+            if isinstance(skd_config, dict):
+                return bool(skd_config.get(name, default))
+            return bool(getattr(skd_config, name, default))
+        skd_config = getattr(distillation_config, "skd", None)
+        return bool(getattr(skd_config, name, default))
+
+    def _resolve_turn_mask_decision(
+        self,
+        agent_data: AgentData,
+        *,
+        should_mask: bool,
+    ) -> tuple[list[int], list[int], str]:
+        if should_mask:
+            _span, turn_mask_before, turn_mask_after = self._mask_last_committed_assistant_turn(agent_data)
+            return turn_mask_before, turn_mask_after, "mask_and_terminate"
+
+        span = self._get_last_assistant_turn_span(agent_data)
+        if span is None:
+            return [], [], "keep"
+        keep_mask = list(agent_data.response_mask[span["response_start"] : span["response_end"]])
+        return keep_mask, keep_mask, "keep"
+
     def _web_skd_include_a11y(self) -> bool:
         rollout_config = getattr(self, "rollout_config", None)
         rollout_custom = getattr(rollout_config, "custom", None) or {}
@@ -231,6 +257,13 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         )
         return teacher_prompt_ids, teacher_server_prompt_ids, teacher_sglang_prefix_surplus
 
+    def _current_multi_modal_data(self, agent_data: AgentData) -> dict[str, Any]:
+        multi_modal_data = super()._current_multi_modal_data(agent_data)
+        teacher_images = self._teacher_images_with_runtime(multi_modal_data.get("images"))
+        if teacher_images is not None:
+            multi_modal_data["images"] = teacher_images
+        return multi_modal_data
+
     def _resolve_request_prompt_inputs_from_agent_state(
         self,
         agent_data: AgentData,
@@ -257,86 +290,44 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
     def _validate_teacher_state_for_partial(self, agent_data: AgentData) -> None:
         self._require_prompt_stream(agent_data, "teacher_prompt_ids")
 
+    async def _handle_no_tool_call(self, agent_data: AgentData) -> AgentState:
+        turn_mask_before, turn_mask_after, mask_decision = self._resolve_turn_mask_decision(
+            agent_data,
+            should_mask=self._skd_mask_setting("mask_no_tool_call", True),
+        )
+        self._log_assistant_turn_decision(
+            agent_data,
+            parse_status="no_tool_call",
+            tool_exec_status="not_executed",
+            mask_decision=mask_decision,
+            termination_reason="no_tool_call",
+            turn_mask_before=turn_mask_before,
+            turn_mask_after=turn_mask_after,
+        )
+        await self._finalize_with_web_osgym_reward(agent_data, termination_reason="no_tool_call")
+        return AgentState.TERMINATED
+
     async def _handle_tool_parse_error(self, agent_data: AgentData, parse_error: ToolParseError) -> AgentState:
         retry_count = int(agent_data.extra_fields.get(_TOOL_PARSE_ERROR_RETRY_COUNT_KEY, 0))
         if retry_count >= self.max_tool_parse_error_retries:
             return AgentState.TERMINATED
-
-        feedback_text = self._build_tool_parse_error_feedback(parse_error)
-        message = self._build_tool_message(feedback_text, None)
-
-        response_ids = await self.apply_chat_template(
-            [message],
-            images=None,
-            videos=None,
-            remove_system_prompt=True,
-        )
-        if response_ids and len(agent_data.response_mask) + len(response_ids) >= self.response_length:
-            await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_response_budget_exhausted")
-            return AgentState.TERMINATED
-
-        next_student_messages, _committed_teacher_prompt_ids = self._resolve_tool_processing_commit_inputs(agent_data)
-        next_student_messages.append(message)
-        next_teacher_messages = self._build_teacher_messages(deepcopy(next_student_messages))
-        next_teacher_prompt_ids = await self._recompute_teacher_prompt_ids(
-            agent_data,
-            next_teacher_messages,
-            agent_data.image_data,
-        )
-
-        (
-            next_server_prompt_ids,
-            next_teacher_server_prompt_ids,
-            next_teacher_sglang_prefix_surplus,
-        ) = await self._build_request_prompt_views(
-            agent_data,
-            student_messages=next_student_messages,
-            teacher_prompt_ids=next_teacher_prompt_ids,
-            image_data=agent_data.image_data,
-        )
-        if next_teacher_server_prompt_ids is not None and await self._terminate_if_teacher_prefix_overflows(
-            agent_data,
-            prefix_len=len(next_teacher_server_prompt_ids),
-            stage="tool_parse_error",
-        ):
-            return AgentState.TERMINATED
-
-        appended_len = len(response_ids)
-        next_prompt_ids = list(agent_data.prompt_ids) + response_ids
-        next_response_mask = list(agent_data.response_mask) + ([0] * appended_len)
-        next_response_logprobs = list(agent_data.response_logprobs)
-        if next_response_logprobs:
-            next_response_logprobs.extend([0.0] * appended_len)
-
-        next_teacher_ids_list = None
-        next_teacher_logprobs_list = None
-        if "teacher_ids_list" in agent_data.extra_fields or "teacher_logprobs_list" in agent_data.extra_fields:
-            if "teacher_ids_list" not in agent_data.extra_fields or "teacher_logprobs_list" not in agent_data.extra_fields:
-                raise ValueError("WebSKD teacher alignment requires both teacher_ids_list and teacher_logprobs_list")
-            assert self.loss_top_k is not None and self.loss_top_k > 0, "SKD dummy rows require distillation topk > 0"
-            next_teacher_ids_list = [list(row) for row in agent_data.extra_fields["teacher_ids_list"]]
-            next_teacher_logprobs_list = [list(row) for row in agent_data.extra_fields["teacher_logprobs_list"]]
-            next_teacher_ids_list.extend([[0] * self.loss_top_k for _ in range(appended_len)])
-            next_teacher_logprobs_list.extend([[0.0] * self.loss_top_k for _ in range(appended_len)])
-
         agent_data.metrics["tool_parse_error"] = 1
         agent_data.extra_fields[_TOOL_PARSE_ERROR_RETRY_COUNT_KEY] = retry_count + 1
-        agent_data.messages = next_student_messages
-        agent_data.prompt_ids = next_prompt_ids
-        agent_data.response_mask = next_response_mask
-        if next_response_logprobs:
-            agent_data.response_logprobs = next_response_logprobs
-        agent_data.user_turns += 1
-        agent_data.extra_fields["teacher_prompt_ids"] = next_teacher_prompt_ids
-        agent_data.extra_fields.pop("web_osgym_teacher_messages", None)
-        agent_data.extra_fields.pop("web_osgym_teacher_observation_text", None)
-        agent_data.extra_fields.pop("server_prompt_ids", None)
-        agent_data.extra_fields.pop("teacher_server_prompt_ids", None)
-        agent_data.extra_fields.pop("teacher_sglang_prefix_surplus", None)
-        if next_teacher_ids_list is not None and next_teacher_logprobs_list is not None:
-            agent_data.extra_fields["teacher_ids_list"] = next_teacher_ids_list
-            agent_data.extra_fields["teacher_logprobs_list"] = next_teacher_logprobs_list
-        return AgentState.GENERATING
+        turn_mask_before, turn_mask_after, mask_decision = self._resolve_turn_mask_decision(
+            agent_data,
+            should_mask=self._skd_mask_setting("mask_tool_parse_error", True),
+        )
+        self._log_assistant_turn_decision(
+            agent_data,
+            parse_status="parse_error",
+            tool_exec_status="not_executed",
+            mask_decision=mask_decision,
+            termination_reason="tool_parse_error",
+            turn_mask_before=turn_mask_before,
+            turn_mask_after=turn_mask_after,
+        )
+        await self._finalize_with_web_osgym_reward(agent_data, termination_reason="tool_parse_error")
+        return AgentState.TERMINATED
 
     async def _terminate_if_teacher_prefix_overflows(
         self,
@@ -528,8 +519,37 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             image_count=_safe_len(tool_response.image),
         )
 
+        if result.get("invalid_action"):
+            turn_mask_before, turn_mask_after, mask_decision = self._resolve_turn_mask_decision(
+                agent_data,
+                should_mask=self._skd_mask_setting("mask_invalid_action", True),
+            )
+            self._log_assistant_turn_decision(
+                agent_data,
+                parse_status="ok",
+                tool_exec_status="invalid_action",
+                mask_decision=mask_decision,
+                termination_reason="invalid_action",
+                turn_mask_before=turn_mask_before,
+                turn_mask_after=turn_mask_after,
+            )
+            await self._finalize_with_web_osgym_reward(agent_data, termination_reason="invalid_action")
+            return AgentState.TERMINATED
+
         if result.get("terminated"):
             termination_reason = result.get("termination_reason") or "model_done"
+            span = self._get_last_assistant_turn_span(agent_data)
+            if span is not None:
+                keep_mask = list(agent_data.response_mask[span["response_start"] : span["response_end"]])
+                self._log_assistant_turn_decision(
+                    agent_data,
+                    parse_status="ok",
+                    tool_exec_status="ok",
+                    mask_decision="keep",
+                    termination_reason=termination_reason,
+                    turn_mask_before=keep_mask,
+                    turn_mask_after=keep_mask,
+                )
             _trace_async_skd(
                 "web_skd.tool_processing_terminated",
                 request_id=agent_data.request_id,
@@ -730,6 +750,18 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
             terminated=result.get("terminated", False),
             termination_reason=result.get("termination_reason"),
         )
+        span = self._get_last_assistant_turn_span(agent_data)
+        if span is not None:
+            keep_mask = list(agent_data.response_mask[span["response_start"] : span["response_end"]])
+            self._log_assistant_turn_decision(
+                agent_data,
+                parse_status="ok",
+                tool_exec_status="ok",
+                mask_decision="keep",
+                termination_reason=None,
+                turn_mask_before=keep_mask,
+                turn_mask_after=keep_mask,
+            )
         return AgentState.GENERATING
 
     async def _handle_generating_state(
