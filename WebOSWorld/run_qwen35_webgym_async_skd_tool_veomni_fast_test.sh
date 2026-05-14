@@ -63,22 +63,19 @@ python3 -m verl.trainer.main_ppo \
     distillation.teacher_models.teacher_model.inference.name=sglang \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
     distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.80 \
-    distillation.teacher_models.teacher_model.inference.max_model_len=76800 \
-    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=76800 \
+    distillation.teacher_models.teacher_model.inference.max_model_len=86800 \
+    distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=86800 \
     distillation.teacher_models.teacher_model.inference.max_num_seqs=16 \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.sglang.attention_backend=triton \
     +distillation.teacher_models.teacher_model.inference.engine_kwargs.sglang.mm_attention_backend=fa4 \
     distillation.distillation_loss.loss_mode=forward_kl_topk \
-    distillation.distillation_loss.topk=32 \
+    distillation.distillation_loss.topk=256 \
     +distillation.distillation_loss.forward_kl_topk_impl=logsumexp_gather \
-    distillation.distillation_loss.log_prob_min_clamp=-16 \
-    distillation.distillation_loss.loss_max_clamp=40 \
     distillation.distillation_loss.use_task_rewards=False \
     distillation.distillation_loss.use_policy_gradient=False \
     distillation.skd.chunk_size=256 \
-    distillation.skd.verify_top_k=10 \
+    distillation.skd.verify_top_k=20 \
     distillation.skd.max_chunks_per_sample=224 \
-    "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     "distillation.skd.teacher_fewshot_path=${WEBGYM_TEACHER_FEWSHOT_PATH}" \
     distillation.skd.windowed_training_enabled=False \
     actor_rollout_ref.rollout.name=sglang \
@@ -131,7 +128,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.project_name=verl_async_skd_qwen35_webgym \
     trainer.experiment_name=qwen35_9b_to_27b_async_skd_webgym \
     trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool \
-    trainer.rollout_data_dir=/home/sogang_nlpy/verl/logs/rollout_data/webgym_async_skd_current \
+    trainer.rollout_data_dir=/home/sogang_nlpy/verl/logs/rollout_data/webgym_async_skd_${RUN_TS} \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.val_before_train=False \
@@ -139,6 +136,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=5 \
     trainer.test_freq=5 \
     trainer.total_epochs=100 \
-    trainer.total_training_steps=100 \
+    trainer.total_training_steps=10000 \
     +trainer.use_legacy_worker_impl=disable \
     "$@"
