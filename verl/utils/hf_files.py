@@ -77,4 +77,24 @@ def sync_hf_non_weight_files(
                 entry.unlink()
 
     for file_name, source_file in source_files.items():
-        shutil.copyfile(source_file, target_path / file_name)
+        target_file = target_path / file_name
+        if source_file.resolve() == target_file.resolve():
+            continue
+        shutil.copyfile(source_file, target_file)
+
+
+def remove_hf_weight_files(target_dir: str | os.PathLike[str]) -> None:
+    """Remove existing Hugging Face weight files from a target directory.
+
+    This is used before writing a newly merged model into an existing target
+    directory so that stale weight shards or index files do not survive across
+    repeated merges.
+    """
+
+    target_path = Path(target_dir)
+    if not target_path.is_dir():
+        return
+
+    for entry in target_path.iterdir():
+        if entry.is_file() and is_hf_weight_file(entry.name):
+            entry.unlink()

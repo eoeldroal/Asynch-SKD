@@ -273,11 +273,14 @@ class WebOsGymLoopMixin:
         valid_tool_calls = int(counts.get("valid_tool_call_count", 0))
         env_reward = float(reward)
         agent_data.extra_fields["web_osgym_env_reward_score"] = env_reward
+        agent_data.extra_fields["web_osgym_attempted_tool_calls"] = attempted_tool_calls
+        agent_data.extra_fields["web_osgym_valid_tool_calls"] = valid_tool_calls
         reward_extra_info = agent_data.extra_fields.get("reward_extra_info") or {}
         if not isinstance(reward_extra_info, dict):
             reward_extra_info = {}
         agent_data.extra_fields["reward_extra_info"] = {
             **reward_extra_info,
+            "request_id": agent_data.request_id,
             "web_osgym_env_reward_score": env_reward,
             "web_osgym_attempted_tool_calls": attempted_tool_calls,
             "web_osgym_valid_tool_calls": valid_tool_calls,

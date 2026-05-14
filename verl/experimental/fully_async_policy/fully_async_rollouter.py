@@ -25,6 +25,7 @@ import numpy as np
 import ray
 import torch
 
+from verl.experimental.agent_loop.agent_loop import DeferredAgentLoopOutputs
 from verl.experimental.fully_async_policy.detach_utils import (
     RolloutSample,
     ValidateMetrics,
@@ -633,9 +634,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 return
             raise
         rollout_sample.full_batch = ret
-        rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
-            [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
-        )
+        if isinstance(rollout_sample.full_batch, DeferredAgentLoopOutputs):
+            rollout_sample.full_batch.input_non_tensor_batch["uid"] = np.array(
+                [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch.raw_outputs), dtype=object
+            )
+        else:
+            rollout_sample.full_batch.non_tensor_batch["uid"] = np.array(
+                [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
+            )
         rollout_sample.rollout_status = await self.get_statistics()
 
         success = await self.message_queue_client.put_sample(

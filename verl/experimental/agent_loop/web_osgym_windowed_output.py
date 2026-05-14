@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from copy import deepcopy
 from typing import Any
 
 import numpy as np
 
-from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, WEB_OSGYM_ROLLOUT_TRACE_EXTRA_FIELD_KEYS
 from verl.experimental.agent_loop.web_osgym_windowing import contiguous_one_spans, normalize_web_osgym_steps
 
 
@@ -212,8 +211,9 @@ def build_web_osgym_windowed_agent_loop_outputs(
             )
         )
 
-        extra_fields = deepcopy(output.extra_fields)
-        extra_fields.pop("web_osgym_generation_windows", None)
+        extra_fields = {
+            k: v for k, v in output.extra_fields.items() if k not in WEB_OSGYM_ROLLOUT_TRACE_EXTRA_FIELD_KEYS
+        }
         extra_fields["web_osgym_window_row"] = True
         extra_fields["web_osgym_window_row_idx"] = row_idx
         extra_fields["web_osgym_window_row_count"] = len(groups)

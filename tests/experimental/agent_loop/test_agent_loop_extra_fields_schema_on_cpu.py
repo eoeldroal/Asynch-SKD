@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import warnings
 from functools import partial
 from typing import Any, Optional
@@ -32,6 +33,10 @@ from verl.experimental.agent_loop.agent_loop import (
     _InternalAgentLoopOutput,
 )
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
+from verl.trainer.ppo.core_algos import AdvantageEstimator
+from verl.trainer.ppo.ray_trainer import compute_advantage
+from verl.trainer.ppo.reward import extract_reward
 from verl.utils.dataset.rl_dataset import RLHFDataset
 from verl.workers.reward_manager.naive import NaiveRewardManager
 from verl.workers.rollout.replica import TokenOutput
@@ -131,6 +136,7 @@ def _to_internal(
     output_response_mask: list[int],
     metrics: AgentLoopMetrics,
     extra_fields: dict[str, Any],
+    reward_score: float | None = None,
     num_turns: int,
     prompt_len: int,
     response_len: int,
@@ -162,11 +168,26 @@ def _to_internal(
         routed_experts=None,
         multi_modal_inputs=None,
         multi_modal_data=None,
-        reward_score=None,
+        reward_score=reward_score,
         num_turns=num_turns,
         metrics=metrics,
         extra_fields=extra_fields,
     )
+
+
+class _FakeRewardRemoteMethod:
+    def __init__(self, result: dict[str, Any]):
+        self.result = result
+        self.calls: list[Any] = []
+
+    async def remote(self, data):
+        self.calls.append(data)
+        return self.result
+
+
+class _FakeRewardWorkerHandle:
+    def __init__(self, result: dict[str, Any]):
+        self.compute_score = _FakeRewardRemoteMethod(result)
 
 
 @pytest.mark.asyncio
@@ -381,3 +402,144 @@ def test_web_osgym_training_reward_is_computed_by_reward_manager_from_extra_info
     assert reward_result["reward_extra_info"]["web_osgym_format_reward"] == [2.0 / 5.0]
     assert reward_result["reward_extra_info"]["web_osgym_attempted_tool_calls"] == [2]
     assert reward_result["reward_extra_info"]["web_osgym_valid_tool_calls"] == [2]
+
+
+@pytest.mark.asyncio
+async def test_async_reward_loop_preserves_request_id_when_merging_reward_extra_info():
+    reward_handle = _FakeRewardWorkerHandle(
+        {
+            "reward_score": 1.012,
+            "reward_extra_info": {
+                "web_osgym_env_reward_score": 1.0,
+                "web_osgym_format_reward": 0.4,
+                "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_valid_tool_calls": 2,
+            },
+        }
+    )
+
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {
+            "reward_loop_worker_handles": [reward_handle],
+            "loop": asyncio.get_running_loop(),
+        },
+    )()
+
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[11, 12],
+        response_mask=[1, 1],
+        num_turns=4,
+        metrics=AgentLoopMetrics(),
+        extra_fields={"reward_extra_info": {"request_id": "req-1"}},
+    )
+
+    await AgentLoopWorker._compute_score(
+        dummy_worker,
+        output,
+        prompts=torch.tensor([[101, 102]], dtype=torch.long),
+        responses=torch.tensor([[11, 12]], dtype=torch.long),
+        attention_mask=torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
+        input_ids=torch.tensor([[101, 102, 11, 12]], dtype=torch.long),
+        position_ids=torch.tensor([[0, 1, 2, 3]], dtype=torch.long),
+        kwargs={"data_source": "webgym_rl", "reward_model": {"ground_truth": "env_reward"}},
+    )
+
+    assert output.reward_score == pytest.approx(1.012)
+    assert output.extra_fields["reward_extra_info"] == {
+        "request_id": "req-1",
+        "web_osgym_env_reward_score": 1.0,
+        "web_osgym_format_reward": 0.4,
+        "web_osgym_attempted_tool_calls": 2,
+        "web_osgym_valid_tool_calls": 2,
+    }
+
+
+def test_web_osgym_async_reward_path_drives_training_reward_breakdown_and_advantage():
+    metrics = AgentLoopMetrics()
+    shaped_score_a = 1.0 + 0.03 * (2.0 / 5.0)
+    shaped_score_b = 0.0
+
+    internal_a = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[11, 12],
+        output_response_mask=[1, 1],
+        metrics=metrics,
+        extra_fields={
+            "reward_extra_info": {
+                "request_id": "req-1",
+                "web_osgym_env_reward_score": 1.0,
+                "web_osgym_format_reward": 2.0 / 5.0,
+                "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_valid_tool_calls": 2,
+            },
+            "web_osgym_log_global_step": 7,
+        },
+        reward_score=shaped_score_a,
+        num_turns=4,
+        prompt_len=2,
+        response_len=2,
+    )
+    internal_b = _to_internal(
+        output_prompt_ids=[201, 202],
+        output_response_ids=[21, 22],
+        output_response_mask=[1, 1],
+        metrics=metrics,
+        extra_fields={
+            "reward_extra_info": {
+                "request_id": "req-2",
+                "web_osgym_env_reward_score": 0.0,
+                "web_osgym_format_reward": 0.0,
+                "web_osgym_attempted_tool_calls": 0,
+                "web_osgym_valid_tool_calls": 0,
+            },
+            "web_osgym_log_global_step": 7,
+        },
+        reward_score=shaped_score_b,
+        num_turns=2,
+        prompt_len=2,
+        response_len=2,
+    )
+
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
+    batch = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[internal_a, internal_b],
+        input_non_tensor_batch={
+            "uid": np.array(["uid-1", "uid-1"], dtype=object),
+            "index": np.array([0, 0], dtype=object),
+            "agent_name": np.array(["web_tool_agent", "web_tool_agent"], dtype=object),
+            "data_source": np.array(["webgym_rl", "webgym_rl"], dtype=object),
+            "reward_model": np.array(
+                [{"ground_truth": "env_reward"}, {"ground_truth": "env_reward"}], dtype=object
+            ),
+            "extra_info": np.array([{"task_id": "demo-a"}, {"task_id": "demo-b"}], dtype=object),
+        },
+    )
+
+    reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+    assert reward_tensor.sum(dim=-1).tolist() == pytest.approx([shaped_score_a, shaped_score_b])
+    assert reward_extra_infos_dict["request_id"].tolist() == ["req-1", "req-2"]
+
+    breakdown = SeparateRayPPOTrainer._compute_reward_breakdown_metrics(reward_tensor, reward_extra_infos_dict)
+    assert breakdown["score/sum"] == pytest.approx((shaped_score_a + shaped_score_b) / 2.0)
+    assert breakdown["score/env"] == pytest.approx(0.5)
+    assert breakdown["score/format"] == pytest.approx(0.2)
+
+    batch.batch["token_level_scores"] = reward_tensor
+    batch.batch["token_level_rewards"] = reward_tensor
+    batch = compute_advantage(
+        batch,
+        adv_estimator=AdvantageEstimator.GRPO,
+        num_repeat=2,
+        norm_adv_by_std_in_grpo=True,
+        config=None,
+    )
+    assert batch.batch["advantages"][0, -1].item() > 0.0
+    assert batch.batch["advantages"][1, -1].item() < 0.0

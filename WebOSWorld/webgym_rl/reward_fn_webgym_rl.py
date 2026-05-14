@@ -70,9 +70,6 @@ def compute_score_webgym_rl(
     final_reward = env_reward + float(format_reward_alpha) * float(format_reward)
     return {
         "score": final_reward,
-        "score/sum": final_reward,
-        "score/env": env_reward,
-        "score/format": float(format_reward),
         "web_osgym_env_reward_score": env_reward,
         "web_osgym_format_reward": float(format_reward),
         "web_osgym_attempted_tool_calls": attempted_tool_calls,

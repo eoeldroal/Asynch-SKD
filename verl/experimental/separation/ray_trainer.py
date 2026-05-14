@@ -19,6 +19,8 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import json
+import os
 import uuid
 from copy import deepcopy
 from pprint import pprint
@@ -258,6 +260,108 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             config=self.config,
             rm_resource_pool=resource_pool,
         )
+
+    @staticmethod
+    def _compute_reward_breakdown_metrics(
+        reward_tensor: torch.Tensor | None,
+        reward_extra_infos_dict: dict[str, Any] | None,
+    ) -> dict[str, float]:
+        metrics: dict[str, float] = {}
+
+        if reward_tensor is not None:
+            metrics["score/sum"] = float(reward_tensor.sum(dim=-1).mean().item())
+
+        if not reward_extra_infos_dict:
+            return metrics
+
+        env_scores = reward_extra_infos_dict.get("web_osgym_env_reward_score")
+        if env_scores is not None:
+            env_scores = np.asarray(env_scores, dtype=np.float32)
+            if env_scores.size > 0:
+                metrics["score/env"] = float(np.mean(env_scores))
+
+        format_scores = reward_extra_infos_dict.get("web_osgym_format_reward")
+        if format_scores is not None:
+            format_scores = np.asarray(format_scores, dtype=np.float32)
+            if format_scores.size > 0:
+                metrics["score/format"] = float(np.mean(format_scores))
+
+        return metrics
+
+    @staticmethod
+    def _augment_webgym_summary_rewards(
+        reward_tensor: torch.Tensor,
+        batch: DataProto,
+        reward_extra_infos_dict: dict[str, list] | None,
+        rollout_data_dir: str,
+    ) -> None:
+        if not reward_extra_infos_dict:
+            return
+
+        request_ids = batch.non_tensor_batch.get("request_id")
+        log_steps = batch.non_tensor_batch.get("web_osgym_log_global_step")
+        env_scores = reward_extra_infos_dict.get("web_osgym_env_reward_score")
+        format_scores = reward_extra_infos_dict.get("web_osgym_format_reward")
+
+        if request_ids is None or log_steps is None or env_scores is None or format_scores is None:
+            return
+
+        final_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+        step_request_id_to_summary: dict[int, dict[str, str]] = {}
+
+        for request_id, log_step, final_score, env_score, format_score in zip(
+            request_ids,
+            log_steps,
+            final_scores,
+            env_scores,
+            format_scores,
+            strict=True,
+        ):
+            if request_id in (None, "") or log_step is None:
+                continue
+
+            try:
+                step = int(log_step)
+            except (TypeError, ValueError):
+                continue
+
+            if step not in step_request_id_to_summary:
+                step_dir = os.path.join(rollout_data_dir, f"step_{step}")
+                request_id_to_summary = {}
+                if os.path.isdir(step_dir):
+                    for session_name in os.listdir(step_dir):
+                        summary_path = os.path.join(step_dir, session_name, "summary.json")
+                        if not os.path.isfile(summary_path):
+                            continue
+                        try:
+                            with open(summary_path, encoding="utf-8") as f:
+                                summary = json.load(f)
+                        except (OSError, json.JSONDecodeError):
+                            continue
+                        summary_request_id = summary.get("request_id")
+                        if summary_request_id not in (None, ""):
+                            request_id_to_summary[str(summary_request_id)] = summary_path
+                step_request_id_to_summary[step] = request_id_to_summary
+
+            summary_path = step_request_id_to_summary[step].get(str(request_id))
+            if not summary_path:
+                continue
+
+            try:
+                with open(summary_path, encoding="utf-8") as f:
+                    summary = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+
+            summary["reward"] = {
+                "sum": float(final_score),
+                "env": float(env_score),
+                "format": float(format_score),
+            }
+
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+                f.write("\n")
 
     def _init_async_rollout_manager(self):
         pass
@@ -635,6 +739,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # Log rollout generations if enabled
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
         if rollout_data_dir:
+            self._augment_webgym_summary_rewards(
+                self.reward_tensor,
+                batch,
+                reward_extra_infos_dict,
+                rollout_data_dir,
+            )
             self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
     def _fit_validate(self):
@@ -697,6 +807,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         timing_raw = self.timing_raw
 
         # collect metrics
+        metrics.update(self._compute_reward_breakdown_metrics(self.reward_tensor, self.reward_extra_infos_dict))
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         # TODO: implement actual tflpo and theoretical tflpo

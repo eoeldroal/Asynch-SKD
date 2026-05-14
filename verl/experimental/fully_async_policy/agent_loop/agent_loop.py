@@ -153,6 +153,11 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
             reward_loop_worker_handles,
         )
 
+    async def generate_sequences_for_queue(self, batch: DataProto):
+        if self._web_osgym_window_update_enabled():
+            return await self.generate_sequences_compact(batch)
+        return await self.generate_sequences(batch)
+
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
     def __init__(
@@ -169,7 +174,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
 
     @auto_await
-    async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
+    async def generate_sequences_single(self, prompts: DataProto) -> Any:
         """Split input batch and dispatch to agent loop workers.
 
         Args:
@@ -178,7 +183,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
             DataProto: Output batch.
         """
         worker = self._select_best_worker()
-        output_future = worker.generate_sequences.remote(prompts)
+        output_future = worker.generate_sequences_for_queue.remote(prompts)
         return await asyncio.wrap_future(output_future.future())
 
     def _select_best_worker(self):

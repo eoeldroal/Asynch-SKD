@@ -195,10 +195,13 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         loop._request_web_osgym_reward_best_effort(agent_data, termination_reason="system_stop")
 
         self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
+        self.assertEqual(agent_data.extra_fields["web_osgym_attempted_tool_calls"], 2)
+        self.assertEqual(agent_data.extra_fields["web_osgym_valid_tool_calls"], 2)
         self.assertTrue(agent_data.extra_fields["web_osgym_reward_requested"])
         self.assertEqual(
             agent_data.extra_fields["reward_extra_info"],
             {
+                "request_id": "loop-req",
                 "web_osgym_env_reward_score": 1.0,
                 "web_osgym_attempted_tool_calls": 2,
                 "web_osgym_valid_tool_calls": 2,

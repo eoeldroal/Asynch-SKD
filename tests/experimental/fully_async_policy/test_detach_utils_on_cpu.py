@@ -189,9 +189,24 @@ def test_assemble_batch_from_rollout_samples_raises_when_sample_has_no_supervise
 def test_assemble_batch_from_rollout_samples_raises_on_non_tensor_key_mismatch_before_concat():
     sample_a = _make_rollout_sample(sample_id="s1", prompt_ids=[1, 2, 3], response_ids=[11, 12])
     sample_b = _make_rollout_sample(sample_id="s2", prompt_ids=[4, 5, 6], response_ids=[21, 22])
-    sample_a.full_batch.non_tensor_batch["web_osgym_steps"] = np.array([[{"step_idx": 1}]], dtype=object)
+    sample_a.full_batch.non_tensor_batch["unexpected_metadata"] = np.array(["extra"], dtype=object)
 
     with pytest.raises(ValueError, match="non_tensor_batch key mismatch"):
+        assemble_batch_from_rollout_samples(
+            [sample_a, sample_b],
+            tokenizer=_FakeTokenizer(),
+            config=None,
+            balance_batch=None,
+        )
+
+
+def test_assemble_batch_from_rollout_samples_raises_if_rollout_trace_fields_reach_training_boundary():
+    sample_a = _make_rollout_sample(sample_id="s1", prompt_ids=[1, 2, 3], response_ids=[11, 12])
+    sample_b = _make_rollout_sample(sample_id="s2", prompt_ids=[4, 5, 6], response_ids=[21, 22])
+    sample_a.full_batch.non_tensor_batch["web_osgym_steps"] = np.array([[{"step_idx": 1}]], dtype=object)
+    sample_b.full_batch.non_tensor_batch["web_osgym_steps"] = np.array([[{"step_idx": 1}]], dtype=object)
+
+    with pytest.raises(ValueError, match="rollout trace fields"):
         assemble_batch_from_rollout_samples(
             [sample_a, sample_b],
             tokenizer=_FakeTokenizer(),

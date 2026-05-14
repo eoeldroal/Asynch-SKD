@@ -1421,7 +1421,16 @@ class AgentLoopWorker(AgentLoopOutputMaterializerMixin):
                 selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
                 result = await selected_reward_loop_worker_handle.compute_score.remote(data)
                 output.reward_score = result["reward_score"]
-                output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+                existing_reward_extra_info = output.extra_fields.get("reward_extra_info")
+                if not isinstance(existing_reward_extra_info, dict):
+                    existing_reward_extra_info = {}
+                returned_reward_extra_info = result.get("reward_extra_info")
+                if not isinstance(returned_reward_extra_info, dict):
+                    returned_reward_extra_info = {}
+                output.extra_fields["reward_extra_info"] = {
+                    **existing_reward_extra_info,
+                    **returned_reward_extra_info,
+                }
             output.metrics.compute_score = timing["compute_score"]
 
     async def _compute_teacher_logprobs(

@@ -24,6 +24,14 @@ import torch
 import torch.nn.functional as F
 
 from verl import DataProto
+from verl.experimental.agent_loop.agent_loop import (
+    WEB_OSGYM_ROLLOUT_TRACE_EXTRA_FIELD_KEYS,
+    AgentLoopWorker,
+    DeferredAgentLoopOutputs,
+    _get_rollout_and_model_config,
+)
+from verl.utils.config import omega_conf_to_dataclass
+from verl.workers.config import RolloutConfig
 from verl.trainer.ppo.ray_trainer import compute_response_mask
 
 
@@ -49,6 +57,17 @@ class ValidateMetrics:
     timing_raw: dict[str, Any]
     metrics: Optional[dict[str, Any]] = None
     val_generations: Optional[list[tuple]] = None
+
+
+class _DeferredAgentLoopMaterializer(AgentLoopWorker):
+    def __init__(self, config, tokenizer, processor):
+        rollout_config, _model_config = _get_rollout_and_model_config(config)
+        self.rollout_config = omega_conf_to_dataclass(rollout_config, RolloutConfig)
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.reward_loop_worker_handles = None
+        self.distillation_enabled = False
+        self.teacher_server_manager = None
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
@@ -93,9 +112,37 @@ def addition_process(output: DataProto):
     return output
 
 
+def _materialize_deferred_rollout_sample(
+    rollout_sample: RolloutSample,
+    *,
+    tokenizer,
+    config,
+    processor,
+) -> DataProto:
+    deferred = rollout_sample.full_batch
+    if not isinstance(deferred, DeferredAgentLoopOutputs):
+        return deferred
+    if config is None:
+        raise ValueError("Deferred fully-async rollout samples require config for trainer-side materialization.")
+    materializer = _DeferredAgentLoopMaterializer(config=config, tokenizer=tokenizer, processor=processor)
+    batch = materializer.materialize_raw_outputs_sync(
+        deferred.raw_outputs,
+        deferred.input_non_tensor_batch,
+        validate=deferred.validate,
+    )
+    rollout_sample.full_batch = batch
+    return batch
+
+
 def _validate_rollout_sample_batch(batch: DataProto, *, sample_id: str) -> None:
     if batch.batch is None:
         raise ValueError(f"Rollout sample '{sample_id}' is missing tensor batch data.")
+    leaked_trace_keys = sorted(set(batch.non_tensor_batch) & WEB_OSGYM_ROLLOUT_TRACE_EXTRA_FIELD_KEYS)
+    if leaked_trace_keys:
+        raise ValueError(
+            f"Rollout sample '{sample_id}' contains Web/OSGym rollout trace fields before batch assembly: "
+            f"{leaked_trace_keys}. These fields must be filtered before training."
+        )
 
     if "response_mask" in batch.batch.keys():
         response_mask = batch.batch["response_mask"]
@@ -127,6 +174,55 @@ def _validate_rollout_samples_for_concat(rollout_samples_batch: list[DataProto],
                 f"reference_sample='{reference_sample_id}' sample='{rs.sample_id}' "
                 f"missing={missing} extra={extra}."
             )
+
+
+def _tensor_nbytes(value: Any) -> int:
+    if isinstance(value, torch.Tensor):
+        return int(value.numel() * value.element_size())
+    if isinstance(value, np.ndarray):
+        if value.dtype == object:
+            return sum(_tensor_nbytes(item) for item in value.flat)
+        return int(value.nbytes)
+    if isinstance(value, dict):
+        return sum(_tensor_nbytes(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_tensor_nbytes(item) for item in value)
+    return 0
+
+
+def _summarize_training_payload(batch: DataProto) -> dict[str, Any]:
+    window_rows = 0
+    if "web_osgym_window_row" in batch.non_tensor_batch:
+        window_rows = sum(bool(value) for value in batch.non_tensor_batch["web_osgym_window_row"].tolist())
+
+    multi_modal_inputs = batch.non_tensor_batch.get("multi_modal_inputs")
+    multi_modal_tensor_bytes = _tensor_nbytes(multi_modal_inputs) if multi_modal_inputs is not None else 0
+    image_count = 0
+    if isinstance(multi_modal_inputs, np.ndarray):
+        for item in multi_modal_inputs.tolist():
+            if not isinstance(item, dict):
+                continue
+            image_grid_thw = item.get("image_grid_thw")
+            if isinstance(image_grid_thw, torch.Tensor):
+                image_count += int(image_grid_thw.shape[0])
+
+    block_sizes = []
+    if "web_osgym_window_supervision_block_size" in batch.non_tensor_batch:
+        block_sizes = sorted(
+            {
+                int(value.item() if isinstance(value, np.generic) else value)
+                for value in batch.non_tensor_batch["web_osgym_window_supervision_block_size"].tolist()
+                if value is not None
+            }
+        )
+
+    return {
+        "rows": len(batch),
+        "window_rows": window_rows,
+        "web_osgym_window_supervision_block_sizes": block_sizes,
+        "multi_modal_image_count": image_count,
+        "multi_modal_tensor_mib": round(multi_modal_tensor_bytes / (1024**2), 2),
+    }
 
 
 def _validate_param_version_array(name: str, values: np.ndarray) -> list[int]:
@@ -274,7 +370,7 @@ def _pad_batch_to_required_multiple(batch: DataProto, multiple: int | None) -> D
 
 
 def assemble_batch_from_rollout_samples(
-    rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None
+    rollout_samples: list[RolloutSample], tokenizer, config, balance_batch=None, processor=None
 ) -> DataProto:
     """
     Assemble gen_batch_output from RolloutSample objects
@@ -305,7 +401,8 @@ def assemble_batch_from_rollout_samples(
     rollout_status = {f"fully_async/{key}": value for key, value in rollout_status.items()}
 
     for rs in rollout_samples:
-        batch = addition_process(rs.full_batch)
+        batch = _materialize_deferred_rollout_sample(rs, tokenizer=tokenizer, config=config, processor=processor)
+        batch = addition_process(batch)
         _validate_rollout_sample_batch(batch, sample_id=rs.sample_id)
         rollout_samples_batch.append(batch)
 
@@ -313,6 +410,8 @@ def assemble_batch_from_rollout_samples(
     _align_rollout_sample_widths(rollout_samples_batch, tokenizer)
     final_batch = DataProto.concat(rollout_samples_batch)
     final_batch = _pad_batch_to_required_multiple(final_batch, _infer_required_multiple_from_balance_fn(balance_batch))
+    payload_summary = _summarize_training_payload(final_batch)
+    print(f"[BatchUtils] Training payload summary {payload_summary}")
 
     # Calculate response_mask (if not present)
     if "response_mask" not in final_batch.batch.keys():

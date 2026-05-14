@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from verl.utils.hf_files import resolve_hf_non_weight_source_dir, sync_hf_non_weight_files
+from verl.utils.hf_files import remove_hf_weight_files, resolve_hf_non_weight_source_dir, sync_hf_non_weight_files
 
 
 def test_resolve_hf_non_weight_source_dir_prefers_huggingface_subdir(tmp_path: Path):
@@ -39,3 +39,30 @@ def test_sync_hf_non_weight_files_copies_metadata_and_preserves_weight_files(tmp
     assert preserved_target_weight.read_text() == "merged-weights"
     assert not (target_dir / "obsolete.txt").exists()
     assert not (target_dir / "pytorch_model.bin.index.json").exists()
+
+
+def test_remove_hf_weight_files_removes_stale_weight_artifacts_only(tmp_path: Path):
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+
+    (target_dir / "model-00001-of-00002.safetensors").write_text("old-weights")
+    (target_dir / "model.safetensors.index.json").write_text('{"weight_map":{}}')
+    (target_dir / "config.json").write_text('{"model_type":"qwen"}')
+
+    remove_hf_weight_files(target_dir)
+
+    assert not (target_dir / "model-00001-of-00002.safetensors").exists()
+    assert not (target_dir / "model.safetensors.index.json").exists()
+    assert (target_dir / "config.json").read_text() == '{"model_type":"qwen"}'
+
+
+def test_sync_hf_non_weight_files_is_noop_when_source_and_target_match(tmp_path: Path):
+    source_dir = tmp_path / "huggingface"
+    source_dir.mkdir()
+    (source_dir / "config.json").write_text('{"model_type":"qwen"}')
+    (source_dir / "tokenizer.json").write_text('{"tokenizer":"qwen"}')
+
+    sync_hf_non_weight_files(source_dir, source_dir)
+
+    assert (source_dir / "config.json").read_text() == '{"model_type":"qwen"}'
+    assert (source_dir / "tokenizer.json").read_text() == '{"tokenizer":"qwen"}'
