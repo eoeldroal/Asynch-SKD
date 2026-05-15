@@ -536,7 +536,7 @@ async def test_web_skd_parse_error_can_keep_committed_turn_when_masking_is_disab
 
 
 @pytest.mark.asyncio
-async def test_web_skd_invalid_action_masks_committed_turn_and_emits_turn_log(tmp_path, monkeypatch):
+async def test_web_skd_invalid_action_keeps_committed_turn_and_emits_turn_log(tmp_path, monkeypatch):
     turn_log = tmp_path / "async_skd_turns.jsonl"
     monkeypatch.setenv("VERL_ASYNC_SKD_TURN_LOG", str(turn_log))
 
@@ -590,10 +590,18 @@ async def test_web_skd_invalid_action_masks_committed_turn_and_emits_turn_log(tm
     assert next_state == AgentState.TERMINATED
     assert agent_data.prompt_ids == [1, 2, 3, TOOL_CALL_A, TOOL_CALL_B, EOS]
     assert agent_data.response_ids == [TOOL_CALL_A, TOOL_CALL_B, EOS]
-    assert agent_data.response_mask == [0, 0, 0]
+    assert agent_data.response_mask == [1, 1, 1]
     assert agent_data.assistant_turns == 1
-    assert teacher_rows(agent_data) == [[0] * LOSS_TOP_K, [0] * LOSS_TOP_K, [0] * LOSS_TOP_K]
-    assert teacher_logprobs(agent_data) == [[0.0] * LOSS_TOP_K, [0.0] * LOSS_TOP_K, [0.0] * LOSS_TOP_K]
+    assert teacher_rows(agent_data) == [
+        [TOOL_CALL_A, 0, 0, 0],
+        [TOOL_CALL_B, 0, 0, 0],
+        [EOS, 0, 0, 0],
+    ]
+    assert teacher_logprobs(agent_data) == [
+        [-1.0] * LOSS_TOP_K,
+        [-2.0] * LOSS_TOP_K,
+        [-3.0] * LOSS_TOP_K,
+    ]
     assert agent_data.metrics["web_osgym/invalid_action"] == 1
     assert agent_data.extra_fields["web_osgym_termination_reason"] == "invalid_action"
 
@@ -605,9 +613,9 @@ async def test_web_skd_invalid_action_masks_committed_turn_and_emits_turn_log(tm
     assert record["logical_step"] == 2
     assert record["parse_status"] == "ok"
     assert record["tool_exec_status"] == "invalid_action"
-    assert record["mask_decision"] == "mask_and_terminate"
+    assert record["mask_decision"] == "keep"
     assert record["turn_mask_before"] == [1, 1, 1]
-    assert record["turn_mask_after"] == [0, 0, 0]
+    assert record["turn_mask_after"] == [1, 1, 1]
     assert record["assistant_turn"] == 1
     assert record["response_start"] == 0
     assert record["response_end"] == 3

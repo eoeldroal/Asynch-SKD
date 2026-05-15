@@ -522,7 +522,7 @@ class WebSkdAgentLoop(WebOsGymLoopMixin, SkdAgentLoop):
         if result.get("invalid_action"):
             turn_mask_before, turn_mask_after, mask_decision = self._resolve_turn_mask_decision(
                 agent_data,
-                should_mask=self._skd_mask_setting("mask_invalid_action", True),
+                should_mask=False,
             )
             self._log_assistant_turn_decision(
                 agent_data,

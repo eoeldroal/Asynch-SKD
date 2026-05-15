@@ -1330,7 +1330,7 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.extra_fields["tool_parse_error_retry_count"], 9999)
         self.assertEqual(agent_data.response_mask, [0, 0])
 
-    async def test_invalid_action_masks_last_assistant_turn_and_terminates(self):
+    async def test_invalid_action_keeps_last_assistant_turn_and_terminates(self):
         loop = _build_loop()
         loop.tools = {"computer": _InvalidActionFakeTool()}
         loop._build_teacher_messages = lambda messages: deepcopy(messages)
@@ -1410,12 +1410,12 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(agent_data.messages, before_messages)
             self.assertEqual(agent_data.prompt_ids, before_prompt_ids)
             self.assertEqual(agent_data.user_turns, 0)
-            self.assertEqual(agent_data.response_mask, [0, 0])
+            self.assertEqual(agent_data.response_mask, [1, 1])
             self.assertEqual(agent_data.metrics["web_osgym/invalid_action"], 1)
-            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[0, 0, 0, 0], [0, 0, 0, 0]])
+            self.assertEqual(agent_data.extra_fields["teacher_ids_list"], [[41, 410, 411, 0], [42, 420, 421, 0]])
             self.assertEqual(
                 agent_data.extra_fields["teacher_logprobs_list"],
-                [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+                [[-1.0, -1.1, -1.2, 0.0], [-2.0, -2.1, -2.2, 0.0]],
             )
             self.assertEqual(agent_data.extra_fields["web_osgym_termination_reason"], "invalid_action")
 
@@ -1424,9 +1424,9 @@ class TestWebSkdAgentLoop(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(records[0]["event"], "assistant_turn_decision")
             self.assertEqual(records[0]["parse_status"], "ok")
             self.assertEqual(records[0]["tool_exec_status"], "invalid_action")
-            self.assertEqual(records[0]["mask_decision"], "mask_and_terminate")
+            self.assertEqual(records[0]["mask_decision"], "keep")
             self.assertEqual(records[0]["turn_mask_before"], [1, 1])
-            self.assertEqual(records[0]["turn_mask_after"], [0, 0])
+            self.assertEqual(records[0]["turn_mask_after"], [1, 1])
 
     async def test_invalid_action_can_keep_last_assistant_turn_when_masking_is_disabled(self):
         loop = _build_loop()
