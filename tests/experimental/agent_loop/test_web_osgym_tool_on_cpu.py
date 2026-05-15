@@ -775,6 +775,79 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.button, "left")
         self.assertEqual(action.num_clicks, 1)
 
+    async def test_tool_execute_defaults_mouse_down_button_to_left(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "MOUSE_DOWN"}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "MOUSE_DOWN")
+        self.assertEqual(action.button, "left")
+
+    async def test_tool_execute_allows_explicit_mouse_up_button(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute("i1", {"actions": [{"action_type": "MOUSE_UP", "button": "middle"}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "MOUSE_UP")
+        self.assertEqual(action.button, "middle")
+
+    async def test_tool_execute_uses_current_cursor_for_right_click_without_coordinates(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute(
+            "i1",
+            {"actions": [{"action_type": "MOVE_TO", "x": 10, "y": 20}, {"action_type": "RIGHT_CLICK"}]},
+        )
+
+        action = seen["actions"][1]
+        self.assertEqual(action.action_type, "RIGHT_CLICK")
+        self.assertEqual(action.x, 10)
+        self.assertEqual(action.y, 20)
+
     async def test_tool_execute_rejects_coordinate_free_click_before_cursor_is_known(self):
         class _FakeClient:
             def __init__(self):
@@ -790,6 +863,24 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "CLICK"}]})
 
         self.assertIn("CLICK omitted x/y", response.text)
+        self.assertTrue(metrics["invalid_action"])
+        self.assertFalse(tool.client.action_called)
+
+    async def test_tool_execute_rejects_coordinate_free_right_click_before_cursor_is_known(self):
+        class _FakeClient:
+            def __init__(self):
+                self.action_called = False
+
+            async def action(self, **kwargs):
+                self.action_called = True
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "RIGHT_CLICK"}]})
+
+        self.assertIn("RIGHT_CLICK omitted x/y", response.text)
         self.assertTrue(metrics["invalid_action"])
         self.assertFalse(tool.client.action_called)
 
@@ -849,6 +940,35 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.action_type, "DOUBLE_CLICK")
         self.assertEqual(action.x, 5)
         self.assertEqual(action.y, 6)
+
+    async def test_tool_execute_scales_drag_to_coordinates_and_updates_cursor(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state(screen_width=1920, screen_height=1080)
+
+        await tool.execute(
+            "i1",
+            {"actions": [{"action_type": "DRAG_TO", "x": 528, "y": 582}, {"action_type": "CLICK"}]},
+        )
+
+        drag_action = seen["actions"][0]
+        click_action = seen["actions"][1]
+        self.assertEqual(drag_action.action_type, "DRAG_TO")
+        self.assertEqual((drag_action.x, drag_action.y), (1014, 629))
+        self.assertEqual(click_action.action_type, "CLICK")
+        self.assertEqual((click_action.x, click_action.y), (1014, 629))
 
     async def test_tool_execute_restores_cursor_from_agent_extra_fields(self):
         seen = {}

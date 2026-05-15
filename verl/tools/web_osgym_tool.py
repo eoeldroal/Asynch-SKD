@@ -137,9 +137,25 @@ def _normalize_hotkey_keys(value: Any) -> Any:
     return normalized_keys
 
 
+_COORD_ACTIONS = frozenset({"CLICK", "DOUBLE_CLICK", "RIGHT_CLICK", "MOVE_TO", "DRAG_TO"})
+
+
 def _normalize_web_osgym_action_payload(raw_action: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(raw_action)
     action_type = normalized.get("action_type")
+
+    if action_type in _COORD_ACTIONS and "coordinate" not in normalized:
+        x = normalized.get("x")
+        y = normalized.get("y")
+        if isinstance(x, list) and len(x) >= 2:
+            normalized["coordinate"] = [int(x[0]), int(x[1])]
+            normalized.pop("x", None)
+            normalized.pop("y", None)
+        elif x is not None and y is not None:
+            normalized["coordinate"] = [int(x), int(y)]
+            normalized.pop("x", None)
+            normalized.pop("y", None)
+
     if action_type in {"PRESS", "KEY_DOWN", "KEY_UP"} and "key" in normalized:
         normalized["key"] = _normalize_playwright_key_alias(normalized.get("key"))
     elif action_type == "HOTKEY" and isinstance(normalized.get("keys"), list):
@@ -258,6 +274,12 @@ class WebOsGymTool(BaseTool):
 
     @staticmethod
     def _require_coordinates(action: WebOsGymAction, cursor_x: int | None, cursor_y: int | None) -> tuple[int, int]:
+        if action.coordinate is not None:
+            if len(action.coordinate) < 2:
+                raise ValueError(
+                    f"{action.action_type} coordinate must have at least 2 elements, got {action.coordinate}"
+                )
+            return action.coordinate[0], action.coordinate[1]
         has_x = action.x is not None
         has_y = action.y is not None
         if has_x != has_y:
@@ -266,8 +288,8 @@ class WebOsGymTool(BaseTool):
             return int(action.x), int(action.y)
         if cursor_x is None or cursor_y is None:
             raise ValueError(
-                f"{action.action_type} omitted x/y, but no current cursor position is known. "
-                "Provide x/y or call MOVE_TO first."
+                f"{action.action_type} omitted coordinate, but no current cursor position is known. "
+                "Provide coordinate or call MOVE_TO first."
             )
         return int(cursor_x), int(cursor_y)
 
@@ -277,6 +299,15 @@ class WebOsGymTool(BaseTool):
         if value is None:
             raise ValueError(f"{action.action_type} requires field '{field_name}'")
         return value
+
+    @staticmethod
+    def _normalize_mouse_button(action_type: str, button: str | None) -> str:
+        normalized_button = (button or "left").lower()
+        if normalized_button not in {"left", "middle", "right"}:
+            raise ValueError(
+                f"{action_type} button must be one of 'left', 'middle', or 'right', got {button!r}"
+            )
+        return normalized_button
 
     def _is_action_named_tool(self) -> bool:
         return self.name in self.COMPUTER_13_ACTIONS
@@ -365,37 +396,65 @@ class WebOsGymTool(BaseTool):
             action_type = action.action_type
             payload = action.model_dump(exclude_none=True)
             if action_type == "MOVE_TO":
-                x = self._require_field(action, "x")
-                y = self._require_field(action, "y")
+                if action.coordinate is not None:
+                    x, y = action.coordinate[0], action.coordinate[1]
+                else:
+                    x = self._require_field(action, "x")
+                    y = self._require_field(action, "y")
                 scaled_x, scaled_y = self._scale_xy_to_screen(state, int(x), int(y))
+                payload.pop("coordinate", None)
                 payload.update({"x": scaled_x, "y": scaled_y})
                 cursor_x, cursor_y = scaled_x, scaled_y
 
             elif action_type == "CLICK":
                 x, y = self._require_coordinates(action, cursor_x, cursor_y)
-                button = action.button or "left"
-                if button.lower() not in {"left", "middle", "right"}:
-                    raise ValueError(f"CLICK button must be one of 'left', 'middle', or 'right', got {button!r}")
+                button = self._normalize_mouse_button(action_type, action.button)
                 num_clicks = 1 if action.num_clicks is None else int(action.num_clicks)
                 if num_clicks < 1:
                     raise ValueError(f"CLICK requires num_clicks >= 1, got {num_clicks}")
                 click_x, click_y = int(x), int(y)
-                if action.x is not None and action.y is not None:
+                if action.coordinate is not None or (action.x is not None and action.y is not None):
                     click_x, click_y = self._scale_xy_to_screen(state, click_x, click_y)
-                payload.update({"button": button.lower(), "x": click_x, "y": click_y, "num_clicks": num_clicks})
+                payload.pop("coordinate", None)
+                payload.update({"button": button, "x": click_x, "y": click_y, "num_clicks": num_clicks})
+                cursor_x, cursor_y = click_x, click_y
+
+            elif action_type in {"MOUSE_DOWN", "MOUSE_UP"}:
+                payload.update({"button": self._normalize_mouse_button(action_type, action.button)})
+
+            elif action_type == "RIGHT_CLICK":
+                x, y = self._require_coordinates(action, cursor_x, cursor_y)
+                click_x, click_y = int(x), int(y)
+                if action.coordinate is not None or (action.x is not None and action.y is not None):
+                    click_x, click_y = self._scale_xy_to_screen(state, click_x, click_y)
+                payload.pop("coordinate", None)
+                payload.update({"x": click_x, "y": click_y})
                 cursor_x, cursor_y = click_x, click_y
 
             elif action_type == "DOUBLE_CLICK":
                 x, y = self._require_coordinates(action, cursor_x, cursor_y)
                 click_x, click_y = int(x), int(y)
-                if action.x is not None and action.y is not None:
+                if action.coordinate is not None or (action.x is not None and action.y is not None):
                     click_x, click_y = self._scale_xy_to_screen(state, click_x, click_y)
+                payload.pop("coordinate", None)
                 payload.update({"x": click_x, "y": click_y})
                 cursor_x, cursor_y = click_x, click_y
+
+            elif action_type == "DRAG_TO":
+                if action.coordinate is not None:
+                    x, y = action.coordinate[0], action.coordinate[1]
+                else:
+                    x = self._require_field(action, "x")
+                    y = self._require_field(action, "y")
+                drag_x, drag_y = self._scale_xy_to_screen(state, int(x), int(y))
+                payload.pop("coordinate", None)
+                payload.update({"x": drag_x, "y": drag_y})
+                cursor_x, cursor_y = drag_x, drag_y
 
             elif action_type == "SCROLL":
                 self._require_field(action, "dx")
                 self._require_field(action, "dy")
+                payload.update({"dx": -int(action.dx), "dy": -int(action.dy)})
 
             elif action_type == "TYPING":
                 self._require_field(action, "text")

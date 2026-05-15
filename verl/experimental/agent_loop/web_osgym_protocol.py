@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 class WebOsGymAction(BaseModel):
     action_type: str
+    coordinate: list[int] | None = None
     x: int | None = None
     y: int | None = None
     button: str | None = None

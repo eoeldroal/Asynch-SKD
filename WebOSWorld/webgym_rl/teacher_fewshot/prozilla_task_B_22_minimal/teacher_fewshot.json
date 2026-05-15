@@ -56,8 +56,7 @@
               "actions": [
                 {
                   "action_type": "DOUBLE_CLICK",
-                  "x": 34,
-                  "y": 727
+                  "coordinate": [34, 727]
                 }
               ]
             }
@@ -85,8 +84,7 @@
               "actions": [
                 {
                   "action_type": "CLICK",
-                  "x": 34,
-                  "y": 727
+                  "coordinate": [34, 727]
                 }
               ]
             }

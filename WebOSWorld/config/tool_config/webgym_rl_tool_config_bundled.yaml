@@ -24,39 +24,41 @@ tools:
               items:
                 oneOf:
                   - type: "object"
-                    description: "Move the cursor to the specified position. x and y must each be a single integer field in the 1000x1000 coordinate system. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
+                    description: "Move the cursor to coordinate [x, y] in the 1000×1000 grid."
                     additionalProperties: false
                     properties:
                       action_type:
                         type: "string"
                         enum: ["MOVE_TO"]
-                      x:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                      y:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                    required: ["action_type", "x", "y"]
+                      coordinate:
+                        type: "array"
+                        description: "[x, y] position in the 1000×1000 coordinate grid."
+                        items:
+                          type: "integer"
+                          minimum: 0
+                          maximum: 999
+                        minItems: 2
+                        maxItems: 2
+                    required: ["action_type", "coordinate"]
                   - type: "object"
-                    description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position. If x and y are provided, each must be its own single integer field. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
+                    description: "Click at coordinate [x, y] if provided, otherwise at the current cursor position."
                     additionalProperties: false
                     properties:
                       action_type:
                         type: "string"
                         enum: ["CLICK"]
+                      coordinate:
+                        type: "array"
+                        description: "[x, y] position in the 1000×1000 coordinate grid."
+                        items:
+                          type: "integer"
+                          minimum: 0
+                          maximum: 999
+                        minItems: 2
+                        maxItems: 2
                       button:
                         type: "string"
                         enum: ["left", "middle", "right"]
-                      x:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                      y:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
                       num_clicks:
                         type: "integer"
                         minimum: 1
@@ -84,55 +86,58 @@ tools:
                         enum: ["left", "middle", "right"]
                     required: ["action_type"]
                   - type: "object"
-                    description: "Right click at the current position if x and y are not specified, otherwise right click at the specified position."
+                    description: "Right click at coordinate [x, y] if provided, otherwise at the current cursor position."
                     additionalProperties: false
                     properties:
                       action_type:
                         type: "string"
                         enum: ["RIGHT_CLICK"]
-                      x:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                      y:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
+                      coordinate:
+                        type: "array"
+                        description: "[x, y] position in the 1000×1000 coordinate grid."
+                        items:
+                          type: "integer"
+                          minimum: 0
+                          maximum: 999
+                        minItems: 2
+                        maxItems: 2
                     required: ["action_type"]
                   - type: "object"
-                    description: "Double click at the current position if x and y are not specified, otherwise double click at the specified position."
+                    description: "Double click at coordinate [x, y] if provided, otherwise at the current cursor position."
                     additionalProperties: false
                     properties:
                       action_type:
                         type: "string"
                         enum: ["DOUBLE_CLICK"]
-                      x:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                      y:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
+                      coordinate:
+                        type: "array"
+                        description: "[x, y] position in the 1000×1000 coordinate grid."
+                        items:
+                          type: "integer"
+                          minimum: 0
+                          maximum: 999
+                        minItems: 2
+                        maxItems: 2
                     required: ["action_type"]
                   - type: "object"
-                    description: "Drag the cursor to the specified position with the left button pressed."
+                    description: "Drag to coordinate [x, y] with the left button pressed."
                     additionalProperties: false
                     properties:
                       action_type:
                         type: "string"
                         enum: ["DRAG_TO"]
-                      x:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                      y:
-                        type: "integer"
-                        minimum: 0
-                        maximum: 999
-                    required: ["action_type", "x", "y"]
+                      coordinate:
+                        type: "array"
+                        description: "[x, y] position in the 1000×1000 coordinate grid."
+                        items:
+                          type: "integer"
+                          minimum: 0
+                          maximum: 999
+                        minItems: 2
+                        maxItems: 2
+                    required: ["action_type", "coordinate"]
                   - type: "object"
-                    description: "Scroll the mouse wheel up/down, or left/right."
+                    description: "Scroll the mouse wheel. dy > 0 scrolls down (content moves up), dy < 0 scrolls up (content moves down). dx > 0 scrolls right, dx < 0 scrolls left."
                     additionalProperties: false
                     properties:
                       action_type:
@@ -184,7 +189,7 @@ tools:
                         type: "string"
                     required: ["action_type", "key"]
                   - type: "object"
-                    description: "Press the specified key combination. keys must be an array of single string key names, for example ['ctrl', 'c']. For paste, use ['ctrl', 'v']. Do not pass x/y here, and do not pass a single combined string like 'ctrl+v'."
+                    description: "Press the specified key combination. keys is an array of key names, for example ['ctrl', 'c']."
                     additionalProperties: false
                     properties:
                       action_type:
