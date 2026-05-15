@@ -104,6 +104,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=16 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=4 \
     +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=16 \
+    +actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=False \
     +actor_rollout_ref.rollout.custom.web_skd_include_a11y=false \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \

@@ -5,13 +5,10 @@ cd /home/sogang_nlpy/verl
 
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_${RUN_TIMESTAMP}
-# The referenced parquet files are the fully async RL copies generated from:
-#   /home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json
-# with localhost tasks included, via:
-#   /home/sogang_nlpy/verl/WebOSWorld/webgym_rl/create_webgym_rl_dataset.py
 WEBGYM_ASYNC_RL_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl
 WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${WEBGYM_SYSTEM_PROMPT_PATH:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
+WEBGYM_INITIAL_MODEL_PATH="${WEBGYM_INITIAL_MODEL_PATH:-/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_20/actor/huggingface}"
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -25,7 +22,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.prompt_key=prompt \
     data.truncation=error \
     data.max_prompt_length=3072 \
-    data.max_response_length=65536 \
+    data.max_response_length=32768 \
     data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=64 \
     data.train_batch_size=0 \
@@ -35,7 +32,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_in_reward=False \
     actor_rollout_ref.hybrid_engine=False \
-    actor_rollout_ref.model.path=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_15/actor/huggingface \
+    actor_rollout_ref.model.path=${WEBGYM_INITIAL_MODEL_PATH} \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \
@@ -48,6 +45,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_low=10 \
     actor_rollout_ref.actor.clip_ratio_high=0.2 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.total_training_steps=1000 \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
@@ -86,11 +84,9 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=40 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=40 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_response_tokens=1024 \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=5 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable=False \
-    actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n=5 \
-    actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample=6 \
-    +actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size=1 \
     "actor_rollout_ref.rollout.multi_turn.tool_config_path=${WEBGYM_TOOL_CONFIG_PATH}" \
     "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
@@ -101,22 +97,25 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/reward_fn_webgym_rl.py \
     reward.custom_reward_function.name=compute_score_webgym_rl \
     +reward.custom_reward_function.reward_kwargs.format_reward_alpha=0.1 \
-    +reward.custom_reward_function.reward_kwargs.format_reward_min_denominator=5 \
+    +reward.custom_reward_function.reward_kwargs.format_reward_tau=2.0 \
+    +reward.custom_reward_function.reward_kwargs.format_reward_gate_by_env_score=False \
     'trainer.logger=["console","wandb"]' \
-    trainer.project_name=verl_fully_async_qwen35_webgym_tool_veomni \
-    trainer.experiment_name=qwen35_9b_fully_async_webgym_tool \
+    trainer.project_name=RL_main \
+    trainer.experiment_name=qwen35_9b_fully_async_webgym_tool_2 \
     trainer.val_before_train=False \
-    trainer.save_freq=3 \
+    trainer.save_freq=5 \
     trainer.test_freq=-1 \
     trainer.resume_mode=auto \
-    trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_fully_async_qwen35_webgym_tool_veomni/qwen35_9b_fully_async_webgym_tool \
+    trainer.max_actor_ckpt_to_keep=3 \
+    trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/RL_main/qwen35_9b_fully_async_webgym_tool_2 \
     "trainer.rollout_data_dir=${ROLLOUT_DATA_DIR}" \
     +ray_kwargs.ray_init.object_store_memory=320000000000 \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=4 \
     rollout.nnodes=1 \
     rollout.n_gpus_per_node=4 \
-    rollout.total_rollout_steps=50 \
+    rollout.total_rollout_steps=1000 \
+    trainer.total_training_steps=1000 \
     trainer.total_epochs=100 \
     async_training.staleness_threshold=1.0 \
     async_training.trigger_parameter_sync_step=2 \

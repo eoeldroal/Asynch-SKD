@@ -8,7 +8,7 @@ ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_as
 WEBGYM_ASYNC_RL_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl
 WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${WEBGYM_SYSTEM_PROMPT_PATH:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
-WEBGYM_INITIAL_MODEL_PATH="${WEBGYM_INITIAL_MODEL_PATH:-/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_10/actor/huggingface}"
+WEBGYM_INITIAL_MODEL_PATH="${WEBGYM_INITIAL_MODEL_PATH:-/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_15/actor/huggingface}"
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -45,6 +45,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.clip_ratio_low=10 \
     actor_rollout_ref.actor.clip_ratio_high=0.2 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.total_training_steps=1000 \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=24576 \
@@ -59,7 +60,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=38401 \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.n=4 \
+    actor_rollout_ref.rollout.n=8 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.max_model_len=98304 \
@@ -70,8 +71,6 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.top_k=20 \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.attention_backend=triton \
     +actor_rollout_ref.rollout.engine_kwargs.sglang.mm_attention_backend=fa4 \
-    +actor_rollout_ref.rollout.engine_kwargs.sglang.grammar_backend=xgrammar \
-    +actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=True \
     actor_rollout_ref.rollout.skip_tokenizer_init=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.calculate_log_probs=True \
@@ -87,9 +86,6 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=10 \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=5 \
     actor_rollout_ref.rollout.multi_turn.web_osgym_window_enable=False \
-    actor_rollout_ref.rollout.multi_turn.web_osgym_window_history_n=5 \
-    actor_rollout_ref.rollout.multi_turn.web_osgym_window_max_images_per_sample=6 \
-    +actor_rollout_ref.rollout.multi_turn.web_osgym_window_supervision_block_size=1 \
     "actor_rollout_ref.rollout.multi_turn.tool_config_path=${WEBGYM_TOOL_CONFIG_PATH}" \
     "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
     actor_rollout_ref.rollout.multi_turn.format=qwen3_coder \
@@ -100,7 +96,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     reward.custom_reward_function.path=/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/reward_fn_webgym_rl.py \
     reward.custom_reward_function.name=compute_score_webgym_rl \
     +reward.custom_reward_function.reward_kwargs.format_reward_alpha=0.5 \
-    +reward.custom_reward_function.reward_kwargs.format_reward_min_denominator=5 \
+    +reward.custom_reward_function.reward_kwargs.format_reward_tau=2.0 \
+    +reward.custom_reward_function.reward_kwargs.format_reward_gate_by_env_score=True \
     'trainer.logger=["console","wandb"]' \
     trainer.project_name=verl_fully_async_qwen35_webgym_tool_veomni \
     trainer.experiment_name=qwen35_9b_fully_async_webgym_tool \
@@ -116,6 +113,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     rollout.nnodes=1 \
     rollout.n_gpus_per_node=4 \
     rollout.total_rollout_steps=1000 \
+    trainer.total_training_steps=1000 \
     trainer.total_epochs=100 \
     async_training.staleness_threshold=1.0 \
     async_training.trigger_parameter_sync_step=2 \

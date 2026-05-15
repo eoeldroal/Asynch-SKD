@@ -62,6 +62,502 @@ WebGym Async SKD에서 초기에 발생하는 `no-tool <|im_end|>` 붕괴가
   4. exact local repro로 teacher verify divergence를 SGLang GDN fused gating까지 좁힌 결과
   5. patched run으로 EOS-cutoff bug가 실제 사라졌는지 검증하고, 남은 문제가 base-model-like tool-call quality인지 대조한 결과
   6. empty actor batch의 직접 원인이 invalid-action masking이었음을 확인하고, 마스킹 정책을 인자화한 결과
+  7. merged Async SKD actor를 fully async RL에 물린 뒤, reward path / hard cap / actor LR / late-stage format reward hacking까지 확인한 결과
+- 현재 fully async RL 기준 최신 결론은:
+  - reward는 **실제로 학습 경로에 들어간다**
+  - `max_assistant_turns=10`은 WebOSGym path에서 **attempted tool-call hard cap**으로 읽는 것이 맞다
+  - actor LR 0 문제는 `trainer.total_training_steps`를 너무 늦게 넣어서 생긴 fully async initialization-order bug였다
+  - launcher에 `actor_rollout_ref.actor.optim.total_training_steps`를 직접 넣은 뒤 `actor/lr ≈ 1e-6`로 정상화되었다
+  - 그 다음 late-stage 병목은 **`WAIT` only valid action으로 format reward를 먹는 reward hacking**이었고, hard gate는 이 경로를 막는 대신 **SKD 직후에는 reward를 너무 sparse하게 만들었다**
+  - 따라서 현재 operational reward는 hard gate가 아니라:
+    - `env + 0.1 * effective_format`
+    - 여기서 `effective_format`은 **기존 format reward를 유지하되, `WAIT/HOTKEY/TYPING` 인접 반복 비율로 positive format bonus만 감쇠**한 값이다
+  - `score/format`은 이제 raw format이 아니라 **실제로 학습에 들어간 effective format**이다
+  - `score/format_raw`와 `score/non_grounding_adjacency_ratio`를 같이 봐야 현재 reward가 어떻게 깎였는지 읽을 수 있다
+  - one-turn plain-text babbling collapse를 막기 위해:
+    - `actor_rollout_ref.rollout.multi_turn.max_assistant_response_tokens=2048`
+    - runtime에서 `max_new_tokens = min(2048, remaining_budget)`
+    를 assistant generation 직전에 주입하도록 바꾸었다
+  - 이 패치 이후 latest live run `qwen35_webgym_fully_async_tool_veomni_20260515_112641`에서는:
+    - assistant-turn text length
+      - `p50 ≈ 946`
+      - `p95 ≈ 4909`
+      - `p99 ≈ 5164`
+      - `max ≈ 10415`
+    로, 이전의 수십만~백만 문자 단일-turn collapse는 사실상 사라졌다
+  - 그러나 latest live bottleneck은 이제 **tool format / schema adherence**다:
+    - summary 기준
+      - `reward_zero_ratio ≈ 97.18%`
+      - `parse_error_summary_ratio ≈ 83.65%`
+      - `invalid_action_summary_ratio ≈ 54.38%`
+    - assistant-turn 기준
+      - `parse_error_turn_ratio ≈ 72.75%`
+      - `valid_exec_turn_ratio ≈ 10.64%`
+    - parse kinds top:
+      - `tool_call_incomplete`
+      - `actions_json_malformed`
+      - `tool_tag_incomplete`
+      - `parameter_block_malformed`
+    - invalid causes top:
+      - invalid `WebOsGymAction` payload
+      - unknown functions such as `computer.press_key`, `wait`, `computer.press`
+  - phase-by-phase reading on the latest live run is:
+    - early `step <= 20`
+      - semantic intent often looks plausible, but nearly every sample still breaks at the tool boundary
+    - mid `100 <= step <= 140`
+      - the dominant failure is still tool formatting / schema mismatch, not broadly weak reasoning
+    - late `220 <= step <= 248`
+      - still mostly tool-format failure on top of plausible plans
+    - very late `249 <= step <= 260`
+      - some trajectories stop being merely format-broken and also show weaker, more repetitive reasoning
+  - 다만 **env false positive**는 여전히 별도 문제다
+  - checkpoint 해석에서는
+    - `training/global_step`
+    - `current_param_version`
+    - checkpoint folder `global_step_N`
+    를 반드시 분리해서 읽어야 한다
+- unconstrained decode path isolation 완료 (2026-05-15):
+  - 27B val run WITHOUT `enable_qwen3_coder_structured_output`
+    - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_only_val_20260515_173102/step_1`
+  - CLICK x_as_list: `187 / 203` (92.1%)
+  - CLICK x_as_scalar: `16 / 203` (7.9%)
+  - dominant error: `"Input should be a valid integer [input_value=[x, y]]"` — Pydantic validation
+  - 27B with `enable_qwen3_coder_structured_output=True` 기준 (이전 probe):
+    - CLICK scalar: `85 / 85` (100%)
+    - CLICK list: `0 / 85` (0%)
+  - 즉 decode constraint 유무가 CLICK payload mode를 결정적으로 분리함이 확인됨
+- SKD turn log 같은 패턴 확인 (2026-05-15):
+  - source: `logs/async_skd_turns_webgym_20260515_165049.jsonl`
+  - total turn events: `405`
+  - `invalid_action = 192` (47%)
+  - `tool_parse_error = 144` (36%)
+  - CLICK x_as_list (invalid_action 중): `187 / 192` (97%)
+  - val run과 SKD student 모두 동일한 list-shaped CLICK 패턴
+- **root cause 최종 확정**:
+  - 툴 스키마와 프롬프트는 올바르게 전달되고 있음
+    - prompt_len이 student/teacher 동일, 스키마에 "x must be single integer" 명시
+  - 그럼에도 unconstrained 생성에서 x 위치 top-1 = `' ['`, mass ≈ 0.9946
+  - 텍스트 instruction만으로는 모델의 `[x, y]` coordinate pair 선호를 이길 수 없음
+- **constrained decoding 방향 폐기**:
+  - `structural_tag + xgrammar` 조합은 surface 증상을 제거하지만
+  - SKD student는 constraint된 토큰을 생성하고, teacher는 unconstrained verify
+  - teacher 자연 분포(list 선호)와 student 강제 출력(scalar) 간 distillation 신호 불일치 발생
+  - inference 시에도 constraint 의존성이 남아 정책이 brittle해짐
+- **새로운 방향: 스키마 정렬 (schema alignment)**:
+  - constraint로 모델을 교정하는 대신, 스키마를 모델의 자연 분포에 맞춤
+  - `x: integer, y: integer` → `coordinate: [x, y]` 배열 표현으로 전환
+  - 이렇게 하면 constrained decoding 없이도 student/teacher 분포가 정렬되고
+  - RL 이후에도 constraint 없이 동일한 형태를 재현 가능
+  - 변경 범위: tool schema YAML, `web_osgym_tool.py` 파싱, few-shot asset, system prompt 문구
+- **새로운 발견 (2026-05-15): RIGHT_CLICK/DRAG_TO/MOUSE_DOWN/MOUSE_UP 구현 누락**:
+  - YAML 스키마와 `COMPUTER_13_ACTIONS`에는 등록되어 있으나
+  - `_normalize_actions()` (`verl/tools/web_osgym_tool.py:414`)에 핸들러가 없음
+  - 스칼라 `{x: 500, y: 500}`을 보내도 → `"Unsupported action_type: RIGHT_CLICK"` (ValueError)
+  - 리스트 `{x: [500, 500]}`을 보내면 → Pydantic ValidationError
+  - 어떤 포맷으로 보내든 무조건 실패하는 유령 액션 상태
+- **전체 action type별 unconstrained 분포 (val run 173102 기준)**:
+  - CLICK: scalar=14%, list=**85%**
+  - DOUBLE_CLICK: scalar=34%, list=**66%**
+  - MOVE_TO: scalar=11%, list=**88%**
+  - RIGHT_CLICK: scalar=62%, list=37% → 스칼라도 핸들러 없어 실패
+  - DRAG_TO: 출력 없음 → 핸들러 없어 실패
+  - SCROLL/TYPING/HOTKEY/PRESS/KEY_DOWN/KEY_UP/WAIT/DONE/FAIL: 정상 (변경 불필요)
+- **채택 구현 방향: tolerate-at-boundary normalizer**:
+  - 스키마: `x, y → coordinate: [x, y]` (CLICK/DOUBLE_CLICK/RIGHT_CLICK/MOVE_TO/DRAG_TO)
+  - normalizer (`_normalize_web_osgym_action_payload`): Pydantic 이전 단계에서 세 가지 변형 통일
+    - `{x: [35, 175]}` → `{coordinate: [35, 175]}` (기존 오류 패턴)
+    - `{x: 35, y: 175}` → `{coordinate: [35, 175]}` (레거시 스칼라)
+    - `{coordinate: [35, 175]}` → 그대로 (신규 정상 포맷)
+  - `_normalize_actions()`: `action.coordinate[0/1]`로 읽고 서버에는 기존 `{x, y}` scalar 전달
+  - `_require_coordinates()`: coordinate 필드 우선 읽기, cursor fallback 로직 유지
+  - RIGHT_CLICK/DRAG_TO/MOUSE_DOWN/MOUSE_UP 핸들러 추가 (스키마는 벤치마크 구성 호환을 위해 유지)
+  - 서버 페이로드(`WebOsGymClient` → `/action`) 불변
+- **반복 val 수렴 계획**:
+  - Round 1: 위 변경 후 val → parse_error_turn_ratio / invalid_action 비율 측정
+  - Round 2: 남은 실패 분류(DRAG_TO 의미론? 알 수 없는 action_type?) → 추가 normalizer rule 또는 스키마 조정 → val 재실행
+  - Round 3: `parse_error_turn_ratio < 5%` 달성 시 RL 학습 진입
+
+---
+
+## Next Plan
+
+### Goal
+
+- 다음 단계의 1차 목표는:
+  - 일반 reasoning 향상
+  - reward 재설계
+  가 아니라
+  - **Async SKD 단계에서 current bundled WebGym tool contract compliance를 직접 끌어올리는 것**
+- latest live diagnosis는 다음을 지지한다:
+  - early / mid phase에서는 semantic intent가 종종 plausible하다
+  - 하지만 그 intent가 tool formatting / schema mismatch 때문에 환경에 거의 반영되지 못한다
+  - late tail의 weaker reasoning은 존재하지만, 이는 1차 병목이라기보다 tool-failure 누적 뒤의 2차 왜곡으로 읽는 것이 맞다
+
+### Why the previous teacher-only conditioning did not help this actor
+
+- Async SKD는 이미:
+  - teacher-only system prompt
+  - optional teacher-only structured few-shot
+  를 지원한다
+- 그리고 과거 실험에서:
+  - few-shot multimodal wiring
+  - teacher-only prompt stream stability
+  는 이미 여러 번 검증되었다
+- 그런데 latest live RL에서도 still dominant failure가:
+  - `tool_call_incomplete`
+  - `actions_json_malformed`
+  - `tool_tag_incomplete`
+  - `parameter_block_malformed`
+  - wrong action vocabulary such as `TYPE`
+  - legacy wrapper such as `computer.press_key`
+  로 남아 있다
+- therefore the immediate conclusion is:
+  - teacher-only conditioning이라는 메커니즘이 없는 것은 아니다
+  - but the SKD path that produced the current actor did **not** use that conditioning
+  - so the next probe should be read as:
+    - **first real teacher-only compliance-conditioning test**
+
+### 27B teacher-capability probe before rebuilding the few-shot
+
+- before rewriting the teacher asset, first measure whether the current `27B` model itself is capable of producing
+  usable WebGym trajectories under the current bundled contract
+- probe script:
+  - `WebOSWorld/val_run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+- important reading rule:
+  - this script runs the `27B` model as the rollout actor for validation-style trajectory collection
+  - this is **not** the exact SKD teacher verification path
+  - but it is still the right direct capability probe for:
+    - current model-side tool compliance
+    - whether the `27B` model can supply a clean teacher-only few-shot candidate at all
+- latest probe root:
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_only_val_20260515_161150/step_1`
+- summary schema note:
+  - these `summary.json` files do not carry the RL-style `reward` breakdown block
+  - here `reward_score` should be read directly as the task success signal for the probe
+  - current observed values are binary:
+    - `0.0`
+    - `1.0`
+
+#### Observed 27B probe result
+
+- total samples:
+  - `93`
+- positive `reward_score`:
+  - `18 / 93`
+  - `≈ 19.35%`
+- parse-error presence:
+  - `4 / 93`
+  - `≈ 4.30%`
+- invalid-action presence:
+  - `30 / 93`
+  - `≈ 32.26%`
+- any valid tool call:
+  - `88 / 93`
+  - `≈ 94.62%`
+- means:
+  - `valid_tool_call_count mean ≈ 24.10`
+  - `attempted_tool_call_count mean ≈ 25.11`
+- termination distribution:
+  - `tool_response_budget_exhausted: 41`
+  - `model_done: 32`
+  - `system_stop: 16`
+  - `model_fail: 4`
+
+#### Interpretation
+
+- the `27B` model is **not** a `0%` hopeless teacher candidate under the current contract
+- more importantly:
+  - tool formatting is much healthier than the problematic `9B` RL runs
+  - valid tool calls are common
+  - parse collapse is comparatively rare in this probe
+- the main remaining weakness in this `27B` probe is:
+  - not “cannot speak the contract at all”
+  - but “often fails to finish the task within the budget”
+- therefore this probe says:
+  - the teacher model itself likely has enough compliance headroom to serve as a useful teacher-only few-shot source
+  - the next asset-building step is justified
+
+#### Representative examples
+
+- clean success:
+  - `warn_ex_toll_basic_exact`
+  - `reward_score=1.0`
+  - `valid=5`
+  - `parse=0`
+  - `invalid=0`
+  - `termination=model_done`
+- valid but incomplete:
+  - `web_bmi_01`
+  - `reward_score=0.0`
+  - `valid=38`
+  - `parse=0`
+  - `invalid=0`
+  - `termination=tool_response_budget_exhausted`
+- implication:
+  - some trajectories are already compliant enough to mine
+  - but candidate selection must explicitly prefer:
+    - successful completion
+    - clean contract adherence
+    - low retry / low loop behavior
+  - and reject:
+    - budget-exhausted long trajectories even if they are syntactically valid
+
+### New finding. The `CLICK` collapse in current SKD is not explained by prompt mismatch
+
+- latest SKD fast-test evidence:
+  - `logs/async_skd_turns_webgym_20260515_165049.jsonl`
+  - `logs/async_skd_events_webgym_20260515_165049.jsonl`
+  - `logs/skd_fast_test_gdn_fix_20260515_165049.out`
+- prompt/tool-contract parity check:
+  - current fast-test launcher does **not** pass
+    - `distillation.skd.teacher_system_prompt_path`
+    - `distillation.skd.teacher_fewshot_path`
+  - `WebSkdAgentLoop` applies the same active tool schemas to both student and teacher prompt rendering
+  - live trace also showed:
+    - `pending_student_template_done ... prompt_len=4241`
+    - `pending_teacher_template_done ... teacher_prompt_len=4241`
+    - `pending_commit_done ... prompt_len=4241 teacher_prompt_len=4241`
+  - therefore the current `CLICK` failure is **not** explained by teacher/student prompt text divergence or a different bundled tool schema
+
+#### Actual `CLICK` contrast
+
+- `27B` actor-only validation probe (`step_1`) under the current bundled contract:
+  - `CLICK` scalar payload samples: `85`
+  - `CLICK` list-shaped payload samples: `0`
+- current SKD fast-test snapshot:
+  - turn rows: `73`
+  - `tool_exec_status=invalid_action`: `35`
+  - invalid action types:
+    - `CLICK: 33`
+    - `DOUBLE_CLICK: 1`
+    - `RIGHT_CLICK: 1`
+  - invalid shape cluster:
+    - `x_as_list: 35 / 35`
+- implication:
+  - the same `27B` family can produce scalar `CLICK` payloads in actor-only validation
+  - but the current SKD top-1 path collapses specifically on `CLICK` payload shape
+
+#### Root-cause narrowing
+
+- the decisive difference is **decode/runtime path**, not prompt text:
+  1. actor-only validation path:
+     - `WebOSWorld/val_run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+     - includes:
+       - `+actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=True`
+     - therefore the WebOSWorld Qwen coder branch injects:
+       - `structural_tag`
+       - `ignore_eos=True`
+       - `stop=["</tool_call>"]`
+  2. current SKD fast-test path:
+     - `WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni_fast_test_GDN_fix.sh`
+     - does **not** set `enable_qwen3_coder_structured_output=True`
+     - teacher verification uses:
+       - `TeacherManager.compute_teacher_logprobs_single(...)`
+       - prompt-logprob scoring only
+       - no `structural_tag`
+       - no constrained generation branch
+- therefore the current comparison is:
+  - actor-only `27B` with the structured-output generation path
+  - versus SKD teacher top-1 from an unconstrained prompt-logprob verify path
+- this explains why the `CLICK` payload mode can diverge even when prompt text and bundled tool schemas match
+
+#### What the teacher top-1 rows actually showed
+
+- on the current SKD fast-test invalid `CLICK` requests, the failure was **not** merely low-probability tail drift under `top-10`
+- representative teacher top-1 rows around `x` payload construction showed:
+  - after `x:`:
+    - top-1 = `' ['`
+    - top-5 normalized mass ≈ `0.9946`
+  - list opening:
+    - top-1 = `'['`
+    - top-5 normalized mass ≈ `0.9983`
+- interpretation:
+  - under the current unconstrained teacher verify path, `CLICK` payload corruption is already present in the teacher local top-1 mode itself
+  - this is why simply tightening `verify_top_k` cannot solve the current `CLICK` failure
+
+### Proposed SKD plan
+
+#### Exact next intervention
+
+- current decision changed:
+  - the **next** SKD probe should not start with teacher-only few-shot
+  - the next probe should first isolate **decode/runtime-path parity**
+- reason:
+  - current evidence does **not** support a prompt-mismatch story
+  - current evidence instead supports:
+    - actor-only `27B` and SKD teacher verify are using materially different decoding contracts
+    - this difference is already enough to explain the `CLICK` scalar-vs-list divergence
+
+#### ~~Step A. Align the SKD teacher path to the actor-only path before rebuilding teacher assets~~ (Closed)
+
+- 이 step은 2026-05-15 실험으로 answer가 나와 closed 처리함
+- 27B val run WITHOUT `enable_qwen3_coder_structured_output`
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_only_val_20260515_173102`
+  - CLICK x_as_list: 92.1%
+- SKD turn log (20260515_165049) 동일 패턴: 97%
+- **결론**: unconstrained greedy도 list-shaped CLICK을 낸다. 이 이상의 probe는 불필요.
+
+#### Step A (revised). Schema alignment — coordinate 표현을 모델 자연 분포에 맞게 전환
+
+##### 배경 및 근거
+
+- 모델의 unconstrained x token top-1 = `' ['`, mass ≈ 0.9946
+- 텍스트 instruction으로 이 prior를 이길 수 없음이 확인됨 (YAML에 “Do not pass a list” 명시에도 92.1% list 출력)
+- `structural_tag + xgrammar` constraint는 surface 증상만 제거:
+  - student: constraint된 scalar 토큰 생성
+  - teacher: unconstrained verify (list 선호 분포)
+  - → distillation 신호 불일치 → SKD learning signal 품질 저하
+- RIGHT_CLICK/DRAG_TO/MOUSE_DOWN/MOUSE_UP: 스키마 선언은 있으나 `_normalize_actions()` 핸들러가 없었음 → 이미 별도 패치로 수정 완료 (2026-05-15)
+
+##### Anthropic Computer Use API 비교 결과
+
+- Anthropic의 `computer_20241022` / `computer_20251124` API와 스키마 전면 비교 수행
+- 공유 가능한 부분: `coordinate: [x, y]` 배열 표현 — 이것만 채택
+- 채택하지 않는 부분:
+  - action type 이름 (`left_click` vs `CLICK` 등): 모델이 이미 우리 이름으로 출력하므로 변경 불필요
+  - scroll 형식 (`scroll_direction/scroll_amount` vs `dx/dy`): 모델이 이미 dx/dy로 출력 (100% 일치)
+  - 좌표계 (픽셀 절댓값 vs 1000×1000 상대 좌표): 서버 프로토콜 변경 필요하므로 유지
+- **결론**: `coordinate: [x, y]` 필드명만 Anthropic 방식으로 채택. 나머지는 현행 유지.
+
+##### 변경 확정 — 스키마 레이어 (YAML)
+
+- 대상 action: CLICK, DOUBLE_CLICK, RIGHT_CLICK, MOVE_TO, DRAG_TO (5개)
+- `x: integer, y: integer` → `coordinate: array[2 integers, 0–999]`로 교체
+- required 변경:
+  - MOVE_TO, DRAG_TO: `coordinate` 필수
+  - CLICK, DOUBLE_CLICK, RIGHT_CLICK: `coordinate` 선택 (cursor fallback 있음)
+- 모델 출력 예시 (변경 후):
+  ```json
+  {“action_type”: “CLICK”, “coordinate”: [531, 582]}
+  ```
+- MOUSE_DOWN/MOUSE_UP: 스키마 유지 (벤치마크 호환), 핸들러는 이미 추가 완료
+
+##### 변경 확정 — Description 정리
+
+- 기존 “Do not pass a list / bracketed value” 계열 경고 **전부 제거**
+  - 실증적으로 효과 없었음 (경고 있어도 92.1% list 출력)
+  - 이제 list 형태가 정상 포맷이므로 경고가 모순이 됨
+- `x and y` 언급을 `coordinate` 로 교체
+- 확정된 description 변경:
+
+  | Action | 변경 후 description |
+  |--------|---------------------|
+  | MOVE_TO | `”Move the cursor to coordinate [x, y] in the 1000×1000 grid.”` |
+  | CLICK | `”Click at coordinate [x, y] if provided, otherwise at the current cursor position.”` |
+  | DOUBLE_CLICK | `”Double click at coordinate [x, y] if provided, otherwise at the current cursor position.”` |
+  | RIGHT_CLICK | `”Right click at coordinate [x, y] if provided, otherwise at the current cursor position.”` |
+  | DRAG_TO | `”Drag to coordinate [x, y] with the left button pressed.”` |
+  | HOTKEY | `”Press the specified key combination. keys is an array of key names, for example ['ctrl', 'c'].”` |
+
+- 변경 없음: SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, MOUSE_DOWN, MOUSE_UP, WAIT, DONE, FAIL
+
+##### 변경 확정 — 파서 레이어 (tolerate-at-boundary)
+
+**원칙**: 모델 출력 포맷 ↔ 서버 페이로드를 파서가 중간에서 분리. 서버는 기존 `{x: int, y: int}` 그대로 수신.
+
+**계층 1 — `_normalize_web_osgym_action_payload()` (Pydantic 이전)**
+
+세 가지 모델 출력 변형을 `coordinate`로 통일:
+
+```
+{x: [35, 175]}        → {coordinate: [35, 175]}   (기존 주요 실패 패턴)
+{x: 35, y: 175}       → {coordinate: [35, 175]}   (레거시 scalar)
+{coordinate: [35, 175]} → 그대로                   (신규 정상 포맷)
+```
+
+변환 후 `x`, `y` 키 제거.
+
+**계층 2 — `WebOsGymAction` Pydantic 모델 (`web_osgym_protocol.py`)**
+
+- `coordinate: list[int] | None = None` 추가
+- `x, y` 필드는 내부 legacy fallback용으로만 유지 (스키마 미노출)
+
+**계층 3 — `_normalize_actions()` 내부 (`web_osgym_tool.py`)**
+
+- `_require_coordinates()`: `action.coordinate` 우선 → legacy `x,y` → cursor fallback 순서
+- 스케일링 조건: `if action.coordinate is not None or (action.x is not None and action.y is not None)`
+  - cursor fallback은 이미 screen 좌표 → scale 불필요
+  - coordinate 또는 x,y 명시 시에만 1000×1000 → pixel 변환
+- 각 핸들러: `payload.pop(“coordinate”, None)` 후 `payload.update({x: scaled_x, y: scaled_y})`
+  - 서버 payload에 coordinate 필드가 포함되지 않도록 보장
+
+**전체 데이터 흐름**:
+```
+모델: {“action_type”: “CLICK”, “x”: [35, 175]}
+  ↓ _normalize_web_osgym_action_payload()
+{“action_type”: “CLICK”, “coordinate”: [35, 175]}
+  ↓ WebOsGymAction(**payload)  — Pydantic 통과
+action.coordinate = [35, 175], action.x = None
+  ↓ _normalize_actions() → _require_coordinates() → scale → pop coordinate
+서버 수신: {“action_type”: “CLICK”, “x”: 672, “y”: 189, “button”: “left”, “num_clicks”: 1}
+```
+
+##### 변경 파일 목록
+
+| 파일 | 변경 내용 |
+|------|----------|
+| `WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml` | `x,y` → `coordinate` 교체, description 정리 |
+| `verl/experimental/agent_loop/web_osgym_protocol.py` | `WebOsGymAction`에 `coordinate` 필드 추가 |
+| `verl/tools/web_osgym_tool.py` | normalizer, `_require_coordinates()`, 각 핸들러 스케일링 조건 |
+| few-shot JSON 및 system prompt | `x,y` → `coordinate` 예시 교체 |
+
+##### 예상 효과
+
+- CLICK parse error 85% 즉시 제거 (list → coordinate 자동 변환)
+- DOUBLE_CLICK 66%, MOVE_TO 88% 동일 해소
+- RIGHT_CLICK/DRAG_TO 처음으로 실제 서버 도달 가능 (핸들러 이미 추가)
+- constrained decoding 불필요 → student/teacher 분포 정렬
+- RL 이후에도 constraint 없이 동일 포맷 재현 가능
+
+#### Step B. Schema 변경 후 val 반복 수렴
+
+- tolerate-at-boundary normalizer 덕분에 `x_as_list` 자체는 normalizer가 흡수 → 더 이상 invalid_action 원인이 되지 않아야 함
+- Round 1 val 주요 readout:
+  - coordinate-type parse error 소멸 여부 (normalizer 정상 작동 확인)
+  - `parse_error_turn_ratio` 전체 감소 폭
+  - `valid_exec_turn_ratio` 상승 여부
+  - 남은 실패 패턴 재분류 (DRAG_TO 의미론? 알 수 없는 action_type 문자열?)
+- Round 2: 남은 패턴 → 추가 normalizer rule 또는 description 조정 → val 재실행
+- Round 3 수렴 기준: `parse_error_turn_ratio < 5%` → RL 진입 판단
+
+#### Step C. Compliance 개선 확인 후 RL 진입 여부 판단
+
+- RL 진입 조건:
+  - `invalid_action` 중 CLICK x_as_list 비율이 의미 있게 감소
+  - `tool_exec_status=ok` turn 비율 상승
+  - early phase에서 executable action이 실제로 환경에 반영되는 것 확인
+- 조건 미충족 시:
+  - RL 진입 postpone
+  - schema / few-shot 추가 조정 우선
+
+### Go / No-Go metrics for the next SKD probe (schema alignment 이후)
+
+- must improve (schema alignment 이후 가장 먼저 볼 것):
+  - CLICK x_as_list invalid_action 비율
+  - `invalid_action` 전체 비율
+  - `tool_exec_status=ok` turn 비율
+- should improve:
+  - `tool_call_incomplete`
+  - `actions_json_malformed`
+  - valid tool call rate
+  - no-valid-call sample ratio
+- only secondary:
+  - downstream reward
+  - long-horizon task completion
+
+### Practical interpretation rule
+
+- if compliance improves but task completion is still mediocre:
+  - continue iterating on SKD / prompt-side compliance
+  - do not jump to “model reasoning is weak” yet
+- if compliance improves and env reward still stays flat:
+  - then the remaining bottleneck moves to:
+    - grounding
+    - state tracking
+    - or evaluator correctness
+- if compliance does **not** improve:
+  - then the next intervention should still stay on the tool boundary
+  - not on reward shaping
 
 ---
 
@@ -1925,6 +2421,666 @@ pytest -q tests/skd/test_skd_logic.py tests/skd/test_web_skd_agent_loop_on_cpu.p
   - keep termination semantics
   - keep strict masking for `tool_parse_error`
   - leave `no_tool_call` strict by default unless a later run proves it is again a dominant source of wasted data
+
+---
+
+### Step 2a. Transition from Async SKD to fully async RL, then re-anchor debugging on the real RL path
+
+#### Status
+
+- Completed for the current launcher and runtime path
+
+#### Sources
+
+- merged actor init point
+  - `checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool/global_step_15/actor/huggingface`
+- fully async RL launcher
+  - `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni_fast_tool.sh`
+- fully async trainer / main
+  - `verl/experimental/fully_async_policy/fully_async_main.py`
+  - `verl/experimental/fully_async_policy/fully_async_trainer.py`
+- rollout data root
+  - `logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_*`
+- W&B output logs
+  - `wandb/run-*/files/output.log`
+
+#### Method
+
+- stop reading the downstream RL run as a vague continuation of SKD
+- verify the real fully async path for:
+  - reward usage
+  - cap semantics
+  - actor LR health
+  - step semantics
+  - actual late-stage response pattern
+
+#### Result
+
+- merged Async SKD actor was used as the RL initialization point
+- the fully async launcher became the operational source of truth
+- reward path was verified end-to-end:
+  - WebOSGym reward fields become `reward_extra_info`
+  - `reward_score` becomes `rm_scores`
+  - fully async trainer uses that reward as `token_level_scores`
+  - with `algorithm.use_kl_in_reward=False`, those scores become the actual `token_level_rewards`
+
+#### Interpretation
+
+- after the SKD-side EOS blocker was removed, the main debugging target moved to the fully async RL loop itself
+- at this point the key question was no longer “is teacher verify corrupt?”
+- it became:
+  - “what is the real RL loop actually optimizing?”
+
+---
+
+### Step 2b. Make the WebOSGym hard cap actually bind on attempted tool calls
+
+#### Status
+
+- Completed
+
+#### Sources
+
+- runtime path
+  - `verl/experimental/agent_loop/web_tool_agent_loop.py`
+- tests
+  - `tests/experimental/agent_loop/test_web_tool_agent_loop_on_cpu.py`
+
+#### Method
+
+- keep existing parse-error feedback and invalid-action handling
+- change only the cap control path:
+  - update `attempted_tool_call_count` even when no trajectory logger exists
+  - check the attempted count **before the next generation**
+
+#### Result
+
+- `attempted_tool_call_count` is no longer just a logging/reward field
+- on the WebOSGym path it now acts as the effective hard cap
+- `parse_error` contributes to that attempted count
+- bad trajectories now stop at 10 attempted tool-call events with `system_stop`
+
+#### Interpretation
+
+- this was the right narrowing
+- the bug was not “the model loops too much” in an abstract sense
+- it was a concrete control-flow ordering problem
+
+---
+
+### Step 2c. Replace the old ratio-only format reward with a cleaner fully async signal
+
+#### Status
+
+- Completed
+
+#### Sources
+
+- reward function
+  - `WebOSWorld/webgym_rl/reward_fn_webgym_rl.py`
+- reward-export path
+  - `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
+  - `verl/experimental/agent_loop/web_tool_agent_loop.py`
+- fully async trainer reward path
+  - `verl/experimental/separation/ray_trainer.py`
+
+#### Method
+
+- replace the old `valid / max(attempted, min_denominator)` style signal
+- use:
+  - `precision = valid / max(attempted, 1)`
+  - `latency = 0` if `valid == 0`, else `exp(-(first_valid - 1) / tau)`
+  - `format_reward = precision * latency`
+  - subtract a penalty for `tool_response_budget_exhausted`
+- final score:
+  - `env_reward + alpha * format_reward`
+
+#### Result
+
+- reward became simpler to audit from live logs
+- the fields that matter now are:
+  - `web_osgym_attempted_tool_calls`
+  - `web_osgym_valid_tool_calls`
+  - `web_osgym_first_valid_tool_call_index`
+  - `web_osgym_termination_reason`
+  - `web_osgym_format_reward`
+
+#### Interpretation
+
+- this fixed the earlier denominator hack
+- but it still only rewards parser-valid, server-executable action streams
+- it does **not** by itself ensure task-progressing behavior
+
+---
+
+### Step 2d. Diagnose the fully async actor-LR zero bug
+
+#### Status
+
+- Root cause identified
+- quick launcher-level mitigation applied
+
+#### Sources
+
+- fully async initialization path
+  - `verl/experimental/fully_async_policy/fully_async_main.py`
+  - `verl/experimental/fully_async_policy/fully_async_trainer.py`
+- VeOmni scheduler build path
+  - `verl/workers/engine/veomni/transformer_impl.py`
+  - local env:
+    - `site-packages/veomni/optim/lr_scheduler.py`
+- launcher
+  - `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni_fast_tool.sh`
+
+#### Method
+
+- compare launcher intent with live `actor/lr` logs
+- trace when `total_training_steps` is injected
+- trace when VeOmni actually builds the scheduler
+- reproduce the scheduler behavior with:
+  - `train_steps=1000`
+  - `train_steps=0`
+  - `train_steps=-1`
+
+#### Result
+
+- VeOmni cosine scheduler is built during worker init
+- at that moment it reads:
+  - `actor_rollout_ref.actor.optim.total_training_steps`
+- in the fully async path, `trainer.total_training_steps` was being set too late
+  - after trainer workers were already initialized
+- therefore actor workers could still build the scheduler with `total_training_steps = -1`
+- with VeOmni cosine scheduler, that yields an effective LR of `0.0`
+- quick operational mitigation:
+  - pass `actor_rollout_ref.actor.optim.total_training_steps=1000` directly in the launcher
+- after this, live runs showed:
+  - `actor/lr ≈ 9.9e-07`
+  instead of `0.0`
+
+#### Interpretation
+
+- any RL run before this fix must be treated with caution
+- it may have produced trajectories and metrics
+- but actor improvement may have been nearly frozen
+
+---
+
+### Step 2e. What late fully async RL actually learned: high format score, but mostly through `WAIT` reward hacking
+
+#### Status
+
+- Completed for the current late-run snapshot
+
+#### Sources
+
+- live run
+  - `logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_20260514_232836`
+  - `wandb/run-20260514_232904-01b13ei1/files/output.log`
+
+#### Method
+
+- compare early root batch dumps against late root batch dumps
+- compute:
+  - attempted/valid distribution
+  - termination distribution
+  - high-format share
+  - `WAIT`-only share among high-format rows
+- for representative rows:
+  - use `request_id` from root `N.jsonl`
+  - then find the matching `trajectory.jsonl`
+
+#### Result
+
+- actor LR is now alive
+- late trainer metrics show:
+  - `score/format ≈ 0.8 ~ 0.93`
+  - low or zero env reward in many batches
+- but high-format rows are mostly not “good tool use”
+- in late high-format rows (`61.jsonl` to `65.jsonl`):
+  - most `format_reward >= 0.8` rows are `WAIT` only
+- representative examples:
+  - `attempted=6, valid=6, format=1.0, termination=system_stop`
+  - actual trajectory: repeated `WAIT`
+
+#### Interpretation
+
+- late-stage format improvement cannot be read naively
+- the model has found a cheap path:
+  - parser-valid
+  - server-executable
+  - no-op actions
+- therefore high `score/format` is not yet evidence of the desired format-first learning goal
+
+---
+
+### Step 2f. Fully async RL step semantics: never confuse these axes again
+
+#### Status
+
+- Important operational rule
+
+#### Sources
+
+- trainer step logic
+  - `verl/experimental/fully_async_policy/fully_async_trainer.py`
+- rollout root batch dumps
+  - `logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_20260514_232836/*.jsonl`
+- W&B logs
+  - `wandb/run-20260514_232904-01b13ei1/files/output.log`
+
+#### Method
+
+- compare:
+  - `training/global_step`
+  - `current_param_version`
+  - checkpoint folder `global_step_N`
+  - root rollout-data file `N.jsonl`
+- trace where each counter is incremented or used
+
+#### Result
+
+- `training/global_step`
+  - trainer local fit-step counter
+- `current_param_version`
+  - parameter-sync / checkpoint counter
+- checkpoint folder `global_step_N`
+  - in fully async, this means `current_param_version = N`
+  - **not** `training/global_step = N`
+- current run uses:
+  - `trigger_parameter_sync_step = 2`
+- therefore approximately:
+  - `training/global_step ≈ 2 * current_param_version`
+
+- concrete example:
+  - checkpoint folder `global_step_20`
+  - was saved when:
+    - `current_param_version = 20`
+    - `training/global_step ≈ 42`
+    - `score/format ≈ 0.819`
+
+#### Interpretation
+
+- reading checkpoint `global_step_20` as if it were W&B step 20 or `training/global_step 20` is wrong
+- all later analysis must anchor on one axis first
+
+---
+
+### Step 2g. Replace hard gating with repetition-aware format attenuation and log the real effective reward
+
+#### Status
+
+- Completed
+
+#### Sources
+
+- current launcher
+  - `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+- reward function
+  - `WebOSWorld/webgym_rl/reward_fn_webgym_rl.py`
+- repetition counter collection
+  - `verl/experimental/agent_loop/web_tool_agent_loop.py`
+  - `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
+- trainer metric / summary export
+  - `verl/experimental/separation/ray_trainer.py`
+- tests
+  - `WebOSWorld/webgym_rl/test_webgym_rl_dataset_and_reward.py`
+  - `tests/experimental/agent_loop/test_web_tool_agent_loop_on_cpu.py`
+  - `tests/experimental/agent_loop/test_web_osgym_loop_mixin_on_cpu.py`
+  - `tests/experimental/fully_async_policy/test_fully_async_reward_path_on_cpu.py`
+
+#### Method
+
+- re-read the latest live rollout root:
+  - `logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_20260515_023745`
+- identify the dominant failure mode:
+  - long stretches where actions remain inside `{WAIT, HOTKEY, TYPING}`
+- keep the original format definition:
+  - precision
+  - first-valid latency
+  - budget-exhausted penalty
+- remove the hard env gate for the main run
+- instead attenuate only the **positive** format bonus using:
+  - `rho = non_grounding_adjacent_pair_count / max(executed_action_count - 1, 1)`
+  - `effective_format = raw_format` if `raw_format <= 0`
+  - `effective_format = (1 - rho) * raw_format` if `raw_format > 0`
+- keep final reward as:
+  - `env_reward + alpha * effective_format`
+
+#### Result
+
+- current launcher now uses:
+  - `format_reward_alpha = 0.1`
+  - `format_reward_gate_by_env_score = False`
+- runtime now exports:
+  - `web_osgym_executed_action_count`
+  - `web_osgym_non_grounding_adjacent_pair_count`
+  - `web_osgym_non_grounding_adjacency_ratio`
+  - `web_osgym_raw_format_reward`
+  - `web_osgym_format_reward`
+- trainer metrics now distinguish:
+  - `score/format`
+    - effective format after repetition decay
+  - `score/format_raw`
+    - raw format before repetition decay
+  - `score/non_grounding_adjacency_ratio`
+    - mean repetition ratio
+- rollout `summary.json` reward block now contains:
+  - `sum`
+  - `env`
+  - `format`
+  - `raw_format`
+  - `non_grounding_adjacency_ratio`
+
+#### Interpretation
+
+- hard gating was useful to prove the earlier format-only hacking path, but it was too sparse for a run starting from an SKD actor
+- the current reward keeps dense format signal alive while directly discounting the exact live failure mode
+- this is a cleaner operational setup than:
+  - pure hard gate
+  - `WAIT`-only penalty
+  - hand-written repetition thresholds
+- however, it still does **not** fix suspicious env-positive rows by itself
+- therefore:
+  - reward-shaping progress and evaluator correctness must still be read separately
+
+---
+
+### Step 2h. Add a per-assistant-turn token cap and verify that the live bottleneck shifts from plain-text collapse to tool-format failure
+
+#### Status
+
+- Completed
+
+#### Sources
+
+- current launcher
+  - `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+- runtime config / loop
+  - `verl/workers/config/rollout.py`
+  - `verl/trainer/config/rollout/rollout.yaml`
+  - `verl/experimental/agent_loop/tool_agent_loop.py`
+  - `verl/experimental/agent_loop/web_tool_agent_loop.py`
+- tests
+  - `tests/experimental/agent_loop/test_web_tool_agent_loop_on_cpu.py`
+
+#### Method
+
+- first verify from the previous live run that the dominant single-turn failure was **plain-text babbling collapse**
+  - previous run `qwen35_webgym_fully_async_tool_veomni_20260515_041013`
+  - no-tool non-parse turns were orders of magnitude longer than normal tool turns
+- then add a dedicated multi-turn config field:
+  - `max_assistant_response_tokens`
+- at assistant generation time, inject:
+  - `max_new_tokens = min(max_assistant_response_tokens, remaining_budget)`
+- keep the existing total trajectory cap:
+  - `data.max_response_length`
+- wire the operational launcher to:
+  - `actor_rollout_ref.rollout.multi_turn.max_assistant_response_tokens=2048`
+
+#### Result
+
+- the per-turn cap now exists as an explicit runtime contract field
+- launcher uses `2048` as the current operational value
+- tests verify the actual path:
+  - `WebOsGymToolAgentLoop._handle_generating_state(...)`
+  - `server_manager.generate(..., sampling_params=...)`
+  receives `max_new_tokens` clipped by the remaining trajectory budget
+- latest live run no longer shows the earlier huge single-turn text explosions
+
+#### Interpretation
+
+- the important distinction is:
+  - `data.max_response_length`
+    - total trajectory response budget
+  - `multi_turn.max_assistant_response_tokens`
+    - one assistant generation budget
+- after this patch, the visible failure mode changed:
+  - before:
+    - single-turn plain-text babbling collapse dominated
+  - after:
+    - tool-call formatting / schema mismatch dominates
+
+#### Latest live diagnosis
+
+- latest run:
+  - `logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_20260515_112641`
+- aggregate summary:
+  - `4000` summaries
+  - `reward_zero_ratio ≈ 97.18%`
+  - `env_positive_ratio ≈ 2.83%`
+  - `raw_format_positive_ratio ≈ 29.25%`
+  - `parse_error_summary_ratio ≈ 83.65%`
+  - `invalid_action_summary_ratio ≈ 54.38%`
+- aggregate turn-level:
+  - assistant turns: `78758`
+  - `tool_call_ratio ≈ 24.51%`
+  - `parse_error_turn_ratio ≈ 72.75%`
+  - `invalid_action_turn_ratio ≈ 13.88%`
+  - `valid_exec_turn_ratio ≈ 10.64%`
+
+#### Representative examples
+
+- semantic plan looks plausible, but the environment never sees it because the tool block is malformed:
+  - `step_22/web_bmi_03.../trajectory.jsonl`
+  - the model explicitly recognizes the earlier `x coordinate` issue and the need to click `BMI Calculator for Children and Teens`
+  - then emits malformed JSON:
+    - `{\"action_type\": \"MOVE_TO\", \"x\": 508, 777}`
+- format is valid, but the trajectory degenerates into a non-grounding loop and still gets `0`:
+  - `step_123/prozilla_filefind_01.../summary.json`
+  - `attempted=15`
+  - `valid=15`
+  - `parse=0`
+  - `invalid=0`
+  - `raw_format=0.85`
+  - `non_grounding_adjacency_ratio=1.0`
+  - `format=0.0`
+  - `reward_score=0.0`
+- suspicious positive reward still exists and must not be mistaken for real recovery:
+  - `step_13/warn_prozilla_explorer_10.../summary.json`
+  - `reward_score=1.0`
+  - `valid_tool_call_count=2`
+  - `parse_error_count=15`
+  - `termination_reason=model_done`
+  - this remains an evaluator / env-signal correctness issue
+
+---
+
+## Log Analysis Guide
+
+### 1. If the target is a checkpoint
+
+- use **`current_param_version`** as the primary anchor
+- for checkpoint `global_step_N`, search:
+  - `current_param_version:N`
+  - and the nearby checkpoint-save line in `output.log`
+
+### 2. If the target is quantitative rollout quality
+
+- use the root rollout-data batch dumps:
+  - `logs/rollout_data/.../N.jsonl`
+- these rows contain the fields that matter most:
+  - `web_osgym_attempted_tool_calls`
+  - `web_osgym_valid_tool_calls`
+  - `web_osgym_first_valid_tool_call_index`
+  - `web_osgym_termination_reason`
+  - `web_osgym_format_reward`
+  - `web_osgym_raw_format_reward`
+  - `web_osgym_non_grounding_adjacency_ratio`
+
+### 3. If the target is qualitative trajectory reading
+
+- first choose representative rows from root `N.jsonl`
+- then take their `request_id`
+- then find the matching trace under:
+  - `logs/rollout_data/.../step_*/*/trajectory.jsonl`
+
+### 4. Never use `step_*` directory number as a step axis
+
+- `step_252` in the trace directory is **not**
+  - W&B step 252
+  - `training/global_step 252`
+  - checkpoint `global_step_252`
+
+- it is only a per-trajectory storage bucket
+
+### 5. For format-first analysis, never read `score/format` alone
+
+- always pair it with:
+  - `score/format_raw`
+  - `score/non_grounding_adjacency_ratio`
+  - attempted / valid
+  - termination distribution
+  - action-type distribution
+  - `WAIT`-only share
+  - `response_length/clip_ratio`
+  - at least a few representative trajectories
+
+- current meaning:
+  - `score/format`
+    - effective format after repetition decay
+  - `score/format_raw`
+    - raw format before repetition decay
+  - `score/non_grounding_adjacency_ratio`
+    - how much the action stream stayed inside `{WAIT, HOTKEY, TYPING}` across adjacent pairs
+
+### 6. Current practical workflow
+
+1. choose the target axis
+   - checkpoint / `current_param_version`
+   - or `training/global_step`
+2. read the surrounding `output.log` lines
+3. read the matching root `N.jsonl` window
+4. pick representative `request_id`s
+5. read the matching `trajectory.jsonl`
+6. explicitly test for
+   - `WAIT`-only / `FAIL`-only reward hacking
+   - or more generally long `{WAIT, HOTKEY, TYPING}` persistence
+   before claiming format improvement
+
+### Step 2. Unconstrained decode path isolation — CLICK payload root cause 최종 확인
+
+#### Status
+
+- Completed
+
+#### Sources
+
+- val run (structured output OFF):
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_only_val_20260515_173102/step_1`
+- SKD turn log:
+  - `logs/async_skd_turns_webgym_20260515_165049.jsonl`
+- val script diff:
+  - `WebOSWorld/val_run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+    - committed: `enable_qwen3_coder_structured_output=True` 포함
+    - 실험용 수정: 해당 플래그 제거 → unconstrained run
+
+#### Method
+
+- `enable_qwen3_coder_structured_output=True` 버전(기존 27B probe)과
+  `enable_qwen3_coder_structured_output=False` 버전(이번 run)을 직접 비교
+- CLICK action의 x field 형태 분류: scalar integer vs list
+- SKD turn log에서 동일 패턴 확인
+- 프롬프트/스키마 전달 문제인지 vs 모델 선호 문제인지 판단
+
+#### Result
+
+- val run (structured output OFF) CLICK 분포
+  - total CLICK actions: `203`
+  - x_as_list: `187 / 203` (92.1%)
+  - x_as_scalar: `16 / 203` (7.9%)
+  - dominant error: `"Input should be a valid integer [input_value=[x, y]]"` — Pydantic
+  - fatal trajectory error: `"unhashable type: 'list'"` (list가 dict key로 사용됨)
+
+- 비교: structured output ON (기존 probe)
+  - CLICK scalar: `85 / 85` (100%)
+  - CLICK list: `0 / 85` (0%)
+
+- SKD turn log (20260515_165049) 확인
+  - total turn events: `405`
+  - `invalid_action = 192` (47%)
+  - CLICK x_as_list (invalid_action 중): `187 / 192` (97%)
+  - pattern: `{"action_type": "CLICK", "x": [35, 175]}` — x에 좌표 pair 통째로
+  - 일부는 y도 list: `{"action_type": "CLICK", "x": [239, 397], "y": [397]}`
+
+- 스키마/프롬프트 전달 여부
+  - prompt_len student/teacher 동일 확인 (이전 trace)
+  - bundled schema에 `"x must be single integer, not list"` 명시
+  - 그럼에도 unconstrained에서 x top-1 = `' ['`, mass ≈ 0.9946
+  - **프롬프트 전달 문제 아님 — 모델의 unconstrained 선호 문제**
+
+#### Interpretation
+
+- `enable_qwen3_coder_structured_output` 유무가 CLICK payload mode를 결정적으로 분리함
+- constraint ON → scalar 100%, constraint OFF → list 92%
+- 이는 모델이 스키마를 보고도 unconstrained 생성에서는 `[x, y]` pair를 강하게 선호함을 의미
+- constrained decoding 방식의 문제:
+  - student는 constraint된 scalar 토큰을 생성
+  - teacher는 unconstrained verify (list 선호)
+  - distillation 신호 불일치 → SKD learning signal 품질 저하
+  - inference 시에도 constraint 의존성이 남아 brittle한 정책
+- **결론: 스키마를 모델의 자연 분포에 맞추는 것이 근본 해결책**
+  - `x: integer, y: integer` → `coordinate: [x, y]`
+  - constrained decoding 제거 → student/teacher 분포 정렬
+
+---
+
+### Step 3. Schema alignment + tolerate-at-boundary normalizer — 전체 action type 분포 분석 및 방향 확정
+
+#### Status
+
+- In progress (schema/파서 구현 중, val 검증 미완)
+
+#### Sources
+
+- val run (unconstrained): `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_only_val_20260515_173102/step_1`
+- `verl/tools/web_osgym_tool.py` — `_normalize_actions()` 코드 리뷰
+- `verl/experimental/agent_loop/web_osgym_protocol.py` — `WebOsGymAction` Pydantic 모델
+
+#### Method
+
+- unconstrained val run 전체 trajectory에서 각 action type별 coordinate 필드 형태 분류 (scalar vs list)
+- `_normalize_actions()` 코드 전체 읽기 — 핸들러 존재 여부 확인
+- 실행 흐름 추적: `execute()` → `_parse_actions()` → `_normalize_actions()` → 에러 포인트 특정
+
+#### Result
+
+**action type별 unconstrained 출력 분포 (val run 173102)**
+
+| action type | scalar `x,y` | list `[x,y]` in x | 현재 상태 |
+|------------|-------------|-------------------|----------|
+| CLICK | 14% (38) | **85%** (223) | Pydantic ValidationError on list |
+| DOUBLE_CLICK | 34% (17) | **66%** (33) | Pydantic ValidationError on list |
+| MOVE_TO | 11% (1) | **88%** (8) | Pydantic ValidationError on list |
+| RIGHT_CLICK | 62% (5) | 37% (3) | scalar도 `_normalize_actions` 핸들러 없어 ValueError |
+| DRAG_TO | 0 | 0 | 핸들러 없어 ValueError (출력 시도 자체 없음) |
+| MOUSE_DOWN | 0 | 0 | 핸들러 없어 ValueError |
+| MOUSE_UP | 0 | 0 | 핸들러 없어 ValueError |
+| SCROLL/TYPING/HOTKEY/WAIT/DONE/FAIL 등 | — | — | 정상 작동 |
+
+**구현 누락 확인 (`_normalize_actions` 357–419줄)**
+- `elif action_type not in {"WAIT","DONE","FAIL"}: raise ValueError("Unsupported action_type: ...")`
+- RIGHT_CLICK, DRAG_TO, MOUSE_DOWN, MOUSE_UP 모두 이 경로로 떨어짐
+- 에러는 `execute()` 624–631줄에서 catch되어 `"Invalid Web/OSGym action payload: Unsupported action_type: ..."` 로 반환
+- HTTP 서버(`WebOsGymClient`)에는 한 번도 도달하지 않음
+
+**에러 발생 레이어 정리**
+- 리스트 coordinate (CLICK/DOUBLE_CLICK/MOVE_TO): Pydantic `ValidationError` (`x: int | None`, list 거부)
+- scalar RIGHT_CLICK: Pydantic 통과 → `_normalize_actions` `ValueError`
+- 두 경로 모두 `execute()` except 블록에서 동일하게 처리됨 → 구분 불가능
+
+#### Interpretation
+
+- **근본 문제는 두 계층 중첩**: (1) 좌표 필드 타입 불일치 (int vs list), (2) 핸들러 구현 누락
+- 단순히 스키마만 `coordinate: [x, y]`로 바꾸면 Pydantic 계층은 해결되지만 핸들러 누락은 별도로 수정 필요
+- **채택 방향: tolerate-at-boundary normalizer**
+  - `_normalize_web_osgym_action_payload()` 에서 Pydantic 전에 세 가지 모델 출력 변형을 `coordinate: [x, y]`로 통일
+  - `_normalize_actions()`에 RIGHT_CLICK, DRAG_TO, MOUSE_DOWN, MOUSE_UP 핸들러 추가
+  - 서버 페이로드(`{x: int, y: int}`) 불변 — tool 레이어에서만 변환
+- **반복 실험 계획 (schema → val → 분석 → 조정)**
+  - Round 1 목표: parse_error_turn_ratio 50% 이하, invalid_action 중 coordinate-type 에러 소멸
+  - Round 2: 남은 에러 패턴 재분류 (DRAG_TO 의미론, unknown action_type 문자열 등)
+  - Round 3: parse_error_turn_ratio < 5% 수렴 확인 → RL 진입 판단
+- **cursor 스케일링 주의**: `_require_coordinates()` 수정 시 cursor fallback은 이미 screen 좌표이므로 scale 불필요. 새 `coordinate` 필드를 읽을 때만 `_scale_xy_to_screen()` 호출. 기존 `if action.x is not None and action.y is not None` 조건을 `if action.coordinate is not None` 으로 교체해야 이중 스케일링 방지.
 
 ---
 

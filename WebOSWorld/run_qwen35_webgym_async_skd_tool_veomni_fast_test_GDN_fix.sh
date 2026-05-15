@@ -66,8 +66,8 @@ python3 -m verl.trainer.main_ppo \
     distillation.distillation_loss.use_task_rewards=False \
     distillation.distillation_loss.use_policy_gradient=False \
     distillation.skd.chunk_size=32 \
-    distillation.skd.verify_top_k=5 \
-    distillation.skd.max_chunks_per_sample=224 \
+    distillation.skd.verify_top_k=1 \
+    distillation.skd.max_chunks_per_sample=256 \
     distillation.skd.windowed_training_enabled=False \
     distillation.skd.mask_invalid_action=False \
     actor_rollout_ref.rollout.name=sglang \
@@ -93,6 +93,7 @@ python3 -m verl.trainer.main_ppo \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_limit=16 \
     +actor_rollout_ref.rollout.agent.async_skd_prefetch_worker_target=4 \
     +actor_rollout_ref.rollout.agent.async_skd_max_promoted_per_step=16 \
+    +actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=False \
     +actor_rollout_ref.rollout.custom.web_skd_include_a11y=false \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -100,8 +101,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_k=20 \
     actor_rollout_ref.rollout.multi_turn.enable=True \
-    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=50 \
-    actor_rollout_ref.rollout.multi_turn.max_user_turns=50 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=10 \
+    actor_rollout_ref.rollout.multi_turn.max_user_turns=10 \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=5 \
     "actor_rollout_ref.rollout.multi_turn.tool_config_path=${WEBGYM_TOOL_CONFIG_PATH}" \
     "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
