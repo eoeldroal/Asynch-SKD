@@ -97,6 +97,9 @@ class ToolAgentLoop(AgentLoopBase):
         # Initialize tools from config file
         self.max_user_turns = self.rollout_config.multi_turn.max_user_turns
         self.max_assistant_turns = self.rollout_config.multi_turn.max_assistant_turns
+        self.max_assistant_response_tokens = getattr(
+            self.rollout_config.multi_turn, "max_assistant_response_tokens", None
+        )
         self.max_parallel_calls = self.rollout_config.multi_turn.max_parallel_calls
         self.max_tool_response_length = self.rollout_config.multi_turn.max_tool_response_length
         self.tool_response_truncate_side = self.rollout_config.multi_turn.tool_response_truncate_side
@@ -110,6 +113,24 @@ class ToolAgentLoop(AgentLoopBase):
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
         self.max_tool_parse_error_retries = int(self.max_tool_parse_error_retries)
+
+    def _apply_assistant_response_token_cap(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        current_response_len: int,
+    ) -> dict[str, Any]:
+        max_assistant_response_tokens = getattr(self, "max_assistant_response_tokens", None)
+        if max_assistant_response_tokens is None:
+            return sampling_params
+
+        remaining_budget = self.response_length - current_response_len
+        if remaining_budget <= 0:
+            return sampling_params
+
+        capped_sampling_params = dict(sampling_params)
+        capped_sampling_params["max_new_tokens"] = min(int(max_assistant_response_tokens), remaining_budget)
+        return capped_sampling_params
 
     async def _handle_tool_parse_error(self, agent_data: AgentData, parse_error: ToolParseError) -> AgentState:
         del agent_data, parse_error

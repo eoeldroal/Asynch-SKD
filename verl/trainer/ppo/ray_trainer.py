@@ -922,6 +922,8 @@ class RayPPOTrainer:
 
                 # unpad
                 test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                if "extra_info" in test_output_gen_batch.non_tensor_batch:
+                    test_output_gen_batch.non_tensor_batch.pop("extra_info")
 
                 print("validation generation end")
 

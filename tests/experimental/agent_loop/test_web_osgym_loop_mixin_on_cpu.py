@@ -180,6 +180,9 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                 "web_osgym_trajectory_counts": {
                     "attempted_tool_call_count": 2,
                     "valid_tool_call_count": 2,
+                    "first_valid_tool_call_index": 1,
+                    "executed_action_count": 8,
+                    "non_grounding_adjacent_pair_count": 6,
                 },
             }
         )
@@ -197,6 +200,7 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(agent_data.extra_fields["web_osgym_env_reward_score"], 1.0)
         self.assertEqual(agent_data.extra_fields["web_osgym_attempted_tool_calls"], 2)
         self.assertEqual(agent_data.extra_fields["web_osgym_valid_tool_calls"], 2)
+        self.assertEqual(agent_data.extra_fields["web_osgym_first_valid_tool_call_index"], 1)
         self.assertTrue(agent_data.extra_fields["web_osgym_reward_requested"])
         self.assertEqual(
             agent_data.extra_fields["reward_extra_info"],
@@ -204,7 +208,10 @@ class TestWebOsGymLoopMixin(unittest.IsolatedAsyncioTestCase):
                 "request_id": "loop-req",
                 "web_osgym_env_reward_score": 1.0,
                 "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_first_valid_tool_call_index": 1,
                 "web_osgym_valid_tool_calls": 2,
+                "web_osgym_executed_action_count": 8,
+                "web_osgym_non_grounding_adjacent_pair_count": 6,
                 "web_osgym_termination_reason": "system_stop",
             },
         )

@@ -285,6 +285,66 @@ async def test_web_tool_run_requests_reward_close_when_tool_action_times_out_aft
     assert tool.released == ["instance-1"]
 
 
+@pytest.mark.asyncio
+async def test_web_tool_run_stops_before_next_generation_when_parse_error_attempt_cap_is_reached():
+    class _ParseErrorToolParser:
+        def __init__(self):
+            self.last_parse_error = None
+
+        async def extract_tool_calls(self, response_ids, tools):
+            del response_ids, tools
+            self.last_parse_error = ToolParseError(
+                kind="actions_json_malformed",
+                message="the actions JSON is malformed.",
+            )
+            return "", []
+
+    tool = _FakeWebTool()
+    loop = _make_integration_loop(tool)
+    loop.max_assistant_turns = 1
+    loop.tool_parser = _ParseErrorToolParser()
+    loop._write_web_osgym_summary = lambda *args, **kwargs: None
+
+    output = await loop.run(
+        {"temperature": 0.3},
+        raw_prompt=[{"role": "user", "content": "task"}],
+        tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
+        uid="uid-parse-cap",
+        _trajectory_global_step=12,
+    )
+
+    assert len(loop.server_manager.calls) == 1
+    assert output.extra_fields["web_osgym_termination_reason"] == "system_stop"
+    assert output.extra_fields["web_osgym_trajectory_counts"]["attempted_tool_call_count"] == 1
+    assert output.extra_fields["web_osgym_trajectory_counts"]["parse_error_count"] == 1
+    assert output.extra_fields["web_osgym_trajectory_counts"]["event_count"] == 1
+    assert output.num_turns == 3
+
+
+@pytest.mark.asyncio
+async def test_web_tool_run_stops_before_next_generation_when_tool_attempt_cap_is_reached():
+    tool = _FakeNonTerminalObservationTool()
+    loop = _make_integration_loop(tool)
+    loop.max_assistant_turns = 1
+    loop._write_web_osgym_summary = lambda *args, **kwargs: None
+
+    output = await loop.run(
+        {"temperature": 0.3},
+        raw_prompt=[{"role": "user", "content": "task"}],
+        tools_kwargs={"web_osgym": {"create_kwargs": {"task_id": "12345"}}},
+        uid="uid-tool-cap",
+        _trajectory_global_step=12,
+    )
+
+    assert len(loop.server_manager.calls) == 1
+    assert len(tool.executed) == 1
+    assert output.extra_fields["web_osgym_termination_reason"] == "system_stop"
+    assert output.extra_fields["web_osgym_trajectory_counts"]["attempted_tool_call_count"] == 1
+    assert output.extra_fields["web_osgym_trajectory_counts"]["valid_tool_call_count"] == 1
+    assert output.extra_fields["web_osgym_trajectory_counts"]["first_valid_tool_call_index"] == 1
+    assert output.extra_fields["web_osgym_steps"][-1]["phase"] == "tool_observation"
+
+
 def test_web_tool_agent_keeps_tool_agent_layering():
     assert issubclass(WebOsGymToolAgentLoop, ToolAgentLoop)
     assert not issubclass(WebOsGymToolAgentLoop, SkdAgentLoop)
@@ -590,6 +650,35 @@ def test_generation_uses_compact_server_prompt_ids_for_image_bearing_sglang_requ
         assert agent_data.extra_fields["web_osgym_generation_windows"][0]["window_used"] is True
         assert agent_data.prompt_ids == [100, 201]
         assert agent_data.response_mask == [1]
+
+    asyncio.run(_run())
+
+
+def test_generation_caps_per_turn_max_new_tokens_by_remaining_budget():
+    async def _run():
+        loop = _make_integration_loop(_FakeWebTool())
+        loop.max_assistant_response_tokens = 2048
+
+        agent_data = _agent_data(_FakeWebTool())
+        agent_data.prompt_ids = [100]
+        agent_data.response_mask = [1] * 60
+        agent_data.extra_fields["web_osgym_steps"] = [
+            {
+                "step_idx": 1,
+                "phase": "tool_observation",
+                "text": "",
+                "actions": [],
+                "image_start": 0,
+                "image_end": 0,
+            }
+        ]
+
+        state = await loop._handle_generating_state(agent_data, {"temperature": 0.6})
+
+        assert state == AgentState.PROCESSING_TOOLS
+        generate_call = loop.server_manager.calls[0]
+        assert generate_call["sampling_params"]["temperature"] == 0.6
+        assert generate_call["sampling_params"]["max_new_tokens"] == 4
 
     asyncio.run(_run())
 
@@ -1408,7 +1497,10 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
                 "parse_error_count": 1,
                 "attempted_tool_call_count": 4,
                 "valid_tool_call_count": 4,
+                "first_valid_tool_call_index": 1,
                 "event_count": 4,
+                "executed_action_count": 18,
+                "non_grounding_adjacent_pair_count": 12,
             },
         }
     )
@@ -1428,7 +1520,10 @@ def test_web_osgym_summary_writes_session_directory(monkeypatch, tmp_path):
     assert summary["parse_error_count"] == 1
     assert summary["attempted_tool_call_count"] == 4
     assert summary["valid_tool_call_count"] == 4
+    assert summary["first_valid_tool_call_index"] == 1
     assert summary["event_count"] == 4
+    assert summary["executed_action_count"] == 18
+    assert summary["non_grounding_adjacent_pair_count"] == 12
     assert summary["completed"] is True
     assert summary["has_reward"] is True
 
@@ -1504,9 +1599,74 @@ def test_append_web_osgym_assistant_event_tracks_attempted_and_valid_tool_call_c
     counts = agent_data.extra_fields["web_osgym_trajectory_counts"]
     assert counts["attempted_tool_call_count"] == 3
     assert counts["valid_tool_call_count"] == 1
+    assert counts["first_valid_tool_call_index"] == 1
     assert counts["invalid_action_count"] == 1
     assert counts["parse_error_count"] == 1
     assert counts["event_count"] == 3
+
+
+def test_append_web_osgym_assistant_event_tracks_non_grounding_adjacency_counts(monkeypatch, tmp_path):
+    monkeypatch.setenv("WEB_OSGYM_TOOL_TRACE_DIR", str(tmp_path))
+    loop = _make_loop()
+    agent_data = _agent_data(_FakeWebTool())
+    agent_data.request_id = "req-repeat"
+    agent_data.extra_fields.update(
+        {
+            "web_osgym_task_id": "warn_prozilla_explorer_11",
+            "web_osgym_session_id": 322,
+            "web_osgym_sample_uid": "uid-repeat",
+            "global_steps": 0,
+        }
+    )
+
+    def _append_valid_turn(step_idx: int, response_text: str, actions: list[dict]) -> None:
+        loop._record_web_osgym_assistant_turn(
+            agent_data,
+            observation_step_idx=step_idx,
+            response_start=step_idx - 1,
+            response_end=step_idx,
+            response_text=response_text,
+            actions=[],
+        )
+        agent_data.tool_calls = [FunctionCall(name="computer", arguments=json.dumps({"actions": actions}))]
+        loop._append_web_osgym_assistant_event(
+            agent_data,
+            result={
+                "terminated": False,
+                "termination_reason": None,
+                "invalid_action": False,
+                "action_count": len(actions),
+                "web_osgym_error_type": None,
+                "web_osgym_actions": actions,
+            },
+        )
+
+    _append_valid_turn(
+        1,
+        '</think>\n<tool_call>\n<function=computer>\n<parameter=actions>\n[{"action_type":"HOTKEY"},{"action_type":"WAIT"}]\n</parameter>\n</function>\n</tool_call>',
+        [{"action_type": "HOTKEY", "keys": ["ctrl", "alt", "t"]}, {"action_type": "WAIT"}],
+    )
+    _append_valid_turn(
+        2,
+        '</think>\n<tool_call>\n<function=computer>\n<parameter=actions>\n[{"action_type":"TYPING"}]\n</parameter>\n</function>\n</tool_call>',
+        [{"action_type": "TYPING", "text": "cmd"}],
+    )
+    _append_valid_turn(
+        3,
+        '</think>\n<tool_call>\n<function=computer>\n<parameter=actions>\n[{"action_type":"SCROLL"}]\n</parameter>\n</function>\n</tool_call>',
+        [{"action_type": "SCROLL", "dx": 0, "dy": -512}],
+    )
+    _append_valid_turn(
+        4,
+        '</think>\n<tool_call>\n<function=computer>\n<parameter=actions>\n[{"action_type":"HOTKEY"},{"action_type":"HOTKEY"}]\n</parameter>\n</function>\n</tool_call>',
+        [{"action_type": "HOTKEY", "keys": ["super", "e"]}, {"action_type": "HOTKEY", "keys": ["alt", "f4"]}],
+    )
+
+    counts = agent_data.extra_fields["web_osgym_trajectory_counts"]
+    assert counts["executed_action_count"] == 6
+    assert counts["non_grounding_adjacent_pair_count"] == 3
+    assert counts["attempted_tool_call_count"] == 4
+    assert counts["valid_tool_call_count"] == 4
 
 
 def test_init_web_agent_data_stores_trajectory_global_step():

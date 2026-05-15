@@ -61,6 +61,27 @@ class _ExplodingValidationManager(_ValidationSourceAwareManager):
         raise RuntimeError("validation boom")
 
 
+class _MergedExtraInfoValidationManager(_ValidationSourceAwareManager):
+    def generate_sequences(self, batch: DataProto) -> DataProto:
+        self.generate_seen_sources.append(self.current_source)
+        merged_extra_info = []
+        for row in batch.non_tensor_batch["extra_info"].tolist():
+            merged = dict(row)
+            merged["web_osgym_env_reward_score"] = 1.0
+            merged["web_osgym_format_reward"] = 0.4
+            merged_extra_info.append(merged)
+
+        return DataProto.from_dict(
+            tensors={
+                "responses": torch.full((len(batch), 2), 7, dtype=torch.long),
+            },
+            non_tensors={
+                "extra_info": merged_extra_info,
+            },
+            meta_info={"timing": {}},
+        )
+
+
 class _TokenizerStub:
     eos_token_id = 42
     pad_token_id = 0
@@ -77,6 +98,12 @@ def _make_validation_batch_dict() -> dict[str, torch.Tensor | np.ndarray]:
         "data_source": _object_array(["dummy"]),
         "reward_model": _object_array([{"ground_truth": "gt"}]),
     }
+
+
+def _make_validation_batch_dict_with_extra_info() -> dict[str, torch.Tensor | np.ndarray]:
+    batch = _make_validation_batch_dict()
+    batch["extra_info"] = _object_array([{"task_id": "demo-task", "seed": 7}])
+    return batch
 
 
 def _make_trainer_for_validation_source_isolation() -> tuple[
@@ -112,6 +139,44 @@ def _make_trainer_for_validation_source_isolation() -> tuple[
 
     source = _TrackingAsyncSkdSource()
     manager = _ValidationSourceAwareManager(source)
+    trainer._async_skd_data_source = source
+    trainer.async_rollout_manager = manager
+    return trainer, source, manager
+
+
+def _make_trainer_for_validation_extra_info_union() -> tuple[
+    RayPPOTrainer, _TrackingAsyncSkdSource, _MergedExtraInfoValidationManager
+]:
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create(
+        {
+            "trainer": {
+                "logger": [],
+                "log_val_generations": 0,
+            },
+            "actor_rollout_ref": {
+                "rollout": {
+                    "agent": {
+                        "num_workers": 1,
+                        "default_agent_loop": "skd_agent",
+                    },
+                    "val_kwargs": {
+                        "n": 1,
+                        "do_sample": True,
+                    },
+                }
+            },
+        }
+    )
+    trainer.tokenizer = _TokenizerStub()
+    trainer.global_steps = 10
+    trainer.use_rm = False
+    trainer.validation_generations_logger = SimpleNamespace(log=lambda *args, **kwargs: None)
+    trainer.val_dataloader = [_make_validation_batch_dict_with_extra_info()]
+    trainer._val_metrics_update = lambda *args, **kwargs: {"validation/mock": 1.0}
+
+    source = _TrackingAsyncSkdSource()
+    manager = _MergedExtraInfoValidationManager(source)
     trainer._async_skd_data_source = source
     trainer.async_rollout_manager = manager
     return trainer, source, manager
@@ -169,6 +234,24 @@ def test_validate_flushes_lookahead_without_rollout_resume_hooks(monkeypatch):
 
     assert manager.flush_seen_sources == [source]
     assert trainer._async_skd_rollout_paused is True
+
+
+def test_validate_ignores_generated_extra_info_when_unioning_batches(monkeypatch):
+    trainer, source, manager = _make_trainer_for_validation_extra_info_union()
+    seen_extra_info: dict[str, list[dict[str, object]]] = {}
+
+    def _capture_reward(batch):
+        seen_extra_info["extra_info"] = batch.non_tensor_batch["extra_info"].tolist()
+        return torch.ones(len(batch), 1, dtype=torch.float32), {}
+
+    monkeypatch.setattr("verl.trainer.ppo.ray_trainer.extract_reward", _capture_reward)
+
+    metrics = trainer._validate()
+
+    assert metrics == {"validation/mock": 1.0}
+    assert manager.flush_seen_sources == [source]
+    assert manager.generate_seen_sources == [None]
+    assert seen_extra_info["extra_info"] == [{"task_id": "demo-task", "seed": 7}]
 
 
 class _TrainDataloaderStub:

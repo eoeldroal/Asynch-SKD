@@ -30,7 +30,7 @@ class WebOsGymLoopMixin:
             "The value inside `<parameter=actions>` must be a valid JSON array.",
             "Keep brackets and braces balanced.",
             "Do not nest `<parameter=...>` tags inside the `actions` JSON.",
-            "`x` and `y` must be single integers, not lists or tuples.",
+            "`coordinate` must be a JSON array of two integers, e.g. `[621, 680]`.",
             "If you use `DONE` or `FAIL`, it must be the only action in that `actions` array.",
         ]
 
@@ -43,7 +43,7 @@ class WebOsGymLoopMixin:
             "<tool_call>",
             "<function=computer>",
             "<parameter=actions>",
-            '[{"action_type":"CLICK","x":621,"y":680}]',
+            '[{"action_type":"CLICK","coordinate":[621,680]}]',
             "</parameter>",
             "</function>",
             "</tool_call>",
@@ -271,10 +271,16 @@ class WebOsGymLoopMixin:
         counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
         attempted_tool_calls = int(counts.get("attempted_tool_call_count", 0))
         valid_tool_calls = int(counts.get("valid_tool_call_count", 0))
+        first_valid_tool_call_index = int(counts.get("first_valid_tool_call_index", 0))
+        executed_action_count = int(counts.get("executed_action_count", 0))
+        non_grounding_adjacent_pair_count = int(counts.get("non_grounding_adjacent_pair_count", 0))
         env_reward = float(reward)
         agent_data.extra_fields["web_osgym_env_reward_score"] = env_reward
         agent_data.extra_fields["web_osgym_attempted_tool_calls"] = attempted_tool_calls
+        agent_data.extra_fields["web_osgym_first_valid_tool_call_index"] = first_valid_tool_call_index
         agent_data.extra_fields["web_osgym_valid_tool_calls"] = valid_tool_calls
+        agent_data.extra_fields["web_osgym_executed_action_count"] = executed_action_count
+        agent_data.extra_fields["web_osgym_non_grounding_adjacent_pair_count"] = non_grounding_adjacent_pair_count
         reward_extra_info = agent_data.extra_fields.get("reward_extra_info") or {}
         if not isinstance(reward_extra_info, dict):
             reward_extra_info = {}
@@ -283,7 +289,10 @@ class WebOsGymLoopMixin:
             "request_id": agent_data.request_id,
             "web_osgym_env_reward_score": env_reward,
             "web_osgym_attempted_tool_calls": attempted_tool_calls,
+            "web_osgym_first_valid_tool_call_index": first_valid_tool_call_index,
             "web_osgym_valid_tool_calls": valid_tool_calls,
+            "web_osgym_executed_action_count": executed_action_count,
+            "web_osgym_non_grounding_adjacent_pair_count": non_grounding_adjacent_pair_count,
             "web_osgym_termination_reason": termination_reason,
         }
 

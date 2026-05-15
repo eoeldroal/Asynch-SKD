@@ -350,6 +350,7 @@ def test_web_osgym_training_reward_is_computed_by_reward_manager_from_extra_info
             "reward_extra_info": {
                 "web_osgym_env_reward_score": 1.0,
                 "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_first_valid_tool_call_index": 1,
                 "web_osgym_valid_tool_calls": 2,
                 "web_osgym_termination_reason": "model_done",
             }
@@ -381,6 +382,7 @@ def test_web_osgym_training_reward_is_computed_by_reward_manager_from_extra_info
     assert merged_extra_info["task_id"] == "demo-task"
     assert merged_extra_info["web_osgym_env_reward_score"] == 1.0
     assert merged_extra_info["web_osgym_attempted_tool_calls"] == 2
+    assert merged_extra_info["web_osgym_first_valid_tool_call_index"] == 1
     assert merged_extra_info["web_osgym_valid_tool_calls"] == 2
 
     reward_manager = NaiveRewardManager(
@@ -389,18 +391,19 @@ def test_web_osgym_training_reward_is_computed_by_reward_manager_from_extra_info
         compute_score=partial(
             compute_score_webgym_rl,
             format_reward_alpha=0.03,
-            format_reward_min_denominator=5,
+            format_reward_tau=2.0,
         ),
     )
     reward_result = reward_manager(batch, return_dict=True)
 
-    expected_score = 1.0 + 0.03 * (2.0 / 5.0)
+    expected_score = 1.0 + 0.03
     reward_tensor = reward_result["reward_tensor"]
     assert reward_tensor.shape == batch.batch["responses"].shape
     assert reward_tensor[0, 1].item() == pytest.approx(expected_score)
     assert reward_result["reward_extra_info"]["web_osgym_env_reward_score"] == [1.0]
-    assert reward_result["reward_extra_info"]["web_osgym_format_reward"] == [2.0 / 5.0]
+    assert reward_result["reward_extra_info"]["web_osgym_format_reward"] == [1.0]
     assert reward_result["reward_extra_info"]["web_osgym_attempted_tool_calls"] == [2]
+    assert reward_result["reward_extra_info"]["web_osgym_first_valid_tool_call_index"] == [1]
     assert reward_result["reward_extra_info"]["web_osgym_valid_tool_calls"] == [2]
 
 
@@ -413,6 +416,7 @@ async def test_async_reward_loop_preserves_request_id_when_merging_reward_extra_
                 "web_osgym_env_reward_score": 1.0,
                 "web_osgym_format_reward": 0.4,
                 "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_first_valid_tool_call_index": 1,
                 "web_osgym_valid_tool_calls": 2,
             },
         }
@@ -453,13 +457,14 @@ async def test_async_reward_loop_preserves_request_id_when_merging_reward_extra_
         "web_osgym_env_reward_score": 1.0,
         "web_osgym_format_reward": 0.4,
         "web_osgym_attempted_tool_calls": 2,
+        "web_osgym_first_valid_tool_call_index": 1,
         "web_osgym_valid_tool_calls": 2,
     }
 
 
 def test_web_osgym_async_reward_path_drives_training_reward_breakdown_and_advantage():
     metrics = AgentLoopMetrics()
-    shaped_score_a = 1.0 + 0.03 * (2.0 / 5.0)
+    shaped_score_a = 1.0 + 0.03
     shaped_score_b = 0.0
 
     internal_a = _to_internal(
@@ -471,8 +476,9 @@ def test_web_osgym_async_reward_path_drives_training_reward_breakdown_and_advant
             "reward_extra_info": {
                 "request_id": "req-1",
                 "web_osgym_env_reward_score": 1.0,
-                "web_osgym_format_reward": 2.0 / 5.0,
+                "web_osgym_format_reward": 1.0,
                 "web_osgym_attempted_tool_calls": 2,
+                "web_osgym_first_valid_tool_call_index": 1,
                 "web_osgym_valid_tool_calls": 2,
             },
             "web_osgym_log_global_step": 7,
@@ -493,6 +499,7 @@ def test_web_osgym_async_reward_path_drives_training_reward_breakdown_and_advant
                 "web_osgym_env_reward_score": 0.0,
                 "web_osgym_format_reward": 0.0,
                 "web_osgym_attempted_tool_calls": 0,
+                "web_osgym_first_valid_tool_call_index": 0,
                 "web_osgym_valid_tool_calls": 0,
             },
             "web_osgym_log_global_step": 7,
@@ -530,7 +537,7 @@ def test_web_osgym_async_reward_path_drives_training_reward_breakdown_and_advant
     breakdown = SeparateRayPPOTrainer._compute_reward_breakdown_metrics(reward_tensor, reward_extra_infos_dict)
     assert breakdown["score/sum"] == pytest.approx((shaped_score_a + shaped_score_b) / 2.0)
     assert breakdown["score/env"] == pytest.approx(0.5)
-    assert breakdown["score/format"] == pytest.approx(0.2)
+    assert breakdown["score/format"] == pytest.approx(0.5)
 
     batch.batch["token_level_scores"] = reward_tensor
     batch.batch["token_level_rewards"] = reward_tensor

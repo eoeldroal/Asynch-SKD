@@ -76,6 +76,7 @@ class MultiTurnConfig(BaseConfig):
 
     enable: bool = False
     max_assistant_turns: Optional[int] = None
+    max_assistant_response_tokens: Optional[int] = None
     tool_config_path: Optional[str] = None
     system_prompt_path: Optional[str] = None
     max_user_turns: Optional[int] = None

@@ -286,6 +286,18 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             if format_scores.size > 0:
                 metrics["score/format"] = float(np.mean(format_scores))
 
+        raw_format_scores = reward_extra_infos_dict.get("web_osgym_raw_format_reward")
+        if raw_format_scores is not None:
+            raw_format_scores = np.asarray(raw_format_scores, dtype=np.float32)
+            if raw_format_scores.size > 0:
+                metrics["score/format_raw"] = float(np.mean(raw_format_scores))
+
+        adjacency_ratios = reward_extra_infos_dict.get("web_osgym_non_grounding_adjacency_ratio")
+        if adjacency_ratios is not None:
+            adjacency_ratios = np.asarray(adjacency_ratios, dtype=np.float32)
+            if adjacency_ratios.size > 0:
+                metrics["score/non_grounding_adjacency_ratio"] = float(np.mean(adjacency_ratios))
+
         return metrics
 
     @staticmethod
@@ -302,19 +314,30 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         log_steps = batch.non_tensor_batch.get("web_osgym_log_global_step")
         env_scores = reward_extra_infos_dict.get("web_osgym_env_reward_score")
         format_scores = reward_extra_infos_dict.get("web_osgym_format_reward")
+        raw_format_scores = reward_extra_infos_dict.get("web_osgym_raw_format_reward")
+        adjacency_ratios = reward_extra_infos_dict.get("web_osgym_non_grounding_adjacency_ratio")
 
-        if request_ids is None or log_steps is None or env_scores is None or format_scores is None:
+        if (
+            request_ids is None
+            or log_steps is None
+            or env_scores is None
+            or format_scores is None
+            or raw_format_scores is None
+            or adjacency_ratios is None
+        ):
             return
 
         final_scores = reward_tensor.sum(dim=-1).detach().cpu().tolist()
         step_request_id_to_summary: dict[int, dict[str, str]] = {}
 
-        for request_id, log_step, final_score, env_score, format_score in zip(
+        for request_id, log_step, final_score, env_score, format_score, raw_format_score, adjacency_ratio in zip(
             request_ids,
             log_steps,
             final_scores,
             env_scores,
             format_scores,
+            raw_format_scores,
+            adjacency_ratios,
             strict=True,
         ):
             if request_id in (None, "") or log_step is None:
@@ -357,6 +380,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 "sum": float(final_score),
                 "env": float(env_score),
                 "format": float(format_score),
+                "raw_format": float(raw_format_score),
+                "non_grounding_adjacency_ratio": float(adjacency_ratio),
             }
 
             with open(summary_path, "w", encoding="utf-8") as f:

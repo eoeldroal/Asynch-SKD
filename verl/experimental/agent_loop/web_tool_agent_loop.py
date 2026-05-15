@@ -33,6 +33,7 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _QWEN_CODER_TOOL_CALL_STOP = "</tool_call>"
+_WEB_OSGYM_NON_GROUNDING_ACTION_TYPES = frozenset({"WAIT", "HOTKEY", "TYPING"})
 
 
 @dataclass(frozen=True)
@@ -580,14 +581,16 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         latest_turn = self._latest_web_osgym_assistant_turn(agent_data)
         logger_obj = self._get_web_osgym_trajectory_logger(agent_data)
         session_dir = self._get_web_osgym_session_dir(agent_data)
-        if latest_turn is None or logger_obj is None or session_dir is None:
+        if latest_turn is None:
             return
-        image_records = logger_obj.write_images(
-            session_dir,
-            assistant_turn=int(latest_turn.get("assistant_turn", agent_data.assistant_turns)),
-            user_turn=int(agent_data.user_turns),
-            images=image_data,
-        )
+        image_records = []
+        if logger_obj is not None and session_dir is not None:
+            image_records = logger_obj.write_images(
+                session_dir,
+                assistant_turn=int(latest_turn.get("assistant_turn", agent_data.assistant_turns)),
+                user_turn=int(agent_data.user_turns),
+                images=image_data,
+            )
         traced_tool_calls = self._trace_tool_calls(agent_data.tool_calls)
         event = {
             "event_type": "assistant_turn",
@@ -619,7 +622,8 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             "image_paths": [record["path"] for record in image_records],
             "images": image_records,
         }
-        logger_obj.append_event(session_dir, event)
+        if logger_obj is not None and session_dir is not None:
+            logger_obj.append_event(session_dir, event)
         counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
         counts["event_count"] = int(counts.get("event_count", 0)) + 1
         attempted_tool_call = bool(parse_error is not None or event["tool_call_count"] > 0 or bool(event["actions"]))
@@ -634,10 +638,36 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
             counts["attempted_tool_call_count"] = int(counts.get("attempted_tool_call_count", 0)) + 1
         if valid_tool_call:
             counts["valid_tool_call_count"] = int(counts.get("valid_tool_call_count", 0)) + 1
+            if int(counts.get("first_valid_tool_call_index", 0)) <= 0:
+                counts["first_valid_tool_call_index"] = int(counts["attempted_tool_call_count"])
         if event["result"]["invalid_action"]:
             counts["invalid_action_count"] = int(counts.get("invalid_action_count", 0)) + 1
         if parse_error is not None:
             counts["parse_error_count"] = int(counts.get("parse_error_count", 0)) + 1
+        if valid_tool_call:
+            executed_action_count = int(counts.get("executed_action_count", 0))
+            non_grounding_adjacent_pair_count = int(counts.get("non_grounding_adjacent_pair_count", 0))
+            previous_action_type = counts.get("_last_executed_action_type")
+            if not isinstance(previous_action_type, str):
+                previous_action_type = None
+            for action in event["actions"]:
+                if not isinstance(action, dict):
+                    continue
+                action_type = action.get("action_type")
+                if not isinstance(action_type, str) or not action_type:
+                    continue
+                action_type = action_type.upper()
+                if (
+                    previous_action_type in _WEB_OSGYM_NON_GROUNDING_ACTION_TYPES
+                    and action_type in _WEB_OSGYM_NON_GROUNDING_ACTION_TYPES
+                ):
+                    non_grounding_adjacent_pair_count += 1
+                executed_action_count += 1
+                previous_action_type = action_type
+            counts["executed_action_count"] = executed_action_count
+            counts["non_grounding_adjacent_pair_count"] = non_grounding_adjacent_pair_count
+            if previous_action_type is not None:
+                counts["_last_executed_action_type"] = previous_action_type
         agent_data.extra_fields["web_osgym_trajectory_counts"] = counts
 
     def _write_web_osgym_summary(self, agent_data: AgentData, *, fatal_error: str | None = None) -> None:
@@ -657,11 +687,14 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
                 "reward_score": agent_data.extra_fields.get("web_osgym_env_reward_score"),
                 "attempted_tool_call_count": int(counts.get("attempted_tool_call_count", 0)),
                 "valid_tool_call_count": int(counts.get("valid_tool_call_count", 0)),
+                "first_valid_tool_call_index": int(counts.get("first_valid_tool_call_index", 0)),
                 "termination_reason": agent_data.extra_fields.get("web_osgym_termination_reason"),
                 "num_turns": agent_data.user_turns + agent_data.assistant_turns + 1,
                 "invalid_action_count": int(counts.get("invalid_action_count", 0)),
                 "parse_error_count": int(counts.get("parse_error_count", 0)),
                 "event_count": int(counts.get("event_count", 0)),
+                "executed_action_count": int(counts.get("executed_action_count", 0)),
+                "non_grounding_adjacent_pair_count": int(counts.get("non_grounding_adjacent_pair_count", 0)),
                 "completed": fatal_error is None,
                 "has_reward": bool(agent_data.extra_fields.get("web_osgym_reward_fetched")),
                 "fatal_error": fatal_error,
@@ -867,15 +900,30 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         agent_data.user_turns += 1
         return AgentState.GENERATING
 
+    def _attempted_tool_call_cap_reached(self, agent_data: AgentData) -> bool:
+        if not self.max_assistant_turns:
+            return False
+        counts = dict(agent_data.extra_fields.get("web_osgym_trajectory_counts") or {})
+        attempted_tool_call_count = int(counts.get("attempted_tool_call_count", 0))
+        return attempted_tool_call_count >= self.max_assistant_turns
+
     async def _handle_generating_state(
         self,
         agent_data: AgentData,
         sampling_params: dict[str, Any],
         ignore_termination: bool = False,
     ) -> AgentState:
+        if self._attempted_tool_call_cap_reached(agent_data):
+            if not agent_data.extra_fields.get("web_osgym_reward_fetched"):
+                await self._finalize_with_web_osgym_reward(agent_data, termination_reason="system_stop")
+            return AgentState.TERMINATED
         generation_inputs = await self._build_web_osgym_generation_inputs(agent_data)
         active_tool_schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
         effective_sampling_params = self._build_generation_sampling_params(sampling_params, active_tool_schemas)
+        effective_sampling_params = self._apply_assistant_response_token_cap(
+            effective_sampling_params,
+            current_response_len=len(agent_data.response_mask),
+        )
         request_prompt_ids = generation_inputs.prompt_ids
         if generation_inputs.server_prompt_ids is not None:
             request_prompt_ids = generation_inputs.server_prompt_ids

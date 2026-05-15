@@ -173,6 +173,9 @@ multi_turn:
   # null for no limit (default max_length // 3)
   max_assistant_turns: null
 
+  # null for no per-assistant-generation token cap
+  max_assistant_response_tokens: null
+
   # null for no tool
   tool_config_path: null
 
