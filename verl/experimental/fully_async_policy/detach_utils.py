@@ -505,7 +505,7 @@ class MetricsAggregator:
             # Time-Based metrics, can add metrics here
             "time_sum": ["perf/time_per_step"],
             "min": ["timing_s/agent_loop/tool_calls/min"],
-            "avg": ["timing_s/agent_loop/tool_calls/mean"],
+            "avg": ["timing_s/agent_loop/tool_calls/mean", "score/sum"],
             "max": ["timing_s/agent_loop/tool_calls/max"],
             "last": [
                 "fully_async/count/total_generated_samples",

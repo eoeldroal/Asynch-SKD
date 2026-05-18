@@ -270,6 +270,104 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.button, "left")
         self.assertEqual(action.num_clicks, 1)
 
+    async def test_action_named_scroll_defaults_missing_dx_to_zero(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(
+            config={"base_url": "http://env"},
+            tool_schema=_action_tool_schema(
+                "SCROLL",
+                properties={
+                    "dx": {"type": "integer"},
+                    "dy": {"type": "integer"},
+                },
+                required=["dy"],
+            ),
+        )
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, reward, metrics = await tool.execute("i1", {"dy": -500})
+
+        self.assertEqual(response.text, "next")
+        self.assertIsNone(reward)
+        self.assertFalse(metrics["invalid_action"])
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "SCROLL")
+        self.assertEqual(action.dx, 0)
+        self.assertEqual(action.dy, 500)
+
+    async def test_action_named_wait_duration_expands_to_multiple_wait_steps(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(
+            config={"base_url": "http://env"},
+            tool_schema=_action_tool_schema(
+                "WAIT",
+                properties={
+                    "duration": {"type": "number"},
+                },
+            ),
+        )
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, reward, metrics = await tool.execute("i1", {"duration": 2.0})
+
+        self.assertEqual(response.text, "next")
+        self.assertIsNone(reward)
+        self.assertFalse(metrics["invalid_action"])
+        self.assertEqual(metrics["action_count"], 2)
+        self.assertEqual([action.action_type for action in seen["actions"]], ["WAIT", "WAIT"])
+
+    async def test_bundled_wait_timeout_alias_expands_to_multiple_wait_steps(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        response, reward, metrics = await tool.execute(
+            "i1",
+            {"actions": [{"action_type": "WAIT", "timeout": "2"}]},
+        )
+
+        self.assertEqual(response.text, "next")
+        self.assertIsNone(reward)
+        self.assertFalse(metrics["invalid_action"])
+        self.assertEqual(metrics["action_count"], 2)
+        self.assertEqual([action.action_type for action in seen["actions"]], ["WAIT", "WAIT"])
+
     async def test_action_named_tool_rejects_backend_actions_argument(self):
         class _FakeClient:
             def __init__(self):
@@ -775,6 +873,61 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action.button, "left")
         self.assertEqual(action.num_clicks, 1)
 
+    async def test_tool_execute_normalizes_left_click_alias_to_click(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state(screen_width=1920, screen_height=1080)
+
+        await tool.execute("i1", {"actions": [{"action_type": "LEFT_CLICK", "coordinate": [528, 582]}]})
+
+        action = seen["actions"][0]
+        self.assertEqual(action.action_type, "CLICK")
+        self.assertEqual((action.x, action.y), (1014, 629))
+        self.assertEqual(action.button, "left")
+        self.assertEqual(action.num_clicks, 1)
+
+    async def test_tool_execute_expands_typing_enter_flag_to_press_enter(self):
+        seen = {}
+
+        class _FakeClient:
+            async def action(self, **kwargs):
+                seen.update(kwargs)
+
+                class _Response:
+                    text = "next"
+                    image = None
+
+                return _Response()
+
+        tool = WebOsGymTool(config={"base_url": "http://env"}, tool_schema=_tool_schema())
+        tool.client = _FakeClient()
+        tool._instance_dict["i1"] = self._instance_state()
+
+        await tool.execute(
+            "i1",
+            {"actions": [{"action_type": "TYPING", "text": "mkdir -p clean039", "clear": True, "enter": True}]},
+        )
+
+        self.assertEqual(len(seen["actions"]), 2)
+        typing_action = seen["actions"][0]
+        enter_action = seen["actions"][1]
+        self.assertEqual(typing_action.action_type, "TYPING")
+        self.assertEqual(typing_action.text, "mkdir -p clean039")
+        self.assertEqual(enter_action.action_type, "PRESS")
+        self.assertEqual(enter_action.key, "Enter")
+
     async def test_tool_execute_defaults_mouse_down_button_to_left(self):
         seen = {}
 
@@ -862,7 +1015,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "CLICK"}]})
 
-        self.assertIn("CLICK omitted x/y", response.text)
+        self.assertIn("CLICK omitted coordinate", response.text)
         self.assertTrue(metrics["invalid_action"])
         self.assertFalse(tool.client.action_called)
 
@@ -880,7 +1033,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "RIGHT_CLICK"}]})
 
-        self.assertIn("RIGHT_CLICK omitted x/y", response.text)
+        self.assertIn("RIGHT_CLICK omitted coordinate", response.text)
         self.assertTrue(metrics["invalid_action"])
         self.assertFalse(tool.client.action_called)
 
@@ -1039,7 +1192,7 @@ class TestWebOsGymTool(unittest.IsolatedAsyncioTestCase):
 
         response, _, metrics = await tool.execute("i1", {"actions": [{"action_type": "DOUBLE_CLICK"}]})
 
-        self.assertIn("DOUBLE_CLICK omitted x/y", response.text)
+        self.assertIn("DOUBLE_CLICK omitted coordinate", response.text)
         self.assertTrue(metrics["invalid_action"])
         self.assertFalse(tool.client.action_called)
 

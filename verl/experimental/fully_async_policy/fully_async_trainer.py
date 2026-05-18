@@ -333,9 +333,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         await self._init_async_rollout_manager()
 
     def _init_reward_loop(self):
-        if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] Init reward loop")
-            super()._init_reward_loop()
+        # Batch reward computation can still be required even when validation is disabled,
+        # for example when streaming reward is intentionally turned off and reward is filled
+        # in trainer-side postprocessing.
+        print("[FullyAsyncTrainer] Init reward loop")
+        super()._init_reward_loop()
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_worker_handles
+        print(
+            "[FullyAsyncTrainer][Reward] "
+            f"use_trainer_do_validate={self.config.async_training.use_trainer_do_validate} "
+            f"streaming_reward={'enabled' if reward_loop_worker_handles is not None else 'disabled'}"
+        )
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate
@@ -343,16 +351,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.config.async_training.use_trainer_do_validate:
             print("[FullyAsyncTrainer] Init async rollout manager")
 
-            # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-            # agent_reward_loop: streaming reward computation with actor rollout
-            # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-            enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-            # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-            # to stream reward computation with actor rollout
-            reward_loop_worker_handles = (
-                self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-            )
+            # reward_loop_worker_handles becomes None when reward must be computed at batch level
+            # instead of streaming per-sample during rollout.
+            reward_loop_worker_handles = self.reward_loop_manager.reward_loop_worker_handles
 
             # create async rollout manager and request scheduler
             assert self.config.actor_rollout_ref.rollout.mode == "async"

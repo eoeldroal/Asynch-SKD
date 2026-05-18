@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import math
 import os
 import re
 import time
@@ -138,11 +140,56 @@ def _normalize_hotkey_keys(value: Any) -> Any:
 
 
 _COORD_ACTIONS = frozenset({"CLICK", "DOUBLE_CLICK", "RIGHT_CLICK", "MOVE_TO", "DRAG_TO"})
+_ACTION_TYPE_ALIASES = {
+    "LEFT_CLICK": "CLICK",
+    "left_click": "CLICK",
+    "left": "CLICK",
+}
+
+
+def _coerce_legacy_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    return None
+
+
+def _coerce_wait_duration_seconds(value: Any) -> float | int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(duration) or duration <= 0:
+        return None
+    return duration if duration - int(duration) != 0 else int(duration)
 
 
 def _normalize_web_osgym_action_payload(raw_action: Mapping[str, Any]) -> dict[str, Any]:
     normalized = dict(raw_action)
     action_type = normalized.get("action_type")
+    if isinstance(action_type, str):
+        normalized["action_type"] = _ACTION_TYPE_ALIASES.get(action_type, action_type)
+        action_type = normalized["action_type"]
+
+    if action_type == "WAIT":
+        duration = _coerce_wait_duration_seconds(normalized.get("duration"))
+        if duration is not None:
+            normalized["duration"] = duration
+        for alias in ("timeout", "delay"):
+            if alias not in normalized:
+                continue
+            alias_value = normalized.pop(alias)
+            alias_duration = _coerce_wait_duration_seconds(alias_value)
+            if duration is None:
+                normalized["duration"] = alias_duration if alias_duration is not None else alias_value
+                duration = alias_duration
 
     if action_type in _COORD_ACTIONS and "coordinate" not in normalized:
         x = normalized.get("x")
@@ -161,6 +208,39 @@ def _normalize_web_osgym_action_payload(raw_action: Mapping[str, Any]) -> dict[s
     elif action_type == "HOTKEY" and isinstance(normalized.get("keys"), list):
         normalized["keys"] = _normalize_hotkey_keys(normalized.get("keys"))
     return normalized
+
+
+def _extract_coordinate_pair_like(value: Any) -> tuple[int, int] | None:
+    if isinstance(value, list) and len(value) >= 2:
+        return int(value[0]), int(value[1])
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                return None
+            if isinstance(parsed, list) and len(parsed) >= 2:
+                return int(parsed[0]), int(parsed[1])
+    return None
+
+
+def _expand_web_osgym_action_payloads(raw_action: Mapping[str, Any]) -> list[dict[str, Any]]:
+    normalized = _normalize_web_osgym_action_payload(raw_action)
+    action_type = normalized.get("action_type")
+    enter = _coerce_legacy_bool(normalized.pop("enter", None))
+    normalized.pop("clear", None)
+
+    if action_type == "WAIT":
+        duration = _coerce_wait_duration_seconds(normalized.get("duration"))
+        if duration is not None:
+            normalized.pop("duration", None)
+            wait_count = max(1, min(10, math.ceil(float(duration))))
+            return [{"action_type": "WAIT"} for _ in range(wait_count)]
+
+    if action_type == "TYPING" and enter is True:
+        return [normalized, {"action_type": "PRESS", "key": _normalize_playwright_key_alias("enter")}]
+    return [normalized]
 
 
 def _coerce_optional_int(value: Any) -> int | None:
@@ -374,15 +454,41 @@ class WebOsGymTool(BaseTool):
         normalized = deepcopy(dict(parameters))
         if self._is_action_named_tool():
             normalized_action = _normalize_web_osgym_action_payload({"action_type": self.name, **normalized})
-            normalized_action.pop("action_type", None)
-            return normalized_action
+            normalized = {key: value for key, value in normalized_action.items() if key != "action_type"}
+            if self.name in _COORD_ACTIONS:
+                allowed_parameters = set(self.tool_schema.function.parameters.properties)
+                uses_coordinate_schema = "coordinate" in allowed_parameters and not {"x", "y"} & allowed_parameters
+
+                coordinate = normalized.get("coordinate")
+                pair = _extract_coordinate_pair_like(coordinate)
+                if pair is None:
+                    pair = _extract_coordinate_pair_like(normalized.get("x"))
+                if pair is None:
+                    x = normalized.get("x")
+                    y = normalized.get("y")
+                    if x is not None and y is not None:
+                        pair = int(x), int(y)
+
+                if pair is not None:
+                    if uses_coordinate_schema:
+                        normalized["coordinate"] = [pair[0], pair[1]]
+                        normalized.pop("x", None)
+                        normalized.pop("y", None)
+                    else:
+                        normalized["x"], normalized["y"] = pair
+                        normalized.pop("coordinate", None)
+            return normalized
 
         raw_actions = normalized.get("actions")
         if not isinstance(raw_actions, list):
             return normalized
-        normalized["actions"] = [
-            _normalize_web_osgym_action_payload(action) if isinstance(action, Mapping) else action for action in raw_actions
-        ]
+        expanded_actions = []
+        for action in raw_actions:
+            if isinstance(action, Mapping):
+                expanded_actions.extend(_expand_web_osgym_action_payloads(action))
+            else:
+                expanded_actions.append(action)
+        normalized["actions"] = expanded_actions
         return normalized
 
     def _normalize_actions(
@@ -452,9 +558,9 @@ class WebOsGymTool(BaseTool):
                 cursor_x, cursor_y = drag_x, drag_y
 
             elif action_type == "SCROLL":
-                self._require_field(action, "dx")
-                self._require_field(action, "dy")
-                payload.update({"dx": -int(action.dx), "dy": -int(action.dy)})
+                dx = 0 if action.dx is None else int(action.dx)
+                dy = int(self._require_field(action, "dy"))
+                payload.update({"dx": -dx, "dy": -dy})
 
             elif action_type == "TYPING":
                 self._require_field(action, "text")
@@ -481,16 +587,20 @@ class WebOsGymTool(BaseTool):
     ) -> tuple[list[WebOsGymAction], int | None, int | None]:
         if not isinstance(raw_actions, list):
             raise ValueError("Web/OSGym bundled action tool requires an actions list")
-        self._validate_action_count(len(raw_actions))
-
-        actions = []
+        expanded_raw_actions = []
         for index, raw_action in enumerate(raw_actions):
             if not isinstance(raw_action, Mapping):
                 raise ValueError(
                     f"Web/OSGym actions[{index}] must be an object matching the action schema, "
                     f"got {type(raw_action).__name__}"
                 )
-            actions.append(WebOsGymAction(**_normalize_web_osgym_action_payload(raw_action)))
+            expanded_raw_actions.extend(_expand_web_osgym_action_payloads(raw_action))
+
+        self._validate_action_count(len(expanded_raw_actions))
+
+        actions = []
+        for raw_action in expanded_raw_actions:
+            actions.append(WebOsGymAction(**raw_action))
 
         terminal_actions = [action for action in actions if action.action_type in {"DONE", "FAIL"}]
         if terminal_actions and len(actions) != 1:
@@ -667,6 +777,7 @@ class WebOsGymTool(BaseTool):
             "terminated": terminated,
             "termination_reason": termination_reason,
             "action_count": len(actions),
+            "invalid_action": False,
             "web_osgym_actions": final_actions,
         }
 

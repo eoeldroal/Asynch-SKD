@@ -2,8 +2,10 @@
 set -xeuo pipefail
 
 WEBGYM_SKD_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_skd
-WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config_bundled.yaml
-WEBGYM_SYSTEM_PROMPT_PATH="${1:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl.txt}"
+WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml
+WEBGYM_SYSTEM_PROMPT_PATH="${WEBGYM_SYSTEM_PROMPT_PATH:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl_action_named.txt}"
+WEBGYM_TEACHER_SYSTEM_PROMPT_PATH="${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt}"
+WEBGYM_TEACHER_FEWSHOT_PATH="${WEBGYM_TEACHER_FEWSHOT_PATH:-}"
 HF_HUB_ROOT=/home/sogang_nlpy/.cache/huggingface/hub
 QWEN35_9B_PATH="${QWEN35_9B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
 QWEN35_27B_PATH="${QWEN35_27B_PATH:-${HF_HUB_ROOT}/models--Qwen--Qwen3.5-27B/snapshots/fc05daec18b0a78c049392ed2e771dde82bdf654}"
@@ -11,9 +13,6 @@ RUN_TS="$(date +%Y%m%d_%H%M%S)"
 ASYNC_SKD_EVENT_LOG_PATH="/home/sogang_nlpy/verl/logs/async_skd_events_webgym_${RUN_TS}.jsonl"
 ASYNC_SKD_CHUNK_LIVE_LOG_PATH="/home/sogang_nlpy/verl/logs/async_skd_chunk_live_webgym_${RUN_TS}.jsonl"
 ASYNC_SKD_TURN_LOG_PATH="/home/sogang_nlpy/verl/logs/async_skd_turns_webgym_${RUN_TS}.jsonl"
-if [ "$#" -ge 1 ]; then
-    shift
-fi
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -33,7 +32,7 @@ python3 -m verl.trainer.main_ppo \
     data.return_raw_chat=True \
     data.train_batch_size=16 \
     data.max_prompt_length=3072 \
-    data.max_response_length=24576 \
+    data.max_response_length=16385 \
     data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=64 \
     data.truncation=error \
@@ -65,9 +64,10 @@ python3 -m verl.trainer.main_ppo \
     +distillation.distillation_loss.forward_kl_topk_impl=logsumexp_gather \
     distillation.distillation_loss.use_task_rewards=False \
     distillation.distillation_loss.use_policy_gradient=False \
-    distillation.skd.chunk_size=32 \
-    distillation.skd.verify_top_k=1 \
-    distillation.skd.max_chunks_per_sample=256 \
+    distillation.skd.chunk_size=128 \
+    distillation.skd.verify_top_k=5 \
+    distillation.skd.max_chunks_per_sample=128 \
+    "distillation.skd.teacher_system_prompt_path=${WEBGYM_TEACHER_SYSTEM_PROMPT_PATH}" \
     distillation.skd.windowed_training_enabled=False \
     distillation.skd.mask_invalid_action=False \
     actor_rollout_ref.rollout.name=sglang \
@@ -119,15 +119,15 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.veomni.attn_implementation=flash_attention_2 \
     'trainer.logger=["console","wandb"]' \
     trainer.project_name=verl_async_skd_qwen35_webgym \
-    trainer.experiment_name=qwen35_9b_to_27b_async_skd_webgym \
-    trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_counter_tool \
+    trainer.experiment_name=qwen35_9b_to_27b_async_skd_webgym_fast_test_gdn_fix \
+    trainer.default_local_dir=/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_fast_test_gdn_fix \
     trainer.rollout_data_dir=/home/sogang_nlpy/verl/logs/rollout_data/webgym_async_skd_${RUN_TS} \
     trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.val_before_train=False \
-    trainer.resume_mode=auto \
+    trainer.resume_mode=disable \
     trainer.save_freq=5 \
-    trainer.test_freq=5 \
+    trainer.test_freq=-1 \
     trainer.total_epochs=100 \
     trainer.total_training_steps=10000 \
     +trainer.use_legacy_worker_impl=disable \

@@ -272,16 +272,30 @@ class Qwen3XMLToolParser(ToolParser):
                         f"boolean (`true` of `false`) in tool '{func_name}', degenerating to false."
                     )
                 return param_value == "true"
+            elif (
+                param_type == "object"
+                or param_type.startswith("dict")
+                or param_type == "array"
+                or param_type.startswith("list")
+                or param_type.startswith("tuple")
+            ):
+                try:
+                    param_value = json.loads(param_value)
+                    return param_value
+                except Exception:
+                    logger.warning(
+                        f"Parsed value '{param_value}' of parameter '{param_name}' is not valid JSON in tool "
+                        f"'{func_name}', will try other methods to parse it."
+                    )
+                try:
+                    param_value = eval(param_value)
+                except Exception:
+                    logger.warning(
+                        f"Parsed value '{param_value}' of parameter '{param_name}' cannot be converted "
+                        f"via Python `eval()` in tool '{func_name}', degenerating to string."
+                    )
+                return param_value
             else:
-                if param_type == "object" or param_type.startswith("dict"):
-                    try:
-                        param_value = json.loads(param_value)
-                        return param_value
-                    except Exception:
-                        logger.warning(
-                            f"Parsed value '{param_value}' of parameter '{param_name}' is not a valid "
-                            f"JSON object in tool '{func_name}', will try other methods to parse it."
-                        )
                 try:
                     param_value = eval(param_value)
                 except Exception:

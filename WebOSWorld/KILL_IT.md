@@ -414,8 +414,12 @@ WebGym Async SKD에서 초기에 발생하는 `no-tool <|im_end|>` 붕괴가
 - Anthropic의 `computer_20241022` / `computer_20251124` API와 스키마 전면 비교 수행
 - 공유 가능한 부분: `coordinate: [x, y]` 배열 표현 — 이것만 채택
 - 채택하지 않는 부분:
-  - action type 이름 (`left_click` vs `CLICK` 등): 모델이 이미 우리 이름으로 출력하므로 변경 불필요
-  - scroll 형식 (`scroll_direction/scroll_amount` vs `dx/dy`): 모델이 이미 dx/dy로 출력 (100% 일치)
+  - action type 이름 체계 자체 (`left_click` vs `CLICK` 등): canonical contract는 현행 유지
+    - 다만 latest val에서는 `LEFT_CLICK`, `left_click`, `left` 같은 non-canonical action_type drift가 소수 남아 있음
+    - 이것은 semantics 부족이 아니라 action vocabulary canonicalization 문제로 읽어야 함
+  - scroll 형식의 필드명 자체 (`scroll_direction/scroll_amount` vs `dx/dy`): `dx/dy` 유지
+    - 다만 latest val qualitative read에서는 raw model `dy` sign이 Playwright/server contract와 반대로 나오는 경향이 강해,
+      현재 adapter의 sign inversion shim은 유지가 필요함
   - 좌표계 (픽셀 절댓값 vs 1000×1000 상대 좌표): 서버 프로토콜 변경 필요하므로 유지
 - **결론**: `coordinate: [x, y]` 필드명만 Anthropic 방식으로 채택. 나머지는 현행 유지.
 
@@ -449,7 +453,9 @@ WebGym Async SKD에서 초기에 발생하는 `no-tool <|im_end|>` 붕괴가
   | DRAG_TO | `”Drag to coordinate [x, y] with the left button pressed.”` |
   | HOTKEY | `”Press the specified key combination. keys is an array of key names, for example ['ctrl', 'c'].”` |
 
-- 변경 없음: SCROLL, TYPING, PRESS, KEY_DOWN, KEY_UP, MOUSE_DOWN, MOUSE_UP, WAIT, DONE, FAIL
+- 변경 없음: TYPING, PRESS, KEY_DOWN, KEY_UP, WAIT, DONE, FAIL
+- MOUSE_DOWN/MOUSE_UP: 스키마 유지, 핸들러 추가 완료
+- SCROLL: field schema는 유지하되, sign semantics는 아래 shim note 참고
 
 ##### 변경 확정 — 파서 레이어 (tolerate-at-boundary)
 
@@ -508,6 +514,103 @@ action.coordinate = [35, 175], action.x = None
 - RIGHT_CLICK/DRAG_TO 처음으로 실제 서버 도달 가능 (핸들러 이미 추가)
 - constrained decoding 불필요 → student/teacher 분포 정렬
 - RL 이후에도 constraint 없이 동일 포맷 재현 가능
+
+##### 남은 action-name drift
+
+- current val `20260515_184009/step_1`에서는 coordinate payload 붕괴는 크게 줄었지만,
+  non-canonical action type이 소수 남아 있다:
+  - `LEFT_CLICK`
+  - `left_click`
+  - `left`
+- 이는 left-click semantics를 모르는 문제가 아니라,
+  canonical contract가 `CLICK`인데 action vocabulary가 drift하는 문제다
+- 현재 canonical contract는 유지:
+  - left click = `{"action_type": "CLICK", ...}`
+  - right click = `{"action_type": "RIGHT_CLICK", ...}`
+- 필요 시 가장 좁은 후속 패치는 boundary alias normalization:
+  - `LEFT_CLICK | left_click | left -> CLICK`
+  - 그러나 현 시점에서는 coordinate/schema alignment보다 우선순위가 낮다
+
+##### SCROLL sign note
+
+- live server path (`surfgym` / Playwright on port `18000`)는 `SCROLL dx/dy`를 그대로 `page.mouse.wheel(dx, dy)`로 넘긴다
+- 즉 server / Playwright contract만 보면:
+  - `dy > 0` = scroll down
+  - `dy < 0` = scroll up
+- 그러나 current val `20260515_184009/step_1` qualitative sweep에서,
+  raw model output은 대체로 반대 sign을 낸다:
+  - total SCROLL turns: `170`
+  - raw sign: `neg=148`, `pos=22`
+  - parsed/executed sign after adapter inversion: `pos=146`, `neg=22`
+- 5.4-mini subagent split review across SCROLL samples converged on the same conclusion:
+  - successful “scroll down” cases are typically
+    - raw `dy < 0`
+    - adapter-normalized `dy > 0`
+    - next observation consistent with downward movement
+  - removing the current inversion would flip many currently-working scroll turns the wrong way
+- therefore:
+  - **contract-level truth**: server does not require sign inversion
+  - **current model-behavior truth**: adapter inversion should remain as a compatibility shim for this live server path
+- interpretation:
+  - SCROLL’s remaining issue is not payload shape
+  - it is a model-facing sign-convention mismatch plus occasional wasted scroll/search policy
+
+##### `actions_json_malformed` detailed read (val `20260515_184009/step_1`)
+
+- latest val `step_1` zero-score sweep 기준 `actions_json_malformed` turn은 `137`개
+- latest qualitative split 결과, 이 parse error는 하나가 아니라 아래 세 층이 겹쳐 있다:
+  1. **실제 JSON delimiter error**
+     - 대표 형태:
+       - `[{\"action_type\": \"CLICK\", \"coordinate\": [19, 977]]`
+       - `[{\"action_type\": \"CLICK\", \"coordinate\": [35, 970]}`
+       - `[{\"action_type\": \"CLICK\", \"coordinate\": [35, 65]]}`
+     - 즉 coordinate schema 자체를 모른다기보다,
+       - object close 누락
+       - array close 누락
+       - close 순서 오류
+       가 main
+  2. **Qwen-side tool dialect drift**
+     - 대표 형태:
+       - `text='mkdir -p clean039'`
+       - `dx=0, dy=-500`
+       - `{\"clear\": false, \"enter\": false}`
+     - 이는 current bundled contract 바깥의 lexical drift이며,
+       parse/normalize boundary에서 국소 흡수가 가능
+  3. **parser implementation mismatch**
+     - current `Qwen3XMLToolParser.convert_param_value()`는 `object/dict`에만 `json.loads()`를 시도하고,
+       `actions`처럼 `type=array`인 parameter는 곧바로 `eval()` fallback으로 간다
+     - 따라서 아래처럼 **정상 JSON**도 parser가 `actions_json_malformed`로 떨어뜨린다:
+       - `[{\"action_type\": \"TYPING\", \"text\": \"...\", \"clear\": false, \"enter\": false}]`
+     - 이유:
+       - Python `eval()`은 JSON boolean `false/true/null`을 그대로 받을 수 없음
+
+- parse-error feedback loop도 일부 존재한다:
+  - current `_build_tool_parse_error_feedback()`는 full `<tool_call> ... </tool_call>` example block를 그대로 준다
+  - latest val read에서는 parse-error turn 중 `7`개가
+    - `"The error message indicates ..."`
+    - `"Let me look at the correct format ..."`
+    처럼 이 예시를 복창한 뒤 다시 malformed tool call을 냄
+  - 즉 feedback는 root cause는 아니지만, 일부 local loop를 증폭시킨다
+
+- 따라서 다음 root-cause fix 방향은 아래로 고정한다:
+  1. parser:
+     - `actions` 같은 array parameter는 `eval()` 전에 `json.loads()`를 우선 시도
+  2. parse feedback:
+     - full multiline tool-call example block 제거
+     - “corrected tool call only” + 짧은 actions payload example만 남김
+  3. boundary normalization:
+     - `LEFT_CLICK | left_click | left -> CLICK`
+     - `TYPING.clear` / `TYPING.enter` drift는 parse layer가 아니라 normalize layer에서 흡수
+     - `clear`는 현재 최소 범위에서는 ignore
+     - `enter=true`는 `PRESS Enter` expansion으로 존중
+
+- 중요한 판정:
+  - latest evidence는 `coordinate: [x, y]` canonical schema 자체를 다시 뒤집을 이유를 주지 않는다
+  - current malformed bulk는
+    - schema semantics mismatch
+    가 아니라
+    - delimiter error + dialect drift + parser tolerance 부족
+    쪽으로 읽는 것이 맞다
 
 #### Step B. Schema 변경 후 val 반복 수렴
 
@@ -3081,6 +3184,1206 @@ pytest -q tests/skd/test_skd_logic.py tests/skd/test_web_skd_agent_loop_on_cpu.p
   - Round 2: 남은 에러 패턴 재분류 (DRAG_TO 의미론, unknown action_type 문자열 등)
   - Round 3: parse_error_turn_ratio < 5% 수렴 확인 → RL 진입 판단
 - **cursor 스케일링 주의**: `_require_coordinates()` 수정 시 cursor fallback은 이미 screen 좌표이므로 scale 불필요. 새 `coordinate` 필드를 읽을 때만 `_scale_xy_to_screen()` 호출. 기존 `if action.x is not None and action.y is not None` 조건을 `if action.coordinate is not None` 으로 교체해야 이중 스케일링 방지.
+
+---
+
+### Step 4. Qwen-native action surface migration — next validation lane
+
+#### Status
+
+- In progress
+
+#### Decision update
+
+- from this point on, **constraint decoding / structured output is no longer part of the target path**
+- we will **not** try to salvage WebGym by:
+  - re-enabling `enable_qwen3_coder_structured_output`
+  - adapting the current structured-output helper to a new multi-tool surface
+  - relying on grammar-side correction as a permanent policy crutch
+
+#### Why this direction is now preferred
+
+- current bundled surface
+  - `computer(actions=[...])`
+  - puts the most fragile part of the protocol inside a nested JSON array under a single `<parameter=actions>`
+- current parser and Qwen XML protocol are more naturally aligned with:
+  - one `<function=...>`
+  - a small set of top-level `<parameter=...>`
+- latest runtime review shows that WebGym already supports this shape operationally:
+  - `WebOsGymTool` already recognizes Computer 13 action-named tools
+  - `WebOsGymLoopMixin._bundle_web_osgym_tool_calls(...)` already converts multiple action-named function calls back into one ordered server `actions` list
+  - therefore the migration is **not** “new executor design”; it is primarily a **model-facing protocol migration**
+
+#### Target model-facing schema
+
+- one action = one function tool
+- action names must remain the current runtime vocabulary:
+  - `MOVE_TO`
+  - `CLICK`
+  - `MOUSE_DOWN`
+  - `MOUSE_UP`
+  - `RIGHT_CLICK`
+  - `DOUBLE_CLICK`
+  - `DRAG_TO`
+  - `SCROLL`
+  - `TYPING`
+  - `PRESS`
+  - `KEY_DOWN`
+  - `KEY_UP`
+  - `HOTKEY`
+  - `WAIT`
+  - `DONE`
+  - `FAIL`
+- **do not invent new names**
+  - for example, use `TYPING`, not `TYPE`
+
+#### Pointer-action parameter rule
+
+- pointer actions in the action-named lane now use **top-level `coordinate`**
+- canonical pointer form:
+  - `MOVE_TO(coordinate=[x, y])`
+  - `CLICK(coordinate=[x, y], button=..., num_clicks=...)`
+  - `RIGHT_CLICK(coordinate=[x, y])`
+  - `DOUBLE_CLICK(coordinate=[x, y])`
+  - `DRAG_TO(coordinate=[x, y])`
+- reason:
+  - the `x/y` probe has now served its purpose
+  - latest validation on the action-named lane showed that the model often still tries to express pointer location as **one pair-like blob**
+    - `x="[35, 976]"`
+    - `x="36, 175"`
+  - therefore the strongest read is:
+    - `one action = one function` is good
+    - `pointer = two separate scalar fields` is not the best fit
+- this means the experimental lane is deliberately:
+  - **action-named function surface**
+  - **top-level `coordinate` pointer parameter**
+  - **no structured output**
+- executor-side server payload remains unchanged:
+  - model-facing `coordinate`
+  - tool-side conversion to server-facing scalar `x/y`
+
+#### What we are explicitly choosing not to do
+
+- do **not** continue iterating on:
+  - `computer(actions=[...])` as the long-term target surface
+- do **not** spend effort extending:
+  - `qwen_coder_structured_output.py`
+  - because it hard-assumes exactly one bundled `computer` tool
+- do **not** treat a future recovery under constrained decoding as evidence that the unconstrained protocol is healthy
+
+#### Immediate protocol consequences
+
+- the current parse-error guidance is tied to:
+  - function name = `computer`
+  - `<parameter=actions>` JSON array
+- once the new lane starts, this guidance must be rewritten around:
+  - one corrected function call
+  - top-level parameters
+  - no `actions` array
+- existing `actions_json_malformed` taxonomy remains useful for the current bundled lane,
+  but it will no longer be the primary failure surface in the new lane
+
+#### Validation-only rollout plan for the new lane
+
+1. create a separate experimental tool config
+   - do not overwrite the current bundled lane
+2. expose Computer 13 as action-named tools
+3. keep pointer actions on top-level `coordinate`
+4. keep structured output **off**
+5. minimally realign:
+   - system prompt
+   - parse-error feedback
+   - any few-shot asset used in that lane
+6. run validation only
+   - no RL
+   - no SKD
+   - no mixed structured-output comparison in the same probe
+
+#### First-pass readouts for the new lane
+
+- tool parse failure type distribution
+- unknown function / unknown parameter rate
+- valid tool execution rate
+- invalid action rate
+- zero-score composition:
+  - parse
+  - invalid
+  - clean-but-incomplete
+- action-family breakdown:
+  - pointer actions
+  - SCROLL
+  - keyboard actions
+  - DONE / FAIL usage
+
+#### Success criterion
+
+- if the new lane reduces:
+  - nested-JSON-specific parse churn
+  - bundled `actions`-array malformed turns
+  - invalid action-name drift
+- while keeping or improving:
+  - valid execution rate
+  - reward-positive share
+then it becomes the new primary lane
+
+#### Failure interpretation rule
+
+- if the new lane still fails badly,
+  the first diagnosis should be:
+  - parameter naming
+  - coordinate canonicalization
+  - prompt / feedback mismatch
+- not an immediate return to structured output
+
+#### Implementation status
+
+- completed:
+  - separate action-named tool config lane is now active at:
+    - `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
+  - separate action-named system prompt asset:
+    - `WebOSWorld/webgym_rl/system_prompt_webgym_rl_action_named.txt`
+  - separate val launcher:
+    - `WebOSWorld/val_run_qwen35_webgym_fully_async_rl_tool_veomni_action_named.sh`
+  - parse-error feedback now branches by active tool surface:
+    - bundled lane → `computer(actions=[...])`
+    - action-named lane → one corrected function call with top-level parameters
+  - runtime now accepts `SCROLL(dy=...)` with `dx` omitted and defaults `dx=0`
+  - single-call action-named path is now **schema-aware**:
+    - if the action-named tool schema uses `coordinate`, keep `coordinate` as canonical
+    - still absorb residual:
+      - `x='[x, y]'`
+      - `x=[x, y]`
+      - legacy scalar `x=..., y=...`
+    - and rewrite them to canonical `coordinate` before validation
+  - action-named prompt and parse-error guidance now both teach:
+    - pointer actions → `coordinate=[x, y]`
+  - `WAIT` now uses:
+    - canonical optional `duration` in seconds
+    - alias absorption for `timeout` / `delay`
+    - tool-side expansion into repeated 1-second `WAIT` actions so the runtime contract stays truthful
+    - duration is rounded up to the nearest whole-second wait step and capped to a small bounded range
+
+- verified by tests:
+  - `110 passed`
+  - focused coverage includes:
+    - action-named config shape
+    - action-named parse-error feedback
+    - action-named single-call execution
+    - bundled-lane regression checks
+    - new val-lane asset presence and launcher wiring
+
+#### First action-named val probe: actual observed failure shape
+
+- first run:
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_action_named_only_val_20260515_202320/step_1`
+- the immediate dominant pointer failure was **not**
+  - `coordinate=[x, y]`
+- it was mostly:
+  - `<parameter=x>[35, 730]</parameter>`
+  - `<parameter=x>36, 175</parameter>`
+  - `<parameter=x>35, 720]</parameter>`
+- representative trajectories:
+  - `.../prozilla_task_A_31.../trajectory.jsonl`
+  - `.../prozilla_task_B_16.../trajectory.jsonl`
+  - `.../warn_prozilla_explorer_10.../trajectory.jsonl`
+
+#### Root cause of the first failure
+
+- the model-facing lane had already changed to action-named scalar `x/y`
+- but the model still emitted residual pair-like pointer values in two common forms:
+  - bracketed pair string inside `x`
+    - e.g. `"[19, 977]"`
+  - comma-joined pair string inside `x`
+    - e.g. `"36, 175"`
+- the single-call action-named execution path goes through:
+  - `WebOsGymLoopMixin._execute_web_osgym_tool_calls(...)`
+  - `tool.postprocess_tool_arguments(...)`
+  - `tool.execute(...)`
+- at that boundary, the first implementation still assumed cleaner scalar `x/y`
+- additionally, the helper intended to absorb bracketed pair-like strings was initially ineffective because:
+  - `verl/tools/web_osgym_tool.py` was missing a local `json` import
+  - so the helper swallowed the exception and returned `None`
+- net effect:
+  - residual pair-like `x` survived into `WebOsGymAction`
+  - then failed at integer validation
+  - or earlier `int('[19, 974]')`-style conversion
+
+#### Fix applied after the first failure
+
+- action-named single-call postprocess now:
+  - keeps canonical pointer form aligned with the current action-named schema
+    - current state: canonical top-level `coordinate`
+  - but also absorbs residual:
+    - `coordinate=[x, y]`
+    - `x='[x, y]'`
+    - list-like `x=[x, y]`
+    - legacy scalar `x=..., y=...`
+  - and rewrites them to canonical pointer form before validation
+- `json` import restored in `verl/tools/web_osgym_tool.py` so the pair-like parser actually runs
+- result:
+  - the exact first-run crash path is now closed
+  - remaining action-named pointer failures, if any, should now reflect the model / prompt / schema itself rather than a dead boundary helper
+
+#### Second action-named probe: verdict on `x/y`
+
+- latest run:
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_action_named_only_val_20260515_203353/step_1`
+- strong positive:
+  - `one action = one function` surface itself aligned very well
+  - `assistant_turn` parse errors = `0`
+- but pointer parameter fit was still bad under scalar `x/y`
+  - pointer actions total:
+    - clean scalar `x/y`: `1001 / 2314 = 43.3%`
+    - pair-like residue in `x`: `1297 / 2314 = 56.1%`
+  - by action:
+    - `CLICK`
+      - scalar `x/y`: `39.3%`
+      - pair-like in `x`: `60.1%`
+    - `MOVE_TO`
+      - scalar `x/y`: `56.2%`
+      - pair-like in `x`: `43.8%`
+    - `RIGHT_CLICK`
+      - scalar `x/y`: `57.2%`
+      - pair-like in `x`: `42.1%`
+    - `DOUBLE_CLICK`
+      - scalar `x/y`: `61.3%`
+      - pair-like in `x`: `38.0%`
+    - `DRAG_TO`
+      - scalar `x/y`: `63.6%`
+      - pair-like in `x`: `36.4%`
+- interpretation:
+  - the action-named migration is good
+  - the scalar `x/y` pointer probe is not the best model-facing fit
+  - the next controlled step is therefore:
+    - keep action-named surface
+    - move pointer actions back to canonical top-level `coordinate`
+
+#### Third action-named probe: early read after switching pointer actions to `coordinate`
+
+- in-progress run:
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_action_named_only_val_20260515_211219/step_1`
+- current mid-run read from `trajectory.jsonl` only:
+  - `assistant_turn` count: `980`
+  - parse errors: `0`
+  - invalid turns: `26`
+- pointer actions now align strongly with the new canonical form:
+  - `CLICK`
+    - `coordinate=[x, y]`: `510 / 519`
+    - omitted coordinate on known cursor: `9 / 519`
+    - residual `x='[x, y]'` / `x='x, y'`: `0`
+  - `DOUBLE_CLICK`
+    - `coordinate=[x, y]`: `127 / 130`
+    - omitted coordinate on known cursor: `3 / 130`
+  - `MOVE_TO`
+    - `coordinate=[x, y]`: `45 / 45`
+  - `RIGHT_CLICK`
+    - `coordinate=[x, y]`: `61 / 61`
+- interpretation:
+  - `one action = one function` remained good
+  - the pointer parameter rollback to canonical top-level `coordinate` immediately matched the model much better
+  - the earlier `x='[x, y]'` pathology is no longer the dominant live failure surface
+- new dominant residual mismatch:
+  - `WAIT`
+    - raw calls seen so far: `40`
+    - empty `{}`: `14`
+    - `duration`: `24`
+    - `timeout`: `2`
+  - representative invalids are now:
+    - `WAIT(duration=2.0)` rejected because the current action-named schema still expects an empty object
+  - therefore the next schema-fit cleanup target is:
+    - canonical `WAIT(duration=...)`
+    - with alias absorption for `timeout` / `delay`
+    - while keeping backend truth explicit that the current runtime executes WAIT in 1-second steps
+
+#### WAIT schema-fit patch applied after the third probe
+
+- action-named tool schema now accepts:
+  - `WAIT(duration=...)`
+- action-named prompt now explicitly teaches:
+  - optional `duration` in seconds
+- runtime handling:
+  - canonical `duration`
+  - absorb `timeout` / `delay` aliases
+  - expand to repeated backend `WAIT` actions
+    - current backend truth is still `1 WAIT = 1000 ms`
+  - round duration up to the nearest whole-second wait step
+- implication:
+  - this preserves model-facing naturalness
+  - while keeping the server-side behavior honest instead of pretending the backend natively understands arbitrary wait durations
+
+#### SCROLL description alignment for the action-named lane
+
+- KILL IT keeps the distinction:
+  - **server-native truth**
+    - `dy > 0` = down
+    - `dy < 0` = up
+  - **current live model-facing truth**
+    - adapter inversion shim is intentionally still active
+- because the YAML tool schema is model-facing input, the action-named lane description has now been flipped to match the **current live effective semantics**:
+  - negative `dy` scrolls down
+  - positive `dy` scrolls up
+  - negative `dx` scrolls right
+  - positive `dx` scrolls left
+- this is intentional and local to the present shimmed lane
+- if the shim is removed later, the description must be flipped back to server-native semantics
+
+#### Remaining caveats for Step 4
+
+- `MOUSE_DOWN` / `MOUSE_UP`
+  - schema currently advertises button-specific behavior
+  - but the current server command path drops `button` at `to_commands()` time
+  - this is a real execution/documentation mismatch and remains open
+- `WAIT`
+  - latest pre-patch action-named run showed the model frequently emitting:
+    - `duration`
+    - `timeout`
+    - `delay`
+  - that mismatch is now patched in the current action-named lane
+  - next thing to verify is not implementation correctness but:
+    - whether invalid `WAIT` turns disappear on the next validation run
+- `SCROLL`
+  - latest action-named probe that showed strong `dy < 0` usage was collected **before** the YAML description was flipped
+  - so the old run should be read as:
+    - strong prior already favored `dy < 0` for downward scroll
+    - old description was not enough to override that prior
+  - the current description is now intentionally aligned to the live shimmed lane
+
+#### ProzillaOS terminal-required task audit: trajectory-first split
+
+- target run:
+  - `logs/rollout_data/qwen35_27b_webgym_fully_async_tool_veomni_action_named_only_val_20260515_211219/step_1`
+- target slice:
+  - Prozilla terminal-required tasks only
+  - count: `44`
+- first-pass split from trajectory review:
+  - the dominant failures are not all the same thing
+  - they split into two buckets:
+    - **terminal UI state-machine failures**
+    - **shell capability / command-contract failures**
+- representative strong terminal UI failure cases:
+  - `warn_prozilla_scripts_14`
+  - `prozilla_task_B_02`
+  - `prozilla_task_B_15`
+  - `prozilla_task_B_22`
+  - `prozilla_task_B_30`
+- representative shell capability / command-contract failures:
+  - path / lookup utilities missing:
+    - `find`
+    - `which`
+    - `whereis`
+    - `readlink -f`
+    - `realpath`
+  - archive / move / copy utilities missing:
+    - `zip`
+    - `tar`
+    - `cp`
+    - `mv`
+  - common inspection / formatting utilities missing:
+    - `wc`
+    - `sort`
+    - `tree`
+    - `du`
+    - `id`
+    - `chmod`
+  - `ls` option handling is misleading:
+    - `ls -R`
+    - `ls -l`
+    - `ls -la`
+    are reported as though `-R`, `-l`, `-la` were missing paths rather than unsupported flags
+- first-pass interpretation:
+  - some tasks fail before shell capability even matters because the terminal never becomes a stable visible interaction target
+  - other tasks clearly reach a stable terminal but then fail because the shell surface is much narrower than the benchmark expects
+
+#### ProzillaOS terminal-required task audit: live 3100 reproduction
+
+- live instance used for reproduction:
+  - `http://127.0.0.1:3100`
+  - served by local `caddy`
+- exact things directly reproduced on the live instance:
+  1. desktop `Commands` **single click** does not open the terminal
+  2. desktop `Commands` **double click** opens a terminal window
+  3. once the terminal is open and focused, basic input / execution / output works
+     - `pwd` visibly lands in the input line
+     - pressing `Enter` visibly executes it and prints `/home/prozilla-os`
+  4. clicking the taskbar `Commands` icon while that terminal is already focused **minimizes** the window
+  5. clicking the same taskbar icon again restores the terminal
+  6. double-clicking the desktop `Commands` icon while a terminal is already open spawns a **second** terminal window instead of focusing the existing one
+- this is enough to move the UI diagnosis from “plausible from trajectory shape” to “confirmed live interaction contract”
+
+#### ProzillaOS terminal UI: confirmed live interaction contract
+
+- desktop discoverability mismatch:
+  - benchmark tasks say `Terminal`
+  - the actual app label is `Commands`
+- desktop launch behavior:
+  - the desktop icon behaves like a file-manager icon that wants a double click
+  - this is hostile to the benchmark because the model has to guess whether the app is launcher-like or document-like
+- taskbar behavior:
+  - the taskbar button currently behaves as:
+    - open if no window exists
+    - focus if a window exists but is not focused
+    - minimize if the existing window is already focused
+  - this is acceptable for a human desktop, but it is not agent-friendly
+  - in the benchmark it turns repeated “bring back the terminal” clicks into silent window disappearance
+- window multiplicity:
+  - `Commands` is not treated as a singleton application
+  - reopening from the desktop creates duplicate terminal windows with fragmented history
+- implication:
+  - the strongest terminal UI failures in the trajectories are consistent with the current live interaction contract
+  - especially:
+    - “the window disappeared after I tried to continue”
+    - “I seem to be typing into a blank / fresh terminal again”
+    - “history is split across multiple terminals”
+
+#### ProzillaOS terminal UI: immediate hardening targets
+
+- treat `Commands` as a **singleton terminal window**
+  - if one exists, focus / raise it
+  - do not open a second terminal from the desktop icon or taskbar
+- disable **primary-click minimize** for the taskbar terminal button in benchmark mode
+  - if the terminal exists, repeated clicks should focus / raise it
+  - not toggle it out of view
+- reduce the discoverability mismatch
+  - rename `Commands` to `Terminal`
+  - or expose `Terminal` as an equally visible alias
+- make input landing state explicit
+  - after typing, the benchmark agent should be able to see that the command really landed in the input line
+  - after `Enter`, the agent should be able to see:
+    - the executed command
+    - the resulting stdout / stderr
+    - the next prompt
+- add an explicit visible terminal status strip or equivalent agent-facing indicator for:
+  - `cwd`
+  - last command
+  - exit status
+  - short stderr / stdout tail
+  - input-not-applied / not-focused state if relevant
+
+#### ProzillaOS shell contract: why UI goes first
+
+- live reproduction showed that the shell loop itself is not completely broken
+  - a focused terminal successfully accepted `pwd`
+  - the output rendered correctly
+- therefore the first order problem is not “shell commands never work”
+- the first order problem is:
+  - getting into one stable terminal window
+  - keeping that same window visible
+  - preventing the UI from silently minimizing or forking the session
+- only after that should the benchmark shell surface be widened
+  - `find`
+  - `sort`
+  - `wc`
+  - `tree`
+  - `which`
+  - `whereis`
+  - `du`
+  - `id`
+  - `chmod`
+  - `cp`
+  - `mv`
+  - `zip`
+  - `tar`
+  - plus `ls` flag support or at least truthful unsupported-flag errors
+
+#### Parallel subagent audit after the live 3100 reproduction
+
+- additional split used for follow-up verification:
+  - launch / discoverability
+  - taskbar focus / minimize / duplicate window semantics
+  - input landing / Enter persistence
+  - Files + Commands coexistence
+  - benchmark command matrix
+- important note:
+  - the shared Playwright MCP browser profile was not available to every subagent
+  - therefore the final evidence is mixed:
+    - some tracks are **live verified**
+    - others are **code-backed only**
+  - this does not invalidate the result, but it changes what we can claim as directly reproduced
+
+#### Parallel subagent result: launch / discoverability
+
+- status:
+  - **live verified**
+- confirmed points:
+  - the visible app name is `Commands`, not `Terminal`
+  - the desktop icon is a file-style icon that wants a **double click**
+  - the home / search / taskbar surfaces also show `Commands`
+  - search can still find the internal app id `terminal`, but the visible result text remains `Commands`
+- exact issue statements:
+  - benchmark tasks and evaluator language still say `Terminal`, while the visible app name is `Commands`
+  - the desktop icon launch contract is double-click, not single-click
+  - this is a real discoverability mismatch for agent tasks even if the UI is internally self-consistent
+
+#### Parallel subagent result: taskbar focus / minimize / duplicate windows
+
+- status:
+  - **code-backed**
+  - but the main interaction rule was also independently reproduced live in the main session
+- confirmed points:
+  - focused taskbar click on `Commands` minimizes the existing window
+  - taskbar click on an unfocused `Commands` window focuses it
+  - direct `open()` paths spawn a fresh terminal window rather than reusing the existing one
+  - multiple terminal windows split:
+    - history
+    - current line
+    - prompt
+    - cwd
+    - raw-mode / alt-screen state
+  - `getAppWindowId()` returns one matching app window rather than an explicitly focused terminal session
+- exact issue statements:
+  - `Commands` should behave like a singleton agent console, not a multiply-openable app with per-window shell state
+  - focused taskbar click should not minimize the live agent console in benchmark mode
+  - window targeting must not become ambiguous when more than one terminal exists
+
+#### Parallel subagent result: input landing / Enter persistence
+
+- status:
+  - **code-backed**
+- confirmed points:
+  - `Terminal.tsx` does attempt to focus the text input when active
+  - the typed line is rendered through `InputLine`, so command text should be visible when the input value lands
+  - `Enter` in non-stream mode should run the line, clear it, append command + output to history, and keep the same terminal window alive
+  - the terminal component itself does not intentionally close on `Enter`
+- what remains unproven from this track alone:
+  - whether the benchmark’s dropped-input symptom is a real focus/input landing race in the live browser
+  - whether the observed vanished-window cases are instead downstream effects of:
+    - minimize behavior
+    - duplicate window opening
+    - shell commands that call `exit()`
+- exact issue statements:
+  - verify the focus handoff and input-landing invariant in the live browser, because the component-level contract says it should work
+  - if a typed command visually disappears, the bug is more likely in live focus / session routing than in the raw terminal renderer
+
+#### Parallel subagent result: Files + Commands coexistence
+
+- status:
+  - **code-backed**
+- confirmed points:
+  - window placement is random, so Files and Commands overlap is expected
+  - the window shell uses `overflow: hidden`, so partially obscured terminal content can be clipped
+  - Files keeps `currentDirectory` as local component state and does not subscribe to external virtual-drive mutations
+  - therefore a file created from Commands will not automatically appear in Files until Files rerenders by navigation, reopen, or similar local state movement
+  - the virtual drive itself is shared and persists correctly; the stale part is the Files UI layer
+- exact issue statements:
+  - Files must react to external virtual-drive mutations triggered by terminal commands
+  - mixed-app window placement should be deterministic enough to keep the terminal readable
+  - clipping from `overflow: hidden` should not be able to hide the only visible proof of terminal completion
+
+#### Parallel subagent result: benchmark command matrix
+
+- status:
+  - **code-backed**
+- confirmed supported commands from the current fixture contract:
+  - `pwd`
+  - `cd`
+  - `help`
+  - basic `ls`
+  - `vi` as an editor command
+- confirmed degraded / missing behavior:
+  - `ls -R`
+  - `ls -l`
+  - `ls -la`
+  all behave as though the flag were a missing path
+  - completely missing for the benchmark surface:
+    - `find`
+    - `which`
+    - `whereis`
+    - `wc`
+    - `sort`
+    - `tree`
+    - `du`
+    - `id`
+    - `chmod`
+    - `cp`
+    - `mv`
+    - `zip`
+    - `tar`
+  - `vi Prozilla.md` is path-sensitive:
+    - it opens a blank buffer if `~/Prozilla.md` does not exist
+    - it does not auto-resolve the Desktop fixture link
+- exact issue statements:
+  - add the benchmark-critical command surface explicitly
+  - fix or truthfully reject the common `ls` flags
+  - make the `vi Prozilla.md` benchmark target path unambiguous
+
+#### Consolidated issue list after the parallel audit
+
+- **UI issues that should be fixed first**
+  1. `Commands` vs `Terminal` discoverability mismatch
+  2. desktop double-click requirement for the terminal app
+  3. focused taskbar click minimizing the agent console
+  4. duplicate terminal sessions from direct reopen paths
+  5. ambiguous terminal targeting when more than one instance exists
+  6. lack of a visible, stable input / last-command / result invariant for the agent
+- **shell-contract issues that should be fixed second**
+  1. `ls` flag handling
+  2. missing benchmark command surface
+  3. ambiguous `vi Prozilla.md` target path
+- **mixed-app issues that still matter**
+  1. Files does not auto-reflect terminal-originated mutations
+  2. window overlap and clipping can hide the evidence the benchmark expects to remain visible
+
+#### Async SKD fast-test launcher realigned to the action-named lane
+
+- status:
+  - **completed**
+- exact launcher:
+  - `WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni_fast_test_GDN_fix.sh`
+- current default wiring is now:
+  - tool config:
+    - `WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml`
+  - base system prompt:
+    - `WebOSWorld/webgym_rl/system_prompt_webgym_rl_action_named.txt`
+  - teacher-only system prompt:
+    - `WebOSWorld/webgym_rl/teacher_system_prompt_webgym_rl.txt`
+- current fast-test launcher intentionally does **not** inject teacher few-shot
+  - reason:
+    - the only existing teacher few-shot asset is still bundled-surface shaped
+    - it serializes `computer(actions=[...])`
+    - while the current fast-test SKD lane is action-named
+  - therefore enabling that few-shot by default would mix:
+    - action-named tool schema / prompts
+    - bundled teacher demonstration transcript
+  - this is a contract mismatch, so default policy is now:
+    - **teacher few-shot off**
+- current fast-test launcher also keeps:
+  - `+actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=False`
+  - no `web_osgym_window_enable=True` override
+  - therefore:
+    - no structured-output path
+    - no multi-window WebOSGym path
+- launcher simplification:
+  - prompt paths are now env-var override based rather than positional-arg plus repeated `shift`
+  - this keeps the fast-test surface simpler and less error-prone
+- validation performed:
+  - `bash -n WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni_fast_test_GDN_fix.sh`
+  - syntax passed
+
+#### Live Async SKD run snapshot after the action-named + teacher-prompt switch
+
+- status:
+  - **in progress**
+- live process:
+  - `bash WebOSWorld/run_qwen35_webgym_async_skd_tool_veomni_fast_test_GDN_fix.sh`
+  - active `python3 -m verl.trainer.main_ppo ...`
+- exact live logs:
+  - `logs/async_skd_turns_webgym_20260516_020607.jsonl`
+  - `logs/async_skd_events_webgym_20260516_020607.jsonl`
+  - `logs/async_skd_chunk_live_webgym_20260516_020607.jsonl`
+- current launcher arguments visible from the live process:
+  - `distillation.skd.chunk_size=128`
+  - `distillation.skd.verify_top_k=5`
+  - `distillation.skd.max_chunks_per_sample=256`
+  - `distillation.skd.teacher_system_prompt_path=.../teacher_system_prompt_webgym_rl.txt`
+  - `distillation.skd.mask_invalid_action=False`
+  - `actor_rollout_ref.rollout.multi_turn.tool_config_path=.../webgym_rl_tool_config.yaml`
+  - `actor_rollout_ref.rollout.multi_turn.system_prompt_path=.../system_prompt_webgym_rl_action_named.txt`
+  - `+actor_rollout_ref.rollout.custom.enable_qwen3_coder_structured_output=False`
+  - no teacher few-shot path is being passed
+- progress should currently be read from the async SKD event logs, not from rollout-data artifacts
+  - at inspection time:
+    - `trainer.rollout_data_dir=/home/sogang_nlpy/verl/logs/rollout_data/webgym_async_skd_20260516_020607`
+    - but that directory had not been materialized yet
+  - event-log step fields showed:
+    - `global_step` observed: `7, 8, 9, 10, 11`
+    - `logical_step` observed: `7, 8, 9, 10, 11`
+    - current max snapshot:
+      - `global_step = 11`
+      - `logical_step = 11`
+
+#### Live Async SKD run: response-surface snapshot while still running
+
+- this section is a **live snapshot**
+  - counts below were collected while the files were still growing
+  - they are useful for shape diagnosis, not for final score accounting
+- one live snapshot yielded approximately:
+  - turn rows: `843`
+  - event rows: `32373`
+  - chunk-live rows: `3624`
+- turn-level read:
+  - `parse_status`
+    - `ok = 842`
+    - `no_tool_call = 1`
+  - `tool_exec_status`
+    - `ok = 826`
+    - `invalid_action = 16`
+    - `not_executed = 1`
+  - `mask_decision`
+    - `keep = 842`
+    - `mask_and_terminate = 1`
+- action-family mix in the verified turn tails:
+  - `CLICK = 525`
+  - `DOUBLE_CLICK = 147`
+  - `RIGHT_CLICK = 54`
+  - `MOVE_TO = 35`
+  - `TYPING = 23`
+  - `PRESS = 16`
+  - `SCROLL = 15`
+  - `TYPE = 12`
+  - `WAIT = 6`
+  - `DONE = 3`
+  - `HOTKEY = 3`
+  - `MOUSE_DOWN = 2`
+  - `KEY_DOWN = 1`
+  - `NO_FUNCTION = 1`
+- interpretation:
+  - the tool surface is still mostly action-named and parseable
+  - but broader task coverage has now surfaced a real residual drift:
+    - `TYPE` instead of `TYPING`
+
+#### Live Async SKD run: teacher replacement / chunk behavior snapshot
+
+- chunk-level read from `async_skd_chunk_live_*`:
+  - chunk rows: `3624`
+  - chunks with `rejected = 1`: `2063`
+  - chunks with `rejected = 0`: `1561`
+  - total accepted tokens: `209893`
+  - total rejected tokens: `2063`
+  - accepted length:
+    - mean `57.9`
+    - median `46`
+- most common accepted-length patterns:
+  - `(128, 0, 128)` = `644`
+  - `(12, 0, 12)` = `186`
+  - `(17, 0, 17)` = `109`
+  - `(3, 1, 4)` = `74`
+  - `(4, 1, 5)` = `72`
+  - `(1, 1, 2)` = `66`
+  - `(0, 1, 1)` = `59`
+- interpretation:
+  - teacher intervention is active and frequent
+  - but it is still mostly **local**
+    - one rejection site
+    - one teacher top-1 replacement
+    - then continue
+  - this is not a regime where teacher output completely rewrites the student turn
+- formatting collapse check:
+  - `endoftext_count = 0`
+  - so the earlier plain `<|im_end|>` / `<|endoftext|>` collapse is **not** the dominant live problem here
+
+#### Live Async SKD run: teacher-system-prompt uptake
+
+- there is visible evidence that the teacher-only prompt is changing reasoning text shape
+- pattern counts from verified turn tails at one live snapshot:
+  - current-screen grounding phrases:
+    - `82`
+  - explicit keep-window-open phrasing:
+    - `10`
+  - terminal postcondition / command-execution phrasing:
+    - `13`
+- representative successful uptake types:
+  - current-screen grounding:
+    - `Looking at the current screenshot ...`
+    - `I can see ...`
+  - required-window persistence:
+    - `Keep the Settings window open`
+    - `Settings window is still open`
+  - search continuation:
+    - `not visible in the current view, I should scroll down ...`
+- interpretation:
+  - the teacher-only prompt is **not** inert
+  - it is visibly steering:
+    - screenshot-grounded reasoning
+    - keep-window-open constraints
+    - some terminal-action phrasing
+
+#### Live Async SKD run: what still breaks
+
+- invalid-action bucket is now much narrower than the earlier bundled-surface failures
+- current live invalids are mostly:
+  - `TYPE` alias drift
+    - model emits `TYPE(...)` instead of `TYPING(...)`
+  - malformed `MOVE_TO`
+    - action name correct
+    - payload wrapper broken
+  - one plain-text no-tool-call turn
+- representative invalid traces:
+  - `TYPE`:
+    - terminal tasks attempting commands such as:
+      - `cd Desktop`
+      - `help`
+      - `id`
+      - `whereis fizzbuzz > path_check.txt`
+  - malformed `MOVE_TO`:
+    - list payload emitted without correct `<parameter=coordinate>` wrapper
+- interpretation:
+  - this is no longer “bundled JSON array collapse”
+  - it is now a smaller residual family:
+    - action-name alias drift
+    - parameter-wrapper drift
+
+#### Live Async SKD run: branch-fixation remains the main behavioral weakness
+
+- using a rough heuristic:
+  - sample has at least `5` assistant turns
+  - and uses no more than `2` action families
+  - live snapshot count was `40`
+- this heuristic is not a final quality judgment by itself
+  - some tasks are naturally click-heavy
+  - but several clearly bad loops remain
+- representative branch-fixation cases:
+  - `996136bd-60a2-415a-88df-e18275f1e8b6`
+    - nine turns of almost pure `RIGHT_CLICK` on the Terminal icon
+  - `a066383a-70bb-42ab-b1b8-bee9b77e1456`
+    - repeated Files icon opening / reopening while still failing to reach the Scripts workflow
+  - `b195a78b-7e38-497a-bda4-13c2ba935fba`
+    - repeated click focus attempts on the same search bar region
+- important interpretation update:
+  - these are **not** best described as “teacher did nothing and the raw student just looped”
+  - chunk traces show repeated teacher replacements inside the same turn stream
+  - the more accurate description is:
+    - **teacher-corrected branch fixation**
+  - that is:
+    - local wording / grounding is being corrected
+    - but the high-level action branch still does not switch
+
+#### Current KILL IT read after the live SKD snapshot
+
+- the current action-named + teacher-prompt SKD lane is **meaningfully better aligned** than the old bundled lane
+  - no early plain-ending collapse
+  - active teacher grounding
+  - mostly stable action-named tool surface
+- but the lane is **not yet clean enough to call closed**
+- the current main blockers are now:
+  1. tool-surface residuals
+     - `TYPE -> TYPING`
+     - malformed `MOVE_TO`
+     - rare no-tool-call text-only turns
+  2. branch-switch weakness
+     - same target
+     - same action family
+     - same hypothesis
+     despite local teacher correction
+- therefore:
+  - **Step 4 remains in progress**
+  - but it is now in a much narrower endgame than the earlier bundled-surface debugging phase
+
+#### Fully async RL run review: `qwen35_webgym_fully_async_tool_veomni_20260516_034645`
+
+- sources:
+  - rollout dump:
+    - `logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_20260516_034645/*.jsonl`
+  - trainer log:
+    - `logs/rl_supervised.out`
+  - dataset builder:
+    - `WebOSWorld/webgym_rl/create_webgym_rl_dataset.py`
+  - current RL launcher:
+    - `WebOSWorld/run_qwen35_webgym_fully_async_rl_tool_veomni.sh`
+  - reward function:
+    - `WebOSWorld/webgym_rl/reward_fn_webgym_rl.py`
+  - termination path:
+    - `verl/experimental/agent_loop/web_tool_agent_loop.py`
+
+##### Dataset facts
+
+- `train.parquet` is currently a repeated dataset, not a unique-task dataset:
+  - `DEFAULT_TRAIN_REPEATS_PER_TASK = 16`
+  - row construction uses `tasks[index % len(tasks)]`
+- the concrete `train.parquet` under `data/webgym_rl` has:
+  - `2112` rows
+  - effectively `132` base tasks repeated `16x`
+  - one duplicated base prompt, so exact unique prompt count is `131`
+- the launcher still uses:
+  - `data.shuffle=False`
+
+##### Batch interpretation correction
+
+- a trainer step in this run is **not** “16 different tasks once each”
+- because `rollout.n=4`, one prompt is repeated `4x` before rollout and advantage computation
+- concrete step files show the effective pattern:
+  - one step often contains `4` prompts
+  - each prompt appears `4` times
+- therefore the early high score at `step 1` must not be interpreted as “the model was broadly strong on the dataset”
+- `step 1` was an easy prompt mixture dominated by:
+  - toll lookup
+  - simple Files navigation
+  - simple Settings navigation
+
+##### Reward read from the analyzed run
+
+- this run does **not** look flat if we only inspect `score`
+- but it is close to flat if we inspect **environment success**
+- aggregated windows from rollout dumps showed:
+  - early `1-25`:
+    - `env mean ≈ 0.115`
+    - `score mean ≈ 0.203`
+    - `format mean ≈ 0.877`
+  - late `226-250`:
+    - `env mean ≈ 0.086`
+    - `score mean ≈ 0.153`
+    - `format mean ≈ 0.672`
+- interpretation:
+  - total score moved because format-like shaping contributed non-trivially
+  - true task success did **not** show robust improvement
+
+##### Termination pathology
+
+- across completed rollout rows in the analyzed run, the dominant endings were:
+  - `system_stop`
+  - `tool_response_budget_exhausted`
+- the corresponding success rates were low:
+  - `system_stop` env success rate was about `0.06`
+  - `tool_response_budget_exhausted` env success rate was about `0.08`
+  - `model_done` was much better, about `0.37`
+- therefore the run mostly collected long failing trajectories, not clean successful completions
+
+##### Repeated-prompt qualitative read
+
+- repeated prompts do reappear, but not as the same fixed 16-row batch
+- fully async queueing and `rollout.n=4` re-mix prompt groups across steps
+- repeated-prompt comparison showed:
+  - some prompts stay stable and strong
+    - e.g. simple Files navigation prompts
+  - some prompts oscillate heavily
+    - e.g. Settings/storage checks
+  - some prompts degrade into no-tool-call or malformed-output failures on later appearances
+
+##### No-tool-call collapse in later repeats
+
+- later repeated failures frequently showed:
+  - `termination_reason = system_stop`
+  - `attempted_tool_calls = 0`
+  - very long raw assistant text with malformed closing tags
+  - huge `<|endoftext|>` tails
+- one representative bad row had:
+  - output length around `424k` chars
+  - `<|endoftext|>` count around `32k`
+- this means some “later failures” are not just poor action choice
+- they are closer to:
+  - reasoning text generation
+  - malformed or incomplete tool-call emission
+  - then `system_stop`
+
+##### Implication for dataset policy
+
+- the current repeated dataset plus `shuffle=False` is a bad fit for this regime
+- the next RL dataset should be:
+  - a **single unique-task base set**
+  - then sampled with `data.shuffle=True`
+- note:
+  - this only removes dataset-level `16x` repetition
+  - it does **not** remove `rollout.n=4`, which still intentionally creates four responses per prompt group for GRPO
+
+##### Judge design read
+
+- expanding heuristic process reward further is risky
+  - the current shaping path already demonstrated reward distortion risk
+- the better next direction is:
+  - keep environment reward as the hard success signal
+  - add a **selective judge-based partial credit** path for failed responses
+
+##### Judge granularity
+
+- group-level judge (`4` responses together) has lower API cost
+- but per-response judge is more naturally aligned with the current reward-manager interface
+  - reward managers currently operate on `run_single(data)` style single-sample inputs
+- therefore the cleaner integration path is:
+  - per-response judge
+  - but only when `env_reward == 0`
+
+##### Judge cost observation
+
+- in the analyzed run, `env_reward == 0` held for about `90.8%` of responses
+- so a per-response judge is still expensive
+- however:
+  - it avoids introducing another heuristic process reward
+  - and it stays semantically closer to the real task than the current format-only shaping
+
+##### Judge input policy
+
+- do **not** pass raw full trajectory tokens
+  - they contain too much malformed residue and padding
+  - they inflate cost
+  - they reduce judge signal quality
+- do pass **all actions**, without dropping any action step
+- the correct target is:
+  - lossless action/result trace
+  - lossy natural-language compaction
+
+##### Required judge payload shape
+
+- must preserve:
+  - all actions in order
+  - action payloads
+  - post-action result / state summary
+  - terminal or field input landed / not-landed style evidence
+  - repeated-action clusters
+  - termination reason
+  - final env reward
+- should not preserve wholesale:
+  - full raw assistant reasoning
+  - full malformed XML residue
+  - massive `<|endoftext|>` tails
+
+##### Image policy for judge
+
+- keep the original screenshot capture pipeline unchanged
+- in the OpenAI request, prefer:
+  - `detail=\"low\"` as the default judge mode
+- this reduces cost substantially while keeping the raw image archive intact
+- use `high` only for text-sensitive families:
+  - calculator
+  - terminal
+  - spreadsheet
+  - OCR-heavy exact-value tasks
+
+##### Current recommended next move
+
+- for the next RL iteration:
+  1. rebuild `data/webgym_rl/train.parquet` as a unique-task base set
+  2. switch RL launcher to `data.shuffle=True`
+  3. do **not** add more heuristic process reward
+  4. prototype a per-response selective judge for `env_reward == 0`
+  5. feed the judge:
+     - low-detail images by default
+     - all actions preserved
+     - compressed but lossless action/result trace
+     - only compacted natural-language residue
+
+##### Step read after this analysis
+
+- the reviewed RL run completed successfully
+- trainer log ended at:
+  - `step:125`
+  - `training/global_step:249.0`
+  - checkpoint saved under:
+    - `checkpoints/RL_main/qwen35_9b_fully_async_webgym_tool_2/global_step_125`
+
+##### Judge implementation update: group-gated dense reward
+
+- the LLM-as-a-judge path is now implemented in two modes:
+  - plain per-response eligibility
+  - **group-gated eligibility**
+- the current RL launcher is wired to the group-gated mode
+
+###### What group-gated means
+
+- reward is no longer allowed to trigger judge independently for each failed response
+- instead:
+  1. a first reward pass computes the ordinary response-level reward and extracts `web_osgym_env_reward_score`
+  2. responses are grouped by `uid`
+  3. the expected group size is read from rollout config:
+     - train: `actor_rollout_ref.rollout.n`
+     - validate: `actor_rollout_ref.rollout.val_kwargs.n`
+  4. **only** groups whose env rewards are all `0` are selected for a second pass
+  5. the second pass turns on judge for those selected rows and overwrites their final reward
+
+###### Why this required a reward-path change
+
+- the old streaming reward path computed reward one response at a time during agent rollout
+- that path cannot know whether the *other* responses in the same GRPO group are also zero
+- therefore the implementation now disables agent-side reward streaming when zero-group judge mode is enabled
+- reward is instead computed at the batch reward stage, where the full `uid` group is visible
+
+###### Current config surface
+
+- judge enable flag:
+  - `llm_judge_enable`
+- zero-group gating flag:
+  - `llm_judge_only_zerogroup`
+- note:
+  - the old name `llm_judge_group_all_zero_only` is still read as a compatibility alias
+  - the launcher now uses the new name
+
+##### Production-path bug fix: `web_osgym_trajectory_dir`
+
+- a real blocker was found after moving judge activation to the batch path:
+  - `compute_score_webgym_rl(...)` expects `extra_info["web_osgym_trajectory_dir"]`
+  - but `web_osgym_trajectory_dir` was only living in `agent_data.extra_fields`, not inside `reward_extra_info`
+- the old streaming path happened to work because `tool_extra_fields` carried it through implicitly
+- the new batch path depends on:
+  - `reward_extra_info -> AgentLoopWorker._postprocess(...) -> merged extra_info`
+- therefore production could silently lose `web_osgym_trajectory_dir` and fall back to:
+  - `trajectory_dir is missing`
+  - judge error
+  - reward `0.0`
+
+###### Fix
+
+- `web_osgym_trajectory_dir` is now explicitly written into `reward_extra_info` inside:
+  - `verl/experimental/agent_loop/web_osgym_loop_mixin.py`
+
+##### Test strategy upgrade
+
+- the earlier tests were too synthetic in one important way:
+  - some fixtures injected `web_osgym_trajectory_dir` directly into dataset-side `extra_info`
+  - that bypassed the real production merge path
+- tests were upgraded so that:
+  - mixin tests verify `reward_extra_info` now contains `web_osgym_trajectory_dir`
+  - `_postprocess(...)` tests verify that `reward_extra_info` is merged into final `extra_info`
+  - fully async reward-loop tests now create rows through:
+    - `_InternalAgentLoopOutput.extra_fields["reward_extra_info"]`
+    - `AgentLoopWorker._postprocess(...)`
+    - `RewardLoopManager.compute_rm_score(...)`
+  - rather than directly seeding `extra_info` with the trajectory path
+
+##### Actual judge read after implementation
+
+- actual OpenAI judge requests were re-run against representative real rollout trajectories
+- key observations:
+  - clearly failed no-progress cases scored `0.0`
+  - premature `DONE` without visible completion also scored `0.0`
+  - terminal partial-progress cases were graded as partial credit
+  - one file-read / file-write case still showed judge variance across identical replicated rows
+- interpretation:
+  - the zero-group activation logic now behaves as intended
+  - remaining ambiguity is mostly in the **judge standard wording**, not in the activation path
+  - standards like:
+    - `open or clearly visible`
+    can still allow unstable partial-credit decisions
+
+##### Current status after this implementation
+
+- the dense-reward path is now better aligned with the original objective:
+  - break all-zero GRPO groups
+  - avoid paying judge cost on mixed-success groups
+- the main remaining open items are:
+  1. populate `judge_standard` / `judge_schema` into the actual RL parquet files
+  2. tighten ambiguous standards for file / editor tasks
+  3. run a short live RL launch with judge-on to measure throughput impact under batch-level gating
+
+##### Current reward-judge hardening snapshot
+
+- the current RL launcher now uses:
+  - `llm_judge_model=gpt-5.4`
+  - `llm_judge_only_zerogroup=true`
+  - `llm_judge_reasoning_effort=high`
+- the current implementation contract is:
+  - **in-process** reward / judge contracts use `pydantic`
+  - **cross-process** transport stays `DataProto` + native `dict` / `list` / `numpy`
+- concretely:
+  - `reward_extra_info` is the row contract
+  - `reward_extra_infos_dict` is the `DataProto.non_tensor_batch` column contract
+  - conversion is now explicit through:
+    - `validate_webgym_reward_extra_info(...)`
+    - `merge_webgym_reward_extra_info(...)`
+    - `pack_webgym_reward_extra_infos(...)`
+- the zero-group judge path no longer double-validates compare input
+  - compare input is validated once at the compare boundary
+  - invalid compare input is skipped at manager level rather than killing the batch reward path
+- current runtime semantics remain:
+  - sample-level reward workers are async
+  - zero-group LLM judge itself is still trainer-side batch reward work
+  - if multiple zero groups are selected in one batch, they are currently judged **group-by-group, sequentially**
+- rollout audit is stronger now:
+  - dump rows carry `request_id`, `uid`, `index`
+  - top-level dump `score` is aligned to final reward rather than stale token-level score state
+
+##### Current preflight test strategy before expensive RL runs
+
+- fast contract lane:
+  - `pydantic` boundary tests for judge input, reward row contract, merge logic, and malformed payload rejection
+- `DataProto` bridge lane:
+  - reward row -> packed non-tensor columns -> reward row roundtrip tests
+- runtime-like fully async lane:
+  - `RewardLoopManager.compute_rm_score(...)`
+  - zero-group selection / skip / merge / dump path
+- minimal real Ray smoke lane:
+  - `DataProto` payload is sent through a real `ray.init(...)` roundtrip and decoded back into reward rows
+- accidental live network calls are blocked in tests by default
+  - OpenAI client construction is monkeypatched to fail unless a test explicitly injects a fake client
+- current known limitation:
+  - property-based tests are prepared for the reward contract path, but `hypothesis` is not installed in the current `skd-cudnn` test env, so that lane is optional rather than always-on
 
 ---
 

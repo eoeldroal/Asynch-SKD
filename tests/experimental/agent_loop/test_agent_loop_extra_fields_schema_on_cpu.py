@@ -462,6 +462,49 @@ async def test_async_reward_loop_preserves_request_id_when_merging_reward_extra_
     }
 
 
+def test_postprocess_merges_web_osgym_trajectory_dir_from_reward_extra_info_into_extra_info():
+    metrics = AgentLoopMetrics()
+    internal = _to_internal(
+        output_prompt_ids=[101, 102],
+        output_response_ids=[11, 12],
+        output_response_mask=[1, 1],
+        metrics=metrics,
+        extra_fields={
+            "reward_extra_info": {
+                "request_id": "req-1",
+                "web_osgym_env_reward_score": 0.0,
+                "web_osgym_trajectory_dir": "/tmp/trajectory/req-1",
+            }
+        },
+        reward_score=None,
+        num_turns=2,
+        prompt_len=2,
+        response_len=2,
+    )
+
+    dummy_worker = type(
+        "_DummyWorker",
+        (),
+        {"reward_loop_worker_handles": None, "distillation_enabled": False},
+    )()
+    batch = AgentLoopWorker._postprocess(
+        dummy_worker,
+        inputs=[internal],
+        input_non_tensor_batch={
+            "uid": np.array(["uid-1"], dtype=object),
+            "index": np.array([0], dtype=object),
+            "agent_name": np.array(["web_tool_agent"], dtype=object),
+            "data_source": np.array(["webgym_rl"], dtype=object),
+            "reward_model": np.array([{"ground_truth": "env_reward"}], dtype=object),
+            "extra_info": np.array([{"task_id": "demo-a"}], dtype=object),
+        },
+    )
+
+    merged_extra_info = batch.non_tensor_batch["extra_info"].tolist()[0]
+    assert merged_extra_info["task_id"] == "demo-a"
+    assert merged_extra_info["web_osgym_trajectory_dir"] == "/tmp/trajectory/req-1"
+
+
 def test_web_osgym_async_reward_path_drives_training_reward_breakdown_and_advantage():
     metrics = AgentLoopMetrics()
     shaped_score_a = 1.0 + 0.03

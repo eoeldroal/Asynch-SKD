@@ -448,7 +448,11 @@ class RayFlowGRPOTrainer:
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
             test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+            should_compute_batch_reward = "rm_scores" not in test_output_gen_batch_padded.batch.keys() and (
+                self.use_rm
+                or (self.reward_loop_manager is not None and self.reward_loop_manager.reward_loop_worker_handles is None)
+            )
+            if should_compute_batch_reward:
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
@@ -641,14 +645,9 @@ class RayFlowGRPOTrainer:
         else:
             from verl.experimental.agent_loop import AgentLoopManager
 
-        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-        # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-        # to stream reward computation with actor rollout
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        # reward_loop_worker_handles becomes None when reward must be computed at batch level
+        # instead of streaming per-sample during rollout.
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_worker_handles
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
@@ -922,7 +921,14 @@ class RayFlowGRPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        should_compute_batch_reward = "rm_scores" not in batch.batch.keys() and (
+                            self.use_rm
+                            or (
+                                self.reward_loop_manager is not None
+                                and self.reward_loop_manager.reward_loop_worker_handles is None
+                            )
+                        )
+                        if should_compute_batch_reward:
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 

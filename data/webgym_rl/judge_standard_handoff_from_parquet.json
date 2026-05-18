@@ -1,0 +1,1043 @@
+{
+  "source": "data/webgym_rl/train.parquet",
+  "note": "Extracted from parquet for handoff. Source task file was not modified.",
+  "count": 41,
+  "items": [
+    {
+      "row_index": 0,
+      "task_id": "prozilla_file_find_01",
+      "task_name": "Find and open 'desktop.xml' under the .config folder.",
+      "prompt": "Find and open 'desktop.xml' under the .config folder.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The file browser navigates to the `.config` folder or another view that clearly shows `.config`."
+        },
+        {
+          "id": "check_2",
+          "text": "`desktop.xml` is visible in that directory and is selected or opened."
+        },
+        {
+          "id": "check_3",
+          "text": "A preview, editor, or viewer shows the contents of `desktop.xml`."
+        }
+      ]
+    },
+    {
+      "row_index": 1,
+      "task_id": "prozilla_file_find_02",
+      "task_name": "Find and open file 'Wallpaper10.png'.",
+      "prompt": "Find and open file 'Wallpaper10.png'.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The file browser shows `Wallpaper10.png` in the current folder or search results."
+        },
+        {
+          "id": "check_2",
+          "text": "`Wallpaper10.png` is selected or opened."
+        },
+        {
+          "id": "check_3",
+          "text": "A viewer or preview displays `Wallpaper10.png`."
+        }
+      ]
+    },
+    {
+      "row_index": 2,
+      "task_id": "prozilla_setting_appearance_01",
+      "task_name": "I want to change the overall look of my system. Go to the appearance settings and switch the system theme to \"Mango\"",
+      "prompt": "I want to change the overall look of my system. Go to the appearance settings and switch the system theme to \"Mango\"",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The appearance settings page is open."
+        },
+        {
+          "id": "check_2",
+          "text": "The system theme control is visible and `Mango` is one of the available choices."
+        },
+        {
+          "id": "check_3",
+          "text": "`Mango` is selected as the system theme."
+        },
+        {
+          "id": "check_4",
+          "text": "The UI or theme preview reflects the `Mango` theme after the change."
+        }
+      ]
+    },
+    {
+      "row_index": 3,
+      "task_id": "prozilla_setting_appearance_02",
+      "task_name": "I want to change the appearance of my system to \"Aqua\"",
+      "prompt": "I want to change the appearance of my system to \"Aqua\"",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The system settings app is open on the appearance page."
+        },
+        {
+          "id": "check_2",
+          "text": "The Aqua theme option is visible and selected in the appearance controls."
+        },
+        {
+          "id": "check_3",
+          "text": "After the selection, the theme preview or system UI reflects the Aqua appearance."
+        },
+        {
+          "id": "check_4",
+          "text": "The final screenshot still shows Aqua as the active appearance setting."
+        }
+      ]
+    },
+    {
+      "row_index": 4,
+      "task_id": "prozilla_setting_taskbar_01",
+      "task_name": "Please pin the \"Wordle\" application to the taskbar.",
+      "prompt": "Please pin the \"Wordle\" application to the taskbar.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The taskbar settings view or taskbar customization view is open."
+        },
+        {
+          "id": "check_2",
+          "text": "Wordle is visible in the app list or available items before pinning."
+        },
+        {
+          "id": "check_3",
+          "text": "Wordle is added to the pinned apps list or shows as pinned after the action."
+        },
+        {
+          "id": "check_4",
+          "text": "The final taskbar view shows Wordle as a pinned application."
+        }
+      ]
+    },
+    {
+      "row_index": 5,
+      "task_id": "prozilla_setting_taskbar_02",
+      "task_name": "Please unpin the \"Commands\" application from the taskbar.",
+      "prompt": "Please unpin the \"Commands\" application from the taskbar.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The taskbar settings view or taskbar customization view is open."
+        },
+        {
+          "id": "check_2",
+          "text": "Commands is visible in the pinned apps list or on the taskbar before removal."
+        },
+        {
+          "id": "check_3",
+          "text": "Commands is removed from the pinned apps list after the unpin action."
+        },
+        {
+          "id": "check_4",
+          "text": "The final taskbar view no longer shows Commands as a pinned app."
+        }
+      ]
+    },
+    {
+      "row_index": 6,
+      "task_id": "prozilla_app_search_01",
+      "task_name": "Search and open the \"Bliss Radio\" application.",
+      "prompt": "Search and open the \"Bliss Radio\" application.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The app search or launcher interface is open."
+        },
+        {
+          "id": "check_2",
+          "text": "The search results show Bliss Radio before it is opened."
+        },
+        {
+          "id": "check_3",
+          "text": "Bliss Radio is launched from the search result or launcher entry."
+        },
+        {
+          "id": "check_4",
+          "text": "The final screenshot shows the Bliss Radio application window active."
+        }
+      ]
+    },
+    {
+      "row_index": 7,
+      "task_id": "prozilla_file_delete_01",
+      "task_name": "Delete 'ProzillaOS.png' from the Pictures folder.",
+      "prompt": "Delete 'ProzillaOS.png' from the Pictures folder.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Pictures folder is open and ProzillaOS.png is visible before deletion."
+        },
+        {
+          "id": "check_2",
+          "text": "ProzillaOS.png is selected or otherwise targeted for deletion."
+        },
+        {
+          "id": "check_3",
+          "text": "After the delete action, ProzillaOS.png no longer appears in the Pictures folder listing."
+        },
+        {
+          "id": "check_4",
+          "text": "The final view remains in the Pictures folder with ProzillaOS.png absent."
+        }
+      ]
+    },
+    {
+      "row_index": 8,
+      "task_id": "prozilla_file_edit_01",
+      "task_name": "Modify 'fizzbuzz.sh' inside the Scripts folder so that 'Buzz' is output when 'i' is divisible by 7. And let me know it is done.",
+      "prompt": "Modify 'fizzbuzz.sh' inside the Scripts folder so that 'Buzz' is output when 'i' is divisible by 7. And let me know it is done.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "fizzbuzz.sh is open in the editor from the Scripts folder."
+        },
+        {
+          "id": "check_2",
+          "text": "The Buzz branch is updated so the condition checks divisibility by 7."
+        },
+        {
+          "id": "check_3",
+          "text": "The edited script is saved or no unsaved-change indicator remains."
+        },
+        {
+          "id": "check_4",
+          "text": "The final screenshot still shows the updated Buzz logic in fizzbuzz.sh."
+        }
+      ]
+    },
+    {
+      "row_index": 9,
+      "task_id": "prozilla_file_properties_01",
+      "task_name": "Open the properties window of 'City Center.png' inside the Pictures/Crumbling City folder.",
+      "prompt": "Open the properties window of 'City Center.png' inside the Pictures/Crumbling City folder.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Files app is open in the Pictures/Crumbling City folder."
+        },
+        {
+          "id": "check_2",
+          "text": "City Center.png is visible and selected in that folder before opening properties."
+        },
+        {
+          "id": "check_3",
+          "text": "The City Center.png Properties window is open."
+        },
+        {
+          "id": "check_4",
+          "text": "The properties window shows City Center.png while the folder context stays on Pictures/Crumbling City."
+        }
+      ]
+    },
+    {
+      "row_index": 10,
+      "task_id": "prozilla_setting_desktop_01",
+      "task_name": "I want to hide all my desktop icons to keep my workspace clean. Please disable the desktop icons visibility option in the system settings.",
+      "prompt": "I want to hide all my desktop icons to keep my workspace clean. Please disable the desktop icons visibility option in the system settings.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Desktop settings page is open."
+        },
+        {
+          "id": "check_2",
+          "text": "The desktop icons visibility control is visible before the change."
+        },
+        {
+          "id": "check_3",
+          "text": "The desktop icons visibility control is turned off."
+        },
+        {
+          "id": "check_4",
+          "text": "The final desktop view shows no desktop icons."
+        }
+      ]
+    },
+    {
+      "row_index": 11,
+      "task_id": "prozilla_app_filter_01",
+      "task_name": "I want to browse educational apps only. Please filter the App Center applications to display only the Education category.",
+      "prompt": "I want to browse educational apps only. Please filter the App Center applications to display only the Education category.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The App Center is open."
+        },
+        {
+          "id": "check_2",
+          "text": "The Education category filter is visible and selected."
+        },
+        {
+          "id": "check_3",
+          "text": "The visible app list updates to show Education-category apps after the filter is applied."
+        },
+        {
+          "id": "check_4",
+          "text": "The final view shows only Education-category apps in the visible list."
+        }
+      ]
+    },
+    {
+      "row_index": 12,
+      "task_id": "prozilla_setting_appearance_03",
+      "task_name": "Please update my desktop wallpaper to the last option in the settings, then reveal the clean desktop so I can see it clearly.",
+      "prompt": "Please update my desktop wallpaper to the last option in the settings, then reveal the clean desktop so I can see it clearly.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Settings app is open to the wallpaper selection view before the wallpaper change is made."
+        },
+        {
+          "id": "check_2",
+          "text": "The last wallpaper option in Settings is selected and applied to the desktop wallpaper."
+        },
+        {
+          "id": "check_3",
+          "text": "The desktop background matches that last wallpaper option after the change is applied."
+        },
+        {
+          "id": "check_4",
+          "text": "The desktop is revealed in a clean state with application windows minimized or hidden."
+        }
+      ]
+    },
+    {
+      "row_index": 13,
+      "task_id": "prozilla_file_delete&file_properties_01",
+      "task_name": "I want to delete japan.png and view properties of Farms.png.",
+      "prompt": "I want to delete japan.png and view properties of Farms.png.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Pictures folder is open and both japan.png and Farms.png are visible before the delete action."
+        },
+        {
+          "id": "check_2",
+          "text": "japan.png is deleted from the Pictures folder and no longer appears in the file list."
+        },
+        {
+          "id": "check_3",
+          "text": "The Farms.png Properties window is open for the target file."
+        },
+        {
+          "id": "check_4",
+          "text": "The file browser remains in the Pictures folder after the delete and properties actions."
+        }
+      ]
+    },
+    {
+      "row_index": 14,
+      "task_id": "prozilla_setting_taskbar&setting_desktop_01",
+      "task_name": "Unpin 'Terminal' from the taskbar, then disable 'Show icons' in Desktop.",
+      "prompt": "Unpin 'Terminal' from the taskbar, then disable 'Show icons' in Desktop.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Settings view for taskbar and desktop options is open before the changes are made."
+        },
+        {
+          "id": "check_2",
+          "text": "The Terminal taskbar icon is removed so it no longer appears on the taskbar."
+        },
+        {
+          "id": "check_3",
+          "text": "The Show icons option in Desktop settings is turned off."
+        },
+        {
+          "id": "check_4",
+          "text": "Desktop icons are hidden on the desktop after the setting is disabled."
+        }
+      ]
+    },
+    {
+      "row_index": 15,
+      "task_id": "prozilla_setting_appearance&window_minimize_01",
+      "task_name": "Change the theme to 'Grape', update the wallpaper to 'Wallpaper6', and minimize all windows.",
+      "prompt": "Change the theme to 'Grape', update the wallpaper to 'Wallpaper6', and minimize all windows.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Appearance or wallpaper settings view is open before the theme and wallpaper changes are made."
+        },
+        {
+          "id": "check_2",
+          "text": "The system theme is changed to Grape."
+        },
+        {
+          "id": "check_3",
+          "text": "The wallpaper is changed to Wallpaper6."
+        },
+        {
+          "id": "check_4",
+          "text": "All open windows are minimized so the desktop is visible at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 16,
+      "task_id": "prozilla_setting_taskbar&setting_autolaunch_01",
+      "task_name": "Pin 'Wordle' to the taskbar, and enable it to launch automatically upon system startup. Keep the Settings window open.",
+      "prompt": "Pin 'Wordle' to the taskbar, and enable it to launch automatically upon system startup. Keep the Settings window open.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The taskbar settings view is open."
+        },
+        {
+          "id": "check_2",
+          "text": "Wordle is visible in the app list before pinning."
+        },
+        {
+          "id": "check_3",
+          "text": "Wordle is pinned to the taskbar."
+        },
+        {
+          "id": "check_4",
+          "text": "The startup-launch control for Wordle is visible in Settings and enabled."
+        },
+        {
+          "id": "check_5",
+          "text": "The Settings window remains open at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 17,
+      "task_id": "prozilla_app_filter&setting_autolaunch_01",
+      "task_name": "In the App Center, filter apps by the 'Photo & video' category to find the application. Then enable that app to launch automatically upon system startup. Keep the Settings window open.",
+      "prompt": "In the App Center, filter apps by the 'Photo & video' category to find the application. Then enable that app to launch automatically upon system startup. Keep the Settings window open.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "App Center is open with the Photo & video category filter applied."
+        },
+        {
+          "id": "check_2",
+          "text": "The target app is visible in the filtered Photo & video app list."
+        },
+        {
+          "id": "check_3",
+          "text": "The startup-launch control for the target app is visible in Settings."
+        },
+        {
+          "id": "check_4",
+          "text": "The target app's startup-launch setting is enabled."
+        },
+        {
+          "id": "check_5",
+          "text": "The Settings window remains open at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 18,
+      "task_id": "prozilla_setting_autolaunch_01",
+      "task_name": "Configure all applications belonging to the 'Utilities & tools' category to launch automatically upon system startup. Keep the Settings window open.",
+      "prompt": "Configure all applications belonging to the 'Utilities & tools' category to launch automatically upon system startup. Keep the Settings window open.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Settings window is open on the Utilities & tools startup launch list before changes are made."
+        },
+        {
+          "id": "check_2",
+          "text": "The startup launch setting is enabled for Apps, Browser, Commands, Files, Maths, and Notes."
+        },
+        {
+          "id": "check_3",
+          "text": "No application in the Utilities & tools category remains disabled for startup launch."
+        },
+        {
+          "id": "check_4",
+          "text": "The Settings window is still open at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 19,
+      "task_id": "prozilla_file_delete_02",
+      "task_name": "Delete all images inside 'Pictures/Crumbling City'.",
+      "prompt": "Delete all images inside 'Pictures/Crumbling City'.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Files application is open in `Pictures/Crumbling City` before any deletion."
+        },
+        {
+          "id": "check_2",
+          "text": "At least one image file in `Pictures/Crumbling City` is visible and identified for removal."
+        },
+        {
+          "id": "check_3",
+          "text": "The visible image files in `Pictures/Crumbling City` are deleted or removed from the listing."
+        },
+        {
+          "id": "check_4",
+          "text": "No image files remain in the `Pictures/Crumbling City` folder listing after the deletions."
+        },
+        {
+          "id": "check_5",
+          "text": "The folder view stays on `Pictures/Crumbling City` after the deletions."
+        }
+      ]
+    },
+    {
+      "row_index": 20,
+      "task_id": "prozilla_file_edit_02",
+      "task_name": "Open 'fizzbuzz.sh' inside the 'Scripts' folder using the Text Editor, modify the default iteration range (COUNT) from its original value to 50, and save the file. Keep the file open after saving.",
+      "prompt": "Open 'fizzbuzz.sh' inside the 'Scripts' folder using the Text Editor, modify the default iteration range (COUNT) from its original value to 50, and save the file. Keep the file open after saving.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The `Scripts` folder is opened in Files and `fizzbuzz.sh` is opened in Text Editor."
+        },
+        {
+          "id": "check_2",
+          "text": "The `COUNT` assignment line is visible in the editor before editing."
+        },
+        {
+          "id": "check_3",
+          "text": "The `COUNT` value is changed to `50` in `fizzbuzz.sh`."
+        },
+        {
+          "id": "check_4",
+          "text": "The edited file is saved after the `COUNT` change."
+        },
+        {
+          "id": "check_5",
+          "text": "`fizzbuzz.sh` remains open in Text Editor after saving."
+        }
+      ]
+    },
+    {
+      "row_index": 21,
+      "task_id": "prozilla_file_delete_folder_01",
+      "task_name": "Open the Files application, compare the total file sizes inside the 'Videos' and 'Audio' folders. Delete the folder that has the larger total file size, and then navigate back to the home directory in the Files application.",
+      "prompt": "Open the Files application, compare the total file sizes inside the 'Videos' and 'Audio' folders. Delete the folder that has the larger total file size, and then navigate back to the home directory in the Files application.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "Files is open at the home directory with both `Videos` and `Audio` available to inspect."
+        },
+        {
+          "id": "check_2",
+          "text": "The total file sizes of `Videos` and `Audio` are compared in the Files application."
+        },
+        {
+          "id": "check_3",
+          "text": "The folder identified as larger by total size is selected and deleted."
+        },
+        {
+          "id": "check_4",
+          "text": "The deleted folder no longer appears in the folder list after deletion."
+        },
+        {
+          "id": "check_5",
+          "text": "Files is returned to the home directory `~` after the deletion."
+        }
+      ]
+    },
+    {
+      "row_index": 22,
+      "task_id": "web_sheet_bmi_record_01",
+      "task_name": "I am organizing health assessment data for five team members and need to calculate their BMI metrics for our company wellness initiative. Could you please use the CDC BMI calculator to compute the BMI and categories for five individuals (Names: Alice, Bob, Charlie, Diana, Edward) with their respective heights and weights (Alice: 165 cm, 65 kg; Bob: 178 cm, 90 kg; Charlie: 170 cm, 70 kg; Diana: 158 cm, 75 kg; Edward: 185 cm, 85 kg), then save all their names, calculated BMI values, and BMI categories in the spreadsheet starting at A1 with appropriate headers?",
+      "prompt": "I am organizing health assessment data for five team members and need to calculate their BMI metrics for our company wellness initiative. Could you please use the CDC BMI calculator to compute the BMI and categories for five individuals (Names: Alice, Bob, Charlie, Diana, Edward) with their respective heights and weights (Alice: 165 cm, 65 kg; Bob: 178 cm, 90 kg; Charlie: 170 cm, 70 kg; Diana: 158 cm, 75 kg; Edward: 185 cm, 85 kg), then save all their names, calculated BMI values, and BMI categories in the spreadsheet starting at A1 with appropriate headers?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC adult BMI calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet is filled starting at A1 with the headers Name, BMI, and BMI Category."
+        },
+        {
+          "id": "check_3",
+          "text": "Alice and Bob are recorded with BMI 23.9 Healthy Weight and BMI 28.4 Overweight."
+        },
+        {
+          "id": "check_4",
+          "text": "Charlie and Diana are recorded with BMI 24.2 Healthy Weight and BMI 30 Obese."
+        },
+        {
+          "id": "check_5",
+          "text": "Edward is recorded with BMI 24.8 Healthy Weight."
+        }
+      ]
+    },
+    {
+      "row_index": 23,
+      "task_id": "web_sheet_bmi_record_us_01",
+      "task_name": "I am compiling fitness assessment data for five team members and need their BMI calculated using US measurements. Could you please use the CDC BMI calculator to compute the BMI and categories for five individuals (Names: Alex, Brian, Carol, David, Emily) with their heights and weights in US units (Alex: 5 feet 8 inches, 170 pounds; Brian: 6 feet, 195 pounds; Carol: 5 feet 4 inches, 145 pounds; David: 5 feet 10 inches, 220 pounds; Emily: 5 feet 6 inches, 130 pounds), then record their names, calculated BMI values, and BMI categories in the spreadsheet starting at A1 with appropriate headers?",
+      "prompt": "I am compiling fitness assessment data for five team members and need their BMI calculated using US measurements. Could you please use the CDC BMI calculator to compute the BMI and categories for five individuals (Names: Alex, Brian, Carol, David, Emily) with their heights and weights in US units (Alex: 5 feet 8 inches, 170 pounds; Brian: 6 feet, 195 pounds; Carol: 5 feet 4 inches, 145 pounds; David: 5 feet 10 inches, 220 pounds; Emily: 5 feet 6 inches, 130 pounds), then record their names, calculated BMI values, and BMI categories in the spreadsheet starting at A1 with appropriate headers?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC adult BMI calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with the headers Name, BMI, and BMI Category."
+        },
+        {
+          "id": "check_3",
+          "text": "Alex and Brian are recorded with BMI 25.8 Overweight and BMI 26.4 Overweight."
+        },
+        {
+          "id": "check_4",
+          "text": "Carol and David are recorded with BMI 24.9 Healthy Weight and BMI 31.6 Obese."
+        },
+        {
+          "id": "check_5",
+          "text": "Emily is recorded with BMI 21 Healthy Weight."
+        }
+      ]
+    },
+    {
+      "row_index": 24,
+      "task_id": "web_sheet_bmi_filter_obesity_01",
+      "task_name": "I am conducting a health risk assessment for our organization and need to identify individuals whose BMI falls into a specific health category for targeted wellness interventions. Could you please use the CDC BMI calculator to check each person's BMI and category for three individuals (Names: Steve, James, John) with their measurements (Steve: 174 cm, 96 kg; James: 183 cm, 108 kg; John: 168 cm, 58 kg), then save only those matching the obesity criteria to the sheet in the format Name, BMI, and BMI Category starting at A1?",
+      "prompt": "I am conducting a health risk assessment for our organization and need to identify individuals whose BMI falls into a specific health category for targeted wellness interventions. Could you please use the CDC BMI calculator to check each person's BMI and category for three individuals (Names: Steve, James, John) with their measurements (Steve: 174 cm, 96 kg; James: 183 cm, 108 kg; John: 168 cm, 58 kg), then save only those matching the obesity criteria to the sheet in the format Name, BMI, and BMI Category starting at A1?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC adult BMI calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with the headers Name, BMI, and BMI Category."
+        },
+        {
+          "id": "check_3",
+          "text": "Steve is saved with BMI 31.8 and BMI Category Obese."
+        },
+        {
+          "id": "check_4",
+          "text": "James is saved with BMI 32.3 and BMI Category Obese."
+        },
+        {
+          "id": "check_5",
+          "text": "John is not copied into the final sheet, so the saved table contains only the obesity matches."
+        }
+      ]
+    },
+    {
+      "row_index": 25,
+      "task_id": "web_sheet_bmi_reference_adult_01",
+      "task_name": "I am creating a health education resource for our employees and need to compile the official BMI classification system. Could you please visit the CDC BMI calculator site, find the complete adult BMI categories along with their corresponding BMI ranges, and save this reference information in the spreadsheet starting at A1 with column headers 'BMI Category' and 'BMI Range (kg/m2)'?",
+      "prompt": "I am creating a health education resource for our employees and need to compile the official BMI classification system. Could you please visit the CDC BMI calculator site, find the complete adult BMI categories along with their corresponding BMI ranges, and save this reference information in the spreadsheet starting at A1 with column headers 'BMI Category' and 'BMI Range (kg/m2)'?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC adult BMI reference or calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with the headers BMI Category and BMI Range (kg/m2)."
+        },
+        {
+          "id": "check_3",
+          "text": "Underweight is listed as below 18.5 and Healthy Weight is listed as 18.5 to 24.9."
+        },
+        {
+          "id": "check_4",
+          "text": "Overweight is listed as 25.0 to 29.9 and Obese is listed as 30.0 and above."
+        }
+      ]
+    },
+    {
+      "row_index": 26,
+      "task_id": "web_sheet_bmi_child_record_01",
+      "task_name": "I am compiling pediatric health assessments for five children and need their BMI profiles calculated using the CDC children's calculator. Could you please use the children's BMI tool to compute BMI and categories for five children (Names: Alex, Bella, Charlie, Diana, Ethan) with their respective ages and physical measurements (Alex: boy, 5 years 3 months, 113 cm, 19 kg; Bella: girl, 9 years 6 months, 138 cm, 50 kg; Charlie: boy, 4 years 3 months, 104 cm, 17 kg; Diana: girl, 13 years 2 months, 155 cm, 73 kg; Ethan: boy, 11 years, 148 cm, 50 kg), then record all information including names, ages, measurements, calculated BMI values, and BMI categories in the spreadsheet starting at A1 with appropriate headers?",
+      "prompt": "I am compiling pediatric health assessments for five children and need their BMI profiles calculated using the CDC children's calculator. Could you please use the children's BMI tool to compute BMI and categories for five children (Names: Alex, Bella, Charlie, Diana, Ethan) with their respective ages and physical measurements (Alex: boy, 5 years 3 months, 113 cm, 19 kg; Bella: girl, 9 years 6 months, 138 cm, 50 kg; Charlie: boy, 4 years 3 months, 104 cm, 17 kg; Diana: girl, 13 years 2 months, 155 cm, 73 kg; Ethan: boy, 11 years, 148 cm, 50 kg), then record all information including names, ages, measurements, calculated BMI values, and BMI categories in the spreadsheet starting at A1 with appropriate headers?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC children's BMI calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with headers covering child identity, age, measurements, BMI, and BMI category."
+        },
+        {
+          "id": "check_3",
+          "text": "Alex, Bella, and Charlie appear as separate rows with their provided details, a BMI value, and a CDC children's BMI category."
+        },
+        {
+          "id": "check_4",
+          "text": "Diana and Ethan appear as separate rows with their provided details, a BMI value, and a CDC children's BMI category."
+        }
+      ]
+    },
+    {
+      "row_index": 27,
+      "task_id": "web_sheet_bmi_child_filter_healthy_01",
+      "task_name": "I am filtering pediatric health records to identify children in a specific BMI category for targeted health interventions. Could you please use the CDC children's BMI calculator to compute BMI values for five children (Names: Alex, Bella, Charlie, Diana, Ethan) with their respective ages and measurements (Alex: boy, 5 years 3 months, 113 cm, 19 kg; Bella: girl, 9 years 6 months, 138 cm, 50 kg; Charlie: boy, 4 years 3 months, 104 cm, 17 kg; Diana: girl, 13 years 2 months, 155 cm, 73 kg; Ethan: boy, 11 years, 148 cm, 50 kg), then save only those children matching the healthy weight category in the spreadsheet starting at A1 with appropriate headers?",
+      "prompt": "I am filtering pediatric health records to identify children in a specific BMI category for targeted health interventions. Could you please use the CDC children's BMI calculator to compute BMI values for five children (Names: Alex, Bella, Charlie, Diana, Ethan) with their respective ages and measurements (Alex: boy, 5 years 3 months, 113 cm, 19 kg; Bella: girl, 9 years 6 months, 138 cm, 50 kg; Charlie: boy, 4 years 3 months, 104 cm, 17 kg; Diana: girl, 13 years 2 months, 155 cm, 73 kg; Ethan: boy, 11 years, 148 cm, 50 kg), then save only those children matching the healthy weight category in the spreadsheet starting at A1 with appropriate headers?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC children's BMI calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with headers for the child records and BMI category."
+        },
+        {
+          "id": "check_3",
+          "text": "Alex, Charlie, and Ethan appear in the saved table with their provided details and healthy-weight category."
+        },
+        {
+          "id": "check_4",
+          "text": "Bella and Diana do not appear in the final table."
+        }
+      ]
+    },
+    {
+      "row_index": 28,
+      "task_id": "web_sheet_bmi_child_filter_healthy_us_01",
+      "task_name": "I am compiling health records for five children from our US program and need to identify those in a specific BMI category. Could you please use the CDC children's BMI calculator to compute BMI values for five children (Names: Alex, Bella, Charlie, Diana, Ethan) with their respective ages and US measurements (Alex: boy, 5 years 3 months, 3 feet 9 inches, 43 pounds; Bella: girl, 9 years 6 months, 4 feet 6 inches, 100 pounds; Charlie: boy, 4 years 3 months, 3 feet 5 inches, 38 pounds; Diana: girl, 13 years 2 months, 5 feet 1 inch, 160 pounds; Ethan: boy, 11 years, 4 feet 10 inches, 105 pounds), then enter only those children matching the healthy weight category in the spreadsheet starting at A1 with appropriate headers?",
+      "prompt": "I am compiling health records for five children from our US program and need to identify those in a specific BMI category. Could you please use the CDC children's BMI calculator to compute BMI values for five children (Names: Alex, Bella, Charlie, Diana, Ethan) with their respective ages and US measurements (Alex: boy, 5 years 3 months, 3 feet 9 inches, 43 pounds; Bella: girl, 9 years 6 months, 4 feet 6 inches, 100 pounds; Charlie: boy, 4 years 3 months, 3 feet 5 inches, 38 pounds; Diana: girl, 13 years 2 months, 5 feet 1 inch, 160 pounds; Ethan: boy, 11 years, 4 feet 10 inches, 105 pounds), then enter only those children matching the healthy weight category in the spreadsheet starting at A1 with appropriate headers?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC children's BMI calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with headers for the child records and BMI category."
+        },
+        {
+          "id": "check_3",
+          "text": "Alex, Charlie, and Ethan appear in the saved table with their US measurements and healthy-weight category."
+        },
+        {
+          "id": "check_4",
+          "text": "Bella and Diana do not appear in the final table."
+        }
+      ]
+    },
+    {
+      "row_index": 29,
+      "task_id": "web_sheet_bmi_reference_child_01",
+      "task_name": "I am creating a pediatric health education resource and need to compile the official BMI classification system for children and teens. Could you please visit the CDC BMI calculator site, find the complete children and teen BMI categories along with their corresponding BMI ranges, and save this reference information in the spreadsheet starting at A1 with column headers 'BMI Category' and 'BMI Range'?",
+      "prompt": "I am creating a pediatric health education resource and need to compile the official BMI classification system for children and teens. Could you please visit the CDC BMI calculator site, find the complete children and teen BMI categories along with their corresponding BMI ranges, and save this reference information in the spreadsheet starting at A1 with column headers 'BMI Category' and 'BMI Range'?",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The CDC children's BMI reference or calculator page is opened during the trajectory."
+        },
+        {
+          "id": "check_2",
+          "text": "The spreadsheet starts at A1 with the headers BMI Category and BMI Range."
+        },
+        {
+          "id": "check_3",
+          "text": "Underweight is listed as below the 5th percentile and Healthy Weight is listed as the 5th percentile to less than the 85th percentile."
+        },
+        {
+          "id": "check_4",
+          "text": "Overweight is listed as the 85th percentile to less than the 95th percentile and Obesity is listed as the 95th percentile or greater."
+        }
+      ]
+    },
+    {
+      "row_index": 39,
+      "task_id": "web_task_apple_01",
+      "task_name": "On the Apple Store iPhone 17 Pro page, configure the purchase options as follows: select the White (Silver) color, choose 1TB storage, set the payment option to Buy (not monthly installments), select AT&T as the carrier, do not add a trade-in, and do not add AppleCare. Then check the displayed price.",
+      "prompt": "On the Apple Store iPhone 17 Pro page, configure the purchase options as follows: select the White (Silver) color, choose 1TB storage, set the payment option to Buy (not monthly installments), select AT&T as the carrier, do not add a trade-in, and do not add AppleCare. Then check the displayed price.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The iPhone 17 Pro purchase page is open."
+        },
+        {
+          "id": "check_2",
+          "text": "White (Silver) and 1TB are selected on the configuration page."
+        },
+        {
+          "id": "check_3",
+          "text": "The payment setting shows Buy, the carrier shows AT&T, and both trade-in and AppleCare are not added."
+        },
+        {
+          "id": "check_4",
+          "text": "The displayed price is $1,599."
+        }
+      ]
+    },
+    {
+      "row_index": 40,
+      "task_id": "web_task_apple_02",
+      "task_name": "On the Apple Mac Studio purchase page, configure the options as follows: select the M4 Max chip with 16-core CPU and 40-core GPU, choose 64GB memory, choose 1TB storage, add a Final Cut Pro license, add a Logic Pro license, do not add a trade-in, and select Buy as the payment option. Then check the displayed total price.",
+      "prompt": "On the Apple Mac Studio purchase page, configure the options as follows: select the M4 Max chip with 16-core CPU and 40-core GPU, choose 64GB memory, choose 1TB storage, add a Final Cut Pro license, add a Logic Pro license, do not add a trade-in, and select Buy as the payment option. Then check the displayed total price.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Mac Studio purchase page is open."
+        },
+        {
+          "id": "check_2",
+          "text": "The chip selection shows M4 Max with 16-core CPU and 40-core GPU."
+        },
+        {
+          "id": "check_3",
+          "text": "The memory and storage selections show 64GB memory and 1TB storage."
+        },
+        {
+          "id": "check_4",
+          "text": "Final Cut Pro and Logic Pro are added, no trade-in is selected, and the payment option shows Buy."
+        },
+        {
+          "id": "check_5",
+          "text": "The displayed total price is $3,398.98."
+        }
+      ]
+    },
+    {
+      "row_index": 41,
+      "task_id": "web_task_apple_03",
+      "task_name": "On the Apple iPad 11-inch purchase page, configure the options as follows: select the White (Silver) color, choose 256GB storage, select Wi-Fi + Cellular connectivity, skip engraving, add an Apple Pencil (USB-C), add a Magic Keyboard Folio (US English), do not add a trade-in, select Buy as the payment option (no financing), and do not add AppleCare. Then check the displayed total price.",
+      "prompt": "On the Apple iPad 11-inch purchase page, configure the options as follows: select the White (Silver) color, choose 256GB storage, select Wi-Fi + Cellular connectivity, skip engraving, add an Apple Pencil (USB-C), add a Magic Keyboard Folio (US English), do not add a trade-in, select Buy as the payment option (no financing), and do not add AppleCare. Then check the displayed total price.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The iPad 11-inch purchase page is open."
+        },
+        {
+          "id": "check_2",
+          "text": "White (Silver), 256GB, and Wi-Fi + Cellular are selected."
+        },
+        {
+          "id": "check_3",
+          "text": "Engraving is skipped, Apple Pencil (USB-C) and Magic Keyboard Folio (US English) are added, and both trade-in and AppleCare are not added."
+        },
+        {
+          "id": "check_4",
+          "text": "The payment option shows Buy with no financing."
+        },
+        {
+          "id": "check_5",
+          "text": "The displayed total price is $927.00."
+        }
+      ]
+    },
+    {
+      "row_index": 42,
+      "task_id": "web_task_apple_04",
+      "task_name": "Starting from the Apple homepage, navigate to the Apple Music page and find the monthly price of the Individual plan.",
+      "prompt": "Starting from the Apple homepage, navigate to the Apple Music page and find the monthly price of the Individual plan.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Apple homepage is open before navigation to Apple Music."
+        },
+        {
+          "id": "check_2",
+          "text": "The Apple Music page is reached from Apple navigation."
+        },
+        {
+          "id": "check_3",
+          "text": "The Individual plan card is visible on the Apple Music page."
+        },
+        {
+          "id": "check_4",
+          "text": "The Individual plan monthly price is shown as $10.99/month."
+        }
+      ]
+    },
+    {
+      "row_index": 43,
+      "task_id": "web_task_apple_05",
+      "task_name": "Starting from the Apple iPad Accessories page, navigate to the Apple Pencil Pro product page and find its price.",
+      "prompt": "Starting from the Apple iPad Accessories page, navigate to the Apple Pencil Pro product page and find its price.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Apple iPad Accessories page is open before navigating to the product."
+        },
+        {
+          "id": "check_2",
+          "text": "The Apple Pencil Pro product page is opened from the iPad Accessories page."
+        },
+        {
+          "id": "check_3",
+          "text": "The Apple Pencil Pro product title is visible on the product page."
+        },
+        {
+          "id": "check_4",
+          "text": "The product price is shown as $129.00."
+        }
+      ]
+    },
+    {
+      "row_index": 44,
+      "task_id": "prozilla_setting_taskbar&app_01",
+      "task_name": "Pin 'Wordle' to the taskbar, and enable it to launch automatically upon system startup. Keep the Settings window open.",
+      "prompt": "Pin 'Wordle' to the taskbar, and enable it to launch automatically upon system startup. Keep the Settings window open.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The taskbar settings view is open."
+        },
+        {
+          "id": "check_2",
+          "text": "Wordle is visible in the app list before pinning."
+        },
+        {
+          "id": "check_3",
+          "text": "Wordle is pinned to the taskbar."
+        },
+        {
+          "id": "check_4",
+          "text": "The startup-launch control for Wordle is visible in Settings and enabled."
+        },
+        {
+          "id": "check_5",
+          "text": "The Settings window remains open at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 45,
+      "task_id": "prozilla_appfilter&autolaunch01",
+      "task_name": "In the App Center, filter apps by the 'Photo & video' category to find the application. Then enable that app to launch automatically upon system startup. Keep the Settings window open.",
+      "prompt": "In the App Center, filter apps by the 'Photo & video' category to find the application. Then enable that app to launch automatically upon system startup. Keep the Settings window open.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "App Center is open with the Photo & video category filter applied."
+        },
+        {
+          "id": "check_2",
+          "text": "The target app is visible in the filtered Photo & video app list."
+        },
+        {
+          "id": "check_3",
+          "text": "The startup-launch control for the target app is visible in Settings."
+        },
+        {
+          "id": "check_4",
+          "text": "The target app's startup-launch setting is enabled."
+        },
+        {
+          "id": "check_5",
+          "text": "The Settings window remains open at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 46,
+      "task_id": "prozilla_app&auto_launch_01",
+      "task_name": "Configure all applications belonging to the 'Utilities & tools' category to launch automatically upon system startup. Keep the Settings window open.",
+      "prompt": "Configure all applications belonging to the 'Utilities & tools' category to launch automatically upon system startup. Keep the Settings window open.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The startup-launch settings view for the Utilities & tools apps is open."
+        },
+        {
+          "id": "check_2",
+          "text": "The Utilities & tools app list is visible in Settings."
+        },
+        {
+          "id": "check_3",
+          "text": "Every Utilities & tools app shown in the list has startup launch enabled."
+        },
+        {
+          "id": "check_4",
+          "text": "The Settings window remains open at the end."
+        }
+      ]
+    },
+    {
+      "row_index": 47,
+      "task_id": "prozilla_file_delete_02",
+      "task_name": "Delete all images inside 'Pictures/Crumbling City'.",
+      "prompt": "Delete all images inside 'Pictures/Crumbling City'.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The Files application is open in `Pictures/Crumbling City` before any deletion."
+        },
+        {
+          "id": "check_2",
+          "text": "At least one image file in `Pictures/Crumbling City` is visible and identified for removal."
+        },
+        {
+          "id": "check_3",
+          "text": "The visible image files in `Pictures/Crumbling City` are deleted or removed from the listing."
+        },
+        {
+          "id": "check_4",
+          "text": "No image files remain in the `Pictures/Crumbling City` folder listing after the deletions."
+        },
+        {
+          "id": "check_5",
+          "text": "The folder view stays on `Pictures/Crumbling City` after the deletions."
+        }
+      ]
+    },
+    {
+      "row_index": 48,
+      "task_id": "prozilla_file_edit_02",
+      "task_name": "Open 'fizzbuzz.sh' inside the 'Scripts' folder using the Text Editor, modify the default iteration range (COUNT) from its original value to 50, and save the file. Keep the file open after saving.",
+      "prompt": "Open 'fizzbuzz.sh' inside the 'Scripts' folder using the Text Editor, modify the default iteration range (COUNT) from its original value to 50, and save the file. Keep the file open after saving.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "The `Scripts` folder is opened in Files and `fizzbuzz.sh` is opened in Text Editor."
+        },
+        {
+          "id": "check_2",
+          "text": "The `COUNT` assignment line is visible in the editor before editing."
+        },
+        {
+          "id": "check_3",
+          "text": "The `COUNT` value is changed to `50` in `fizzbuzz.sh`."
+        },
+        {
+          "id": "check_4",
+          "text": "The edited file is saved after the `COUNT` change."
+        },
+        {
+          "id": "check_5",
+          "text": "`fizzbuzz.sh` remains open in Text Editor after saving."
+        }
+      ]
+    },
+    {
+      "row_index": 49,
+      "task_id": "prozilla_file_delete_folder_01",
+      "task_name": "Open the Files application, compare the total file sizes inside the 'Videos' and 'Audio' folders. Delete the folder that has the larger total file size, and then navigate back to the home directory in the Files application.",
+      "prompt": "Open the Files application, compare the total file sizes inside the 'Videos' and 'Audio' folders. Delete the folder that has the larger total file size, and then navigate back to the home directory in the Files application.",
+      "judge_standard": [
+        {
+          "id": "check_1",
+          "text": "Files is open at the home directory with both `Videos` and `Audio` available to inspect."
+        },
+        {
+          "id": "check_2",
+          "text": "The total file sizes of `Videos` and `Audio` are compared in the Files application."
+        },
+        {
+          "id": "check_3",
+          "text": "The folder identified as larger by total size is selected and deleted."
+        },
+        {
+          "id": "check_4",
+          "text": "The deleted folder no longer appears in the folder list after deletion."
+        },
+        {
+          "id": "check_5",
+          "text": "Files is returned to the home directory `~` after the deletion."
+        }
+      ]
+    }
+  ]
+}

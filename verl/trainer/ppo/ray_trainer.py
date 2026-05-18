@@ -29,6 +29,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
+from pydantic import BaseModel, ConfigDict, Field
 from torch.utils.data import Dataset, Sampler
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
@@ -73,6 +74,19 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+class RolloutDumpEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    input: str
+    output: str
+    gts: Any = None
+    score: float
+    step: int = Field(ge=0)
+    request_id: str | None = None
+    uid: str | None = None
+    index: int | str | None = None
 
 
 def _get_validation_agent_names(
@@ -753,7 +767,8 @@ class RayPPOTrainer:
         lines = []
         for i in range(n):
             entry = {k: v[i] for k, v in base_data.items()}
-            lines.append(json.dumps(entry, ensure_ascii=False, default=str))
+            validated_entry = RolloutDumpEntry.model_validate(entry).model_dump()
+            lines.append(json.dumps(validated_entry, ensure_ascii=False, default=str))
 
         with open(filename, "w") as f:
             f.write("\n".join(lines) + "\n")
@@ -773,15 +788,18 @@ class RayPPOTrainer:
         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
             inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=False)
-            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
-            if "request_id" in batch.non_tensor_batch:
-                reward_extra_infos_dict.setdefault(
-                    "request_id",
-                    batch.non_tensor_batch["request_id"].tolist(),
-                )
+            for key in ("request_id", "uid", "index"):
+                if key in batch.non_tensor_batch:
+                    reward_extra_infos_to_dump.setdefault(key, batch.non_tensor_batch[key].tolist())
+
+            explicit_scores = reward_extra_infos_to_dump.get("score")
+            if explicit_scores is not None and len(explicit_scores) == len(batch.batch["responses"]):
+                scores = [float(score) for score in explicit_scores]
+            else:
+                scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
 
             self._dump_generations(
                 inputs=inputs,
@@ -910,7 +928,11 @@ class RayPPOTrainer:
                 test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-                if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+                should_compute_batch_reward = "rm_scores" not in test_output_gen_batch_padded.batch.keys() and (
+                    self.use_rm
+                    or (self.reward_loop_manager is not None and self.reward_loop_manager.reward_loop_worker_handles is None)
+                )
+                if should_compute_batch_reward:
                     # for colocate reward models, we need to sleep rollout model
                     # to spare GPU memory for reward model
                     self.checkpoint_manager.sleep_replicas()
@@ -1209,15 +1231,12 @@ class RayPPOTrainer:
             from verl.experimental.agent_loop import AgentLoopManager
 
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-        # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+        # reward_loop_worker_handles becomes None when reward must be computed at batch level
+        # (for example group-level postprocessing such as all-zero LLM judge gating).
         # to stream reward computation with actor rollout
         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
         # teacher loop workers can sleep/wake together with rollout workers
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_worker_handles
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
@@ -1754,7 +1773,14 @@ class RayPPOTrainer:
                             batch = batch.union(gen_baseline_output)
                             # compute reward model score on batch
                             rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            should_compute_batch_reward = "rm_scores" not in batch.batch.keys() and (
+                                self.use_rm
+                                or (
+                                    self.reward_loop_manager is not None
+                                    and self.reward_loop_manager.reward_loop_worker_handles is None
+                                )
+                            )
+                            if should_compute_batch_reward:
                                 batch_reward = self._compute_reward_colocate(batch)
                                 batch = batch.union(batch_reward)
 
@@ -1814,7 +1840,14 @@ class RayPPOTrainer:
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                        should_compute_batch_reward = "rm_scores" not in batch.batch.keys() and (
+                            self.use_rm
+                            or (
+                                self.reward_loop_manager is not None
+                                and self.reward_loop_manager.reward_loop_worker_handles is None
+                            )
+                        )
+                        if should_compute_batch_reward:
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 

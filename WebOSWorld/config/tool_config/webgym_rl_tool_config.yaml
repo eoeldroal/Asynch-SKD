@@ -12,23 +12,27 @@ tools:
       type: "function"
       function:
         name: "MOVE_TO"
-        description: "Move the cursor to the specified position. x and y must each be a single integer field in the 1000x1000 coordinate system. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
+        description: "Move the cursor to the specified position. Provide coordinate as a JSON array of exactly two integers in the 1000x1000 coordinate system, for example [531, 582]. Do not split the position into separate x/y fields."
         parameters:
           type: "object"
           additionalProperties: false
           properties:
-            x:
-              type: "integer"
-            y:
-              type: "integer"
-          required: ["x", "y"]
+            coordinate:
+              type: "array"
+              items:
+                type: "integer"
+                minimum: 0
+                maximum: 999
+              minItems: 2
+              maxItems: 2
+          required: ["coordinate"]
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
     tool_schema:
       type: "function"
       function:
         name: "CLICK"
-        description: "Click the left button if the button not specified, otherwise click the specified button; click at the current position if x and y are not specified, otherwise click at the specified position. If x and y are provided, each must be its own single integer field. Do not pass a list, a bracketed value like '[531]', or a combined string like '531,582'."
+        description: "Click the left button if the button is not specified, otherwise click the specified button. Click at the current position if coordinate is omitted; otherwise click at the specified position. When provided, coordinate must be a JSON array of exactly two integers in the 1000x1000 coordinate system, for example [531, 582]."
         parameters:
           type: "object"
           additionalProperties: false
@@ -36,13 +40,18 @@ tools:
             button:
               type: "string"
               enum: ["left", "middle", "right"]
-            x:
-              type: "integer"
-            y:
-              type: "integer"
+            coordinate:
+              type: "array"
+              items:
+                type: "integer"
+                minimum: 0
+                maximum: 999
+              minItems: 2
+              maxItems: 2
             num_clicks:
               type: "integer"
               minimum: 1
+              maximum: 3
           required: []
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
@@ -80,15 +89,19 @@ tools:
       type: "function"
       function:
         name: "RIGHT_CLICK"
-        description: "Right click at the current position if x and y are not specified, otherwise right click at the specified position."
+        description: "Right click at the current position if coordinate is omitted, otherwise right click at the specified position. When provided, coordinate must be a JSON array of exactly two integers in the 1000x1000 coordinate system, for example [531, 582]."
         parameters:
           type: "object"
           additionalProperties: false
           properties:
-            x:
-              type: "integer"
-            y:
-              type: "integer"
+            coordinate:
+              type: "array"
+              items:
+                type: "integer"
+                minimum: 0
+                maximum: 999
+              minItems: 2
+              maxItems: 2
           required: []
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
@@ -96,15 +109,19 @@ tools:
       type: "function"
       function:
         name: "DOUBLE_CLICK"
-        description: "Double click at the current position if x and y are not specified, otherwise double click at the specified position."
+        description: "Double click at the current position if coordinate is omitted, otherwise double click at the specified position. When provided, coordinate must be a JSON array of exactly two integers in the 1000x1000 coordinate system, for example [531, 582]."
         parameters:
           type: "object"
           additionalProperties: false
           properties:
-            x:
-              type: "integer"
-            y:
-              type: "integer"
+            coordinate:
+              type: "array"
+              items:
+                type: "integer"
+                minimum: 0
+                maximum: 999
+              minItems: 2
+              maxItems: 2
           required: []
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
@@ -112,23 +129,27 @@ tools:
       type: "function"
       function:
         name: "DRAG_TO"
-        description: "Drag the cursor to the specified position with the left button pressed."
+        description: "Drag the cursor to the specified position with the left button pressed. Provide coordinate as a JSON array of exactly two integers in the 1000x1000 coordinate system, for example [531, 582]."
         parameters:
           type: "object"
           additionalProperties: false
           properties:
-            x:
-              type: "integer"
-            y:
-              type: "integer"
-          required: ["x", "y"]
+            coordinate:
+              type: "array"
+              items:
+                type: "integer"
+                minimum: 0
+                maximum: 999
+              minItems: 2
+              maxItems: 2
+          required: ["coordinate"]
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
     tool_schema:
       type: "function"
       function:
         name: "SCROLL"
-        description: "Scroll the mouse wheel up/down, or left/right."
+        description: "Scroll the current scrollable area. Negative dy scrolls down; positive dy scrolls up. Negative dx scrolls right; positive dx scrolls left. If dx is omitted, it defaults to 0."
         parameters:
           type: "object"
           additionalProperties: false
@@ -137,7 +158,7 @@ tools:
               type: "integer"
             dy:
               type: "integer"
-          required: ["dx", "dy"]
+          required: ["dy"]
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
     tool_schema:
@@ -209,6 +230,7 @@ tools:
               type: "array"
               items:
                 type: "string"
+              minItems: 1
           required: ["keys"]
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config
@@ -216,11 +238,15 @@ tools:
       type: "function"
       function:
         name: "WAIT"
-        description: "Wait until the next action."
+        description: "Wait for the current interface to update. You may optionally provide duration in seconds. The current runtime executes WAIT in 1-second steps, so duration is rounded up to the nearest whole-second wait step."
         parameters:
           type: "object"
           additionalProperties: false
-          properties: {}
+          properties:
+            duration:
+              type: "number"
+              minimum: 0.1
+              maximum: 10.0
           required: []
   - class_name: "verl.tools.web_osgym_tool.WebOsGymTool"
     config: *web_osgym_config

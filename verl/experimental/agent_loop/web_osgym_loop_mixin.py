@@ -34,19 +34,57 @@ class WebOsGymLoopMixin:
             "If you use `DONE` or `FAIL`, it must be the only action in that `actions` array.",
         ]
 
-    def _build_tool_parse_error_feedback(self, parse_error: ToolParseError) -> str:
+    @staticmethod
+    def _action_named_tool_parse_error_rules(active_tool_names: list[str]) -> list[str]:
+        tool_names = ", ".join(active_tool_names)
+        return [
+            "Output only well-formed tool call blocks. Do not include extra chat text before, between, or after them.",
+            "Each tool call must use `<tool_call> ... </tool_call>`.",
+            "Each function block must use `<function=...> ... </function>`.",
+            "Each parameter block must use `<parameter=...> ... </parameter>`.",
+            f"The function name must be one of: {tool_names}.",
+            "Use only top-level parameters for that function. Do not wrap them in an `actions` array.",
+            "Keep brackets and braces balanced.",
+            "For pointer actions, provide `coordinate` as a JSON array of two integers in the 1000x1000 coordinate grid.",
+            "If you use DONE or FAIL, output that function call by itself.",
+        ]
+
+    def _build_tool_parse_error_feedback(
+        self,
+        parse_error: ToolParseError,
+        *,
+        active_tool_names: list[str] | None = None,
+    ) -> str:
+        if active_tool_names and active_tool_names != [self.legacy_bundled_tool_name]:
+            lines = [
+                f"Invalid tool call format: {parse_error.message}",
+                "",
+                "Retry with exactly one corrected function call.",
+                "Do not explain the format, do not restate these rules, and do not quote an example block.",
+                "",
+                "Example function call only:",
+                "<tool_call>",
+                "<function=CLICK>",
+                "<parameter=coordinate>",
+                "[621, 680]",
+                "</parameter>",
+                "</function>",
+                "</tool_call>",
+                "",
+                "Rules:",
+            ]
+            lines.extend(f"- {rule}" for rule in self._action_named_tool_parse_error_rules(active_tool_names))
+            return "\n".join(lines)
+
         lines = [
             f"Invalid tool call format: {parse_error.message}",
             "",
-            "Below is an example of a valid tool call format:",
+            "Retry with exactly one corrected tool call.",
+            "Do not explain the format, do not restate these rules, and do not quote an example block.",
+            "Inside `<parameter=actions>`, output only a valid JSON array.",
             "",
-            "<tool_call>",
-            "<function=computer>",
-            "<parameter=actions>",
+            "Example actions payload only:",
             '[{"action_type":"CLICK","coordinate":[621,680]}]',
-            "</parameter>",
-            "</function>",
-            "</tool_call>",
             "",
             "Rules:",
         ]
@@ -288,6 +326,7 @@ class WebOsGymLoopMixin:
             **reward_extra_info,
             "request_id": agent_data.request_id,
             "web_osgym_env_reward_score": env_reward,
+            "web_osgym_trajectory_dir": str(agent_data.extra_fields.get("web_osgym_trajectory_dir") or ""),
             "web_osgym_attempted_tool_calls": attempted_tool_calls,
             "web_osgym_first_valid_tool_call_index": first_valid_tool_call_index,
             "web_osgym_valid_tool_calls": valid_tool_calls,

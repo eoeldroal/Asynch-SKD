@@ -5,11 +5,11 @@ cd /home/sogang_nlpy/verl
 
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 ROLLOUT_DATA_DIR=/home/sogang_nlpy/verl/logs/rollout_data/qwen35_webgym_fully_async_tool_veomni_${RUN_TIMESTAMP}
-WEBGYM_ASYNC_RL_DATASET_DIR=/home/sogang_nlpy/verl/data/webgym_rl
+WEBGYM_ASYNC_RL_DATASET_DIR="${WEBGYM_ASYNC_RL_DATASET_DIR:-/home/sogang_nlpy/verl/data/webgym_rl_cleaned}"
 WEBGYM_TOOL_CONFIG_PATH=/home/sogang_nlpy/verl/WebOSWorld/config/tool_config/webgym_rl_tool_config.yaml
 WEBGYM_SYSTEM_PROMPT_PATH="${WEBGYM_SYSTEM_PROMPT_PATH:-/home/sogang_nlpy/verl/WebOSWorld/webgym_rl/system_prompt_webgym_rl_action_named.txt}"
 WEBGYM_INITIAL_MODEL_PATH="${WEBGYM_INITIAL_MODEL_PATH:-/home/sogang_nlpy/verl/checkpoints/verl_async_skd_qwen35_webgym/qwen35_9b_to_27b_async_skd_webgym_fast_test_gdn_fix/global_step_5/actor/huggingface}"
-WEBGYM_EXPERIMENT_NAME="${WEBGYM_EXPERIMENT_NAME:-qwen35_9b_step5_init_fully_async_webgym_tool}"
+WEBGYM_EXPERIMENT_NAME="${WEBGYM_EXPERIMENT_NAME:-qwen35_9b_step5_init_gspo_fully_async_webgym_tool}"
 
 SGLANG_NUMA_BIND_V2=0 \
 SGLANG_ENABLE_TORCH_INFERENCE_MODE=1 \
@@ -23,7 +23,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     data.prompt_key=prompt \
     data.truncation=error \
     data.max_prompt_length=3072 \
-    data.max_response_length=51200 \
+    data.max_response_length=71680 \
     data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=64 \
     data.train_batch_size=0 \
@@ -38,13 +38,14 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.use_fused_kernels=False \
     actor_rollout_ref.actor.use_torch_compile=True \
-    actor_rollout_ref.actor.policy_loss.loss_mode=cispo \
+    actor_rollout_ref.actor.policy_loss.loss_mode=gspo \
     actor_rollout_ref.actor.use_kl_loss=True \
-    actor_rollout_ref.actor.kl_loss_coef=0.01 \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.loss_agg_mode=token-mean \
-    actor_rollout_ref.actor.clip_ratio_low=10 \
-    actor_rollout_ref.actor.clip_ratio_high=0.2 \
+    actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean \
+    actor_rollout_ref.actor.clip_ratio_low=0.2 \
+    actor_rollout_ref.actor.clip_ratio_high=0.28 \
+    actor_rollout_ref.actor.clip_ratio_c=10.0 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.optim.total_training_steps=1000 \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
@@ -61,7 +62,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=38401 \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.n=12 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.max_model_len=98304 \
@@ -80,11 +81,11 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.rollout.val_kwargs.n=8 \
+    actor_rollout_ref.rollout.val_kwargs.n=12 \
     actor_rollout_ref.rollout.multi_turn.enable=True \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=60 \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=60 \
-    actor_rollout_ref.rollout.multi_turn.max_assistant_response_tokens=8192 \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_response_tokens=16384 \
     actor_rollout_ref.rollout.multi_turn.max_parallel_calls=5 \
     "actor_rollout_ref.rollout.multi_turn.tool_config_path=${WEBGYM_TOOL_CONFIG_PATH}" \
     "actor_rollout_ref.rollout.multi_turn.system_prompt_path=${WEBGYM_SYSTEM_PROMPT_PATH}" \
@@ -123,7 +124,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     rollout.total_rollout_steps=1000 \
     trainer.total_training_steps=1000 \
     trainer.total_epochs=100 \
-    async_training.staleness_threshold=0.5 \
+    async_training.staleness_threshold=1.0 \
     async_training.trigger_parameter_sync_step=2 \
     async_training.require_batches=1 \
     async_training.partial_rollout=True \

@@ -39,7 +39,7 @@ python3 -m verl.trainer.main_ppo \
     distillation.teacher_models.teacher_model.num_replicas=4 \
     distillation.teacher_models.teacher_model.inference.name=sglang \
     distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1 \
-    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.90 \
+    distillation.teacher_models.teacher_model.inference.gpu_memory_utilization=0.80 \
     distillation.teacher_models.teacher_model.inference.max_model_len=9217 \
     distillation.teacher_models.teacher_model.inference.max_num_batched_tokens=9217 \
     distillation.teacher_models.teacher_model.inference.max_num_seqs=512 \
@@ -59,7 +59,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.name=sglang \
     actor_rollout_ref.rollout.mode=async \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.max_model_len=9217 \
     actor_rollout_ref.rollout.max_num_batched_tokens=9217 \

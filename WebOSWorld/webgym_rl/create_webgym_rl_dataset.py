@@ -13,7 +13,7 @@ import pandas as pd
 DEFAULT_TASK_FILE = "/home/sogang_nlpy/goonco/surfgym/tasks/tasks_subset.json"
 DEFAULT_SKD_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_skd"
 DEFAULT_RL_SAVE_DIR = "/home/sogang_nlpy/verl/data/webgym_rl"
-DEFAULT_TRAIN_REPEATS_PER_TASK = 16
+DEFAULT_TRAIN_REPEATS_PER_TASK = 1
 DEFAULT_VAL_REPEATS_PER_TASK = 1
 DEFAULT_INCLUDE_LOCALHOST = True
 
@@ -82,7 +82,7 @@ def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> di
     instruction = str(task.get("instruction") or task.get("task_name") or "")
     if not instruction:
         raise ValueError(f"Task {task_id} is missing both instruction and task_name")
-    return {
+    row = {
         "data_source": "webgym_rl",
         "prompt": _prompt(task),
         "ability": "web_osgym",
@@ -98,6 +98,11 @@ def _row(*, split: str, index: int, task: dict[str, Any], agent_name: str) -> di
             "tools_kwargs": {"web_osgym": {"create_kwargs": {"task_id": task_id}}},
         },
     }
+    judge_standard = task.get("judge_standard")
+    if judge_standard is not None:
+        row["judge_standard"] = deepcopy(judge_standard)
+        row["extra_info"]["judge_standard"] = deepcopy(judge_standard)
+    return row
 
 
 def build_rows(

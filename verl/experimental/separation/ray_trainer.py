@@ -29,6 +29,7 @@ from typing import Any, Optional
 import numpy as np
 import torch
 from omegaconf import OmegaConf
+from pydantic import BaseModel, ConfigDict
 from torch.utils.data import Dataset, Sampler
 from tqdm import tqdm
 
@@ -52,6 +53,16 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
+
+
+class WebGymSummaryReward(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sum: float
+    env: float
+    format: float
+    raw_format: float
+    non_grounding_adjacency_ratio: float
 
 
 class SeparateRayPPOTrainer(RayPPOTrainer):
@@ -265,6 +276,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
     def _compute_reward_breakdown_metrics(
         reward_tensor: torch.Tensor | None,
         reward_extra_infos_dict: dict[str, Any] | None,
+        batch: DataProto | None = None,
     ) -> dict[str, float]:
         metrics: dict[str, float] = {}
 
@@ -279,6 +291,18 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             env_scores = np.asarray(env_scores, dtype=np.float32)
             if env_scores.size > 0:
                 metrics["score/env"] = float(np.mean(env_scores))
+                if batch is not None:
+                    uids = batch.non_tensor_batch.get("uid")
+                    if isinstance(uids, np.ndarray) and len(uids) == len(env_scores):
+                        grouped_env_scores: dict[str, list[float]] = {}
+                        for uid, env_score in zip(uids.tolist(), env_scores.tolist(), strict=True):
+                            grouped_env_scores.setdefault(str(uid), []).append(float(env_score))
+                        if grouped_env_scores:
+                            zero_group_flags = [
+                                1.0 if all(float(score) <= 0.0 for score in scores) else 0.0
+                                for scores in grouped_env_scores.values()
+                            ]
+                            metrics["score/zero group"] = float(np.mean(np.asarray(zero_group_flags, dtype=np.float32)))
 
         format_scores = reward_extra_infos_dict.get("web_osgym_format_reward")
         if format_scores is not None:
@@ -291,6 +315,21 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             raw_format_scores = np.asarray(raw_format_scores, dtype=np.float32)
             if raw_format_scores.size > 0:
                 metrics["score/format_raw"] = float(np.mean(raw_format_scores))
+
+        llm_judge_used = reward_extra_infos_dict.get("web_osgym_llm_judge_used")
+        llm_judge_scores = reward_extra_infos_dict.get("web_osgym_llm_judge_score")
+        if llm_judge_used is not None and llm_judge_scores is not None:
+            llm_judge_used = np.asarray([bool(item) for item in np.asarray(llm_judge_used, dtype=object)], dtype=bool)
+            if llm_judge_used.size > 0 and np.any(llm_judge_used):
+                selected_scores = [
+                    float(score)
+                    for used, score in zip(
+                        llm_judge_used.tolist(), np.asarray(llm_judge_scores, dtype=object).tolist(), strict=True
+                    )
+                    if used and score is not None
+                ]
+                if selected_scores:
+                    metrics["score/llm judge"] = float(np.mean(np.asarray(selected_scores, dtype=np.float32)))
 
         adjacency_ratios = reward_extra_infos_dict.get("web_osgym_non_grounding_adjacency_ratio")
         if adjacency_ratios is not None:
@@ -376,13 +415,13 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             except (OSError, json.JSONDecodeError):
                 continue
 
-            summary["reward"] = {
-                "sum": float(final_score),
-                "env": float(env_score),
-                "format": float(format_score),
-                "raw_format": float(raw_format_score),
-                "non_grounding_adjacency_ratio": float(adjacency_ratio),
-            }
+            summary["reward"] = WebGymSummaryReward(
+                sum=float(final_score),
+                env=float(env_score),
+                format=float(format_score),
+                raw_format=float(raw_format_score),
+                non_grounding_adjacency_ratio=float(adjacency_ratio),
+            ).model_dump()
 
             with open(summary_path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
@@ -552,7 +591,11 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 batch = batch.union(gen_baseline_output)
                 # compute reward model score on batch
                 rm_scores = None
-                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                should_compute_batch_reward = "rm_scores" not in batch.batch.keys() and (
+                    self.use_rm
+                    or (self.reward_loop_manager is not None and self.reward_loop_manager.reward_loop_worker_handles is None)
+                )
+                if should_compute_batch_reward:
                     batch_reward = self._compute_reward_colocate(batch)
                     batch = batch.union(batch_reward)
 
@@ -594,8 +637,26 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
     def _fit_compute_reward(self, batch: DataProto) -> DataProto:
         timing_raw = self.timing_raw
         with marked_timer("reward", timing_raw, color="yellow"):
+            reward_loop_manager = getattr(self, "reward_loop_manager", None)
+            if "rm_scores" not in batch.batch.keys() and not self.use_rm and reward_loop_manager is None:
+                raise RuntimeError("reward_loop_manager is not initialized before trainer-side batch reward computation")
+
+            streaming_reward_disabled = (
+                reward_loop_manager is not None and reward_loop_manager.reward_loop_worker_handles is None
+            )
             # compute reward model score
-            if self.use_rm and "rm_scores" not in batch.batch.keys():
+            should_compute_batch_reward = "rm_scores" not in batch.batch.keys() and (
+                self.use_rm
+                or streaming_reward_disabled
+            )
+            if should_compute_batch_reward:
+                if not getattr(self, "_logged_batch_reward_mode", False):
+                    print(
+                        "[SeparateRayPPOTrainer][Reward] "
+                        f"batch_reward_path use_rm={self.use_rm} "
+                        f"streaming_reward={'disabled' if streaming_reward_disabled else 'enabled'}"
+                    )
+                    self._logged_batch_reward_mode = True
                 batch_reward = self._compute_reward_colocate(batch)
                 batch = batch.union(batch_reward)
 
@@ -764,13 +825,16 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         # Log rollout generations if enabled
         rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
         if rollout_data_dir:
+            reward_extra_infos_to_dump = dict(reward_extra_infos_dict or {})
+            if self.reward_tensor is not None:
+                reward_extra_infos_to_dump["score"] = self.reward_tensor.sum(dim=-1).detach().cpu().tolist()
             self._augment_webgym_summary_rewards(
                 self.reward_tensor,
                 batch,
                 reward_extra_infos_dict,
                 rollout_data_dir,
             )
-            self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
+            self._log_rollout_data(batch, reward_extra_infos_to_dump, timing_raw, rollout_data_dir)
 
     def _fit_validate(self):
         metrics = self.metrics
@@ -832,7 +896,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         timing_raw = self.timing_raw
 
         # collect metrics
-        metrics.update(self._compute_reward_breakdown_metrics(self.reward_tensor, self.reward_extra_infos_dict))
+        metrics.update(self._compute_reward_breakdown_metrics(self.reward_tensor, self.reward_extra_infos_dict, batch))
         metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         # TODO: implement actual tflpo and theoretical tflpo

@@ -862,7 +862,11 @@ class WebOsGymToolAgentLoop(WebOsGymLoopMixin, ToolAgentLoop):
         if retry_count >= self.max_tool_parse_error_retries:
             return AgentState.TERMINATED
 
-        feedback_text = self._build_tool_parse_error_feedback(parse_error)
+        active_tools = getattr(agent_data, "_active_tools", {}) or {}
+        feedback_text = self._build_tool_parse_error_feedback(
+            parse_error,
+            active_tool_names=list(active_tools.keys()) or None,
+        )
         message = self._build_tool_message(feedback_text, None)
         response_ids = await self.apply_chat_template(
             [message],

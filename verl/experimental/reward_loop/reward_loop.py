@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import threading
 
 import aiohttp
 import numpy as np
@@ -31,12 +32,126 @@ from verl.trainer.ppo.reward import load_reward_manager
 from verl.utils import hf_tokenizer
 from verl.utils.experimental.reward_utils import pil_image_to_base64, prepare_query_for_multi_modal
 from verl.utils.fs import copy_to_local
+from verl.utils.import_utils import load_extern_object
 from verl.utils.ray_utils import get_event_loop
 
 from .reward_model import RewardModelManager
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _get_custom_reward_kwargs(config: DictConfig) -> dict:
+    reward_cfg = config.get("reward") or {}
+    custom_cfg = reward_cfg.get("custom_reward_function") or {}
+    reward_kwargs = custom_cfg.get("reward_kwargs") or {}
+    return dict(reward_kwargs)
+
+
+def _llm_judge_only_zerogroup_enabled(config: DictConfig) -> bool:
+    reward_kwargs = _get_custom_reward_kwargs(config)
+    only_zerogroup = reward_kwargs.get("llm_judge_only_zerogroup", False)
+    return bool(reward_kwargs.get("llm_judge_enable", False)) and bool(only_zerogroup)
+
+
+def _expected_llm_judge_group_size(config: DictConfig, *, validate: bool) -> int | None:
+    rollout_cfg = config.get("actor_rollout_ref", {}).get("rollout", {})
+    if validate:
+        expected = rollout_cfg.get("val_kwargs", {}).get("n", None)
+    else:
+        expected = rollout_cfg.get("n", None)
+    try:
+        expected_int = int(expected)
+    except (TypeError, ValueError):
+        return None
+    return expected_int if expected_int > 0 else None
+
+
+def _reward_score_from_env(output: dict) -> float | None:
+    reward_extra_info = output.get("reward_extra_info", {})
+    if not isinstance(reward_extra_info, dict):
+        return None
+    try:
+        return float(reward_extra_info.get("web_osgym_env_reward_score"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _load_zero_group_compare_fn(config: DictConfig):
+    reward_kwargs = _get_custom_reward_kwargs(config)
+    if not (bool(reward_kwargs.get("llm_judge_enable", False)) and bool(reward_kwargs.get("llm_judge_only_zerogroup", False))):
+        return None
+    reward_fn_config = config.reward.get("custom_reward_function") or {}
+    module_path = reward_fn_config.get("path")
+    if not module_path:
+        return None
+    return load_extern_object(module_path=module_path, object_name="compare_zero_group_webgym_rl")
+
+
+def _load_zero_group_compare_async_fn(config: DictConfig):
+    reward_kwargs = _get_custom_reward_kwargs(config)
+    if not (bool(reward_kwargs.get("llm_judge_enable", False)) and bool(reward_kwargs.get("llm_judge_only_zerogroup", False))):
+        return None
+    reward_fn_config = config.reward.get("custom_reward_function") or {}
+    module_path = reward_fn_config.get("path")
+    if not module_path:
+        return None
+    try:
+        return load_extern_object(module_path=module_path, object_name="compare_zero_group_webgym_rl_async")
+    except Exception as exc:
+        raise RuntimeError(
+            "Failed to load compare_zero_group_webgym_rl_async "
+            f"from reward.custom_reward_function.path={module_path!r}"
+        ) from exc
+
+
+def _llm_judge_max_concurrency(config: DictConfig) -> int:
+    reward_kwargs = _get_custom_reward_kwargs(config)
+    value = reward_kwargs.get("llm_judge_max_concurrency", 2)
+    try:
+        concurrency = int(value)
+    except (TypeError, ValueError):
+        return 2
+    return max(concurrency, 1)
+
+
+def _run_coroutine_sync(coro):
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, object] = {}
+    error: dict[str, BaseException] = {}
+
+    def _runner():
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # pragma: no cover - defensive bridge
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "exc" in error:
+        raise error["exc"]
+    return result.get("value")
+
+
+def _load_reward_extra_info_merge_fn(config: DictConfig):
+    reward_fn_config = config.reward.get("custom_reward_function") or {}
+    module_path = reward_fn_config.get("path")
+    if not module_path:
+        return None
+    return load_extern_object(module_path=module_path, object_name="merge_webgym_reward_extra_info")
+
+
+def _load_reward_extra_info_pack_fn(config: DictConfig):
+    reward_fn_config = config.reward.get("custom_reward_function") or {}
+    module_path = reward_fn_config.get("path")
+    if not module_path:
+        return None
+    return load_extern_object(module_path=module_path, object_name="pack_webgym_reward_extra_infos")
 
 
 def migrate_legacy_reward_impl(config):
@@ -308,6 +423,16 @@ class RewardLoopManager:
 
         self.reward_loop_workers_class = ray.remote(RewardLoopWorker)
         self._init_reward_loop_workers()
+        self.zero_group_compare_fn = _load_zero_group_compare_fn(config)
+        self.zero_group_compare_async_fn = _load_zero_group_compare_async_fn(config)
+        self.reward_extra_info_merge_fn = _load_reward_extra_info_merge_fn(config)
+        self.reward_extra_info_pack_fn = _load_reward_extra_info_pack_fn(config)
+        print(
+            "[RewardLoopManager] "
+            f"llm_judge_enable={bool(_get_custom_reward_kwargs(self.config).get('llm_judge_enable', False))} "
+            f"llm_judge_only_zerogroup={bool(_get_custom_reward_kwargs(self.config).get('llm_judge_only_zerogroup', False))} "
+            f"streaming_reward={'disabled' if _llm_judge_only_zerogroup_enabled(self.config) else 'enabled'}"
+        )
 
     @property
     def reward_loop_worker_handles(self) -> list[ActorHandle]:
@@ -317,6 +442,8 @@ class RewardLoopManager:
         (1) rule-based reward without reward model
         (2) reward model with extra resource pool
         """
+        if _llm_judge_only_zerogroup_enabled(self.config):
+            return None
         if not self.config.reward.reward_model.enable or self.config.reward.reward_model.enable_resource_pool:
             return self.reward_loop_workers
         return None
@@ -332,7 +459,6 @@ class RewardLoopManager:
 
             self.reward_loop_workers.append(
                 self.reward_loop_workers_class.options(
-                    name=f"reward_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,
@@ -340,18 +466,179 @@ class RewardLoopManager:
                 ).remote(self.config, self.reward_router_address)
             )
 
+    def _run_reward_workers(self, data: DataProto) -> list[dict]:
+        if len(data) == 0:
+            return []
+        num_chunks = min(len(data), len(self.reward_loop_workers))
+        split_size = (len(data) + num_chunks - 1) // num_chunks
+        chunks = data.split(split_size)
+        outputs = ray.get(
+            [
+                worker.compute_score_batch.remote(chunk)
+                for worker, chunk in zip(self.reward_loop_workers[: len(chunks)], chunks, strict=True)
+            ]
+        )
+        return [item for sublist in outputs for item in sublist]
+
+    def _maybe_apply_zerogroup_llm_judge(self, data: DataProto, outputs_flat: list[dict]) -> list[dict]:
+        if not _llm_judge_only_zerogroup_enabled(self.config):
+            return outputs_flat
+
+        uids = data.non_tensor_batch.get("uid")
+        if not isinstance(uids, np.ndarray) or len(uids) != len(outputs_flat):
+            return outputs_flat
+        extra_infos = data.non_tensor_batch.get("extra_info")
+        if not isinstance(extra_infos, np.ndarray) or len(extra_infos) != len(outputs_flat):
+            return outputs_flat
+
+        validate = bool(data.meta_info.get("validate", False))
+        expected_group_size = _expected_llm_judge_group_size(self.config, validate=validate)
+
+        grouped_indices: dict[str, list[int]] = {}
+        for index, uid in enumerate(uids.tolist()):
+            grouped_indices.setdefault(str(uid), []).append(index)
+
+        selected_groups: list[list[int]] = []
+        selected_group_count = 0
+        skipped_incomplete_groups = 0
+        skipped_missing_env_groups = 0
+        skipped_missing_judge_standard_groups = 0
+        skipped_invalid_compare_input_groups = 0
+        for indices in grouped_indices.values():
+            if expected_group_size is not None and len(indices) != expected_group_size:
+                skipped_incomplete_groups += 1
+                continue
+            env_scores = [_reward_score_from_env(outputs_flat[index]) for index in indices]
+            if any(score is None for score in env_scores):
+                skipped_missing_env_groups += 1
+                continue
+            if not all(
+                isinstance(extra_infos[index], dict)
+                and isinstance(extra_infos[index].get("judge_standard"), list)
+                and any(
+                    isinstance(item, dict)
+                    and str(item.get("id", "")).strip()
+                    and str(item.get("text", "")).strip()
+                    for item in extra_infos[index]["judge_standard"]
+                )
+                for index in indices
+            ):
+                skipped_missing_judge_standard_groups += 1
+                continue
+            if all(float(score) <= 0.0 for score in env_scores):
+                selected_group_count += 1
+                selected_groups.append(indices)
+
+        if selected_group_count > 0 or skipped_incomplete_groups > 0 or skipped_missing_judge_standard_groups > 0:
+            print(
+                "[RewardLoopManager][ZeroGroup] "
+                f"validate={validate} batch_size={len(data)} uid_groups={len(grouped_indices)} "
+                f"expected_group_size={expected_group_size} selected_groups={selected_group_count} "
+                f"selected_samples={sum(len(indices) for indices in selected_groups)} skipped_incomplete_groups={skipped_incomplete_groups} "
+                f"skipped_missing_env_groups={skipped_missing_env_groups} "
+                f"skipped_missing_judge_standard_groups={skipped_missing_judge_standard_groups}"
+            )
+
+        if not selected_groups:
+            return outputs_flat
+
+        compare_fn = getattr(self, "zero_group_compare_fn", None) or _load_zero_group_compare_fn(self.config)
+        compare_async_fn = getattr(self, "zero_group_compare_async_fn", None) or _load_zero_group_compare_async_fn(self.config)
+        if compare_fn is None and compare_async_fn is None:
+            raise RuntimeError("compare_zero_group_webgym_rl is not available for zerogroup judge")
+        merge_fn = getattr(self, "reward_extra_info_merge_fn", None) or _load_reward_extra_info_merge_fn(self.config)
+
+        raw_prompts = data.non_tensor_batch.get("raw_prompt")
+        group_payloads: list[tuple[list[int], list[dict], list[str | None]]] = []
+        for indices in selected_groups:
+            group_extra_infos = []
+            group_task_instructions = []
+            for index in indices:
+                item = extra_infos[index]
+                group_extra_infos.append(dict(item) if isinstance(item, dict) else {})
+                task_instruction = None
+                if isinstance(raw_prompts, np.ndarray) and index < len(raw_prompts):
+                    prompt = raw_prompts[index]
+                    if isinstance(prompt, list):
+                        for message in prompt:
+                            if isinstance(message, dict) and message.get("role") == "user":
+                                content = message.get("content")
+                                if isinstance(content, str) and content.strip():
+                                    task_instruction = content.strip()
+                                    break
+                group_task_instructions.append(task_instruction)
+            group_payloads.append((indices, group_extra_infos, group_task_instructions))
+
+        if compare_async_fn is not None:
+            judged_group_results = _run_coroutine_sync(
+                self._judge_selected_groups_async(compare_async_fn, group_payloads)
+            )
+        else:
+            judged_group_results = []
+            for indices, group_extra_infos, group_task_instructions in group_payloads:
+                try:
+                    judged_outputs = compare_fn(
+                        extra_infos=group_extra_infos,
+                        task_instructions=group_task_instructions,
+                        **_get_custom_reward_kwargs(self.config),
+                    )
+                    judged_group_results.append((indices, judged_outputs, False))
+                except Exception:
+                    judged_group_results.append((indices, None, True))
+
+        for indices, judged_outputs, failed in judged_group_results:
+            if failed or judged_outputs is None:
+                skipped_invalid_compare_input_groups += 1
+                continue
+            for original_index, judged_output in zip(indices, judged_outputs, strict=True):
+                if merge_fn is not None:
+                    merged_reward_extra_info = merge_fn(
+                        outputs_flat[original_index].get("reward_extra_info", {}),
+                        judged_output.get("reward_extra_info", {}),
+                    )
+                else:
+                    merged_reward_extra_info = dict(outputs_flat[original_index].get("reward_extra_info", {}))
+                    merged_reward_extra_info.update(judged_output.get("reward_extra_info", {}))
+                outputs_flat[original_index] = {
+                    "reward_score": judged_output["reward_score"],
+                    "reward_extra_info": merged_reward_extra_info,
+                }
+        if skipped_invalid_compare_input_groups > 0:
+            print(
+                "[RewardLoopManager][ZeroGroupInvalidInput] "
+                f"skipped_invalid_compare_input_groups={skipped_invalid_compare_input_groups}"
+            )
+        return outputs_flat
+
+    async def _judge_selected_groups_async(self, compare_async_fn, group_payloads):
+        semaphore = asyncio.Semaphore(_llm_judge_max_concurrency(self.config))
+        reward_kwargs = _get_custom_reward_kwargs(self.config)
+
+        async def _judge_single(indices, group_extra_infos, group_task_instructions):
+            async with semaphore:
+                try:
+                    judged_outputs = await compare_async_fn(
+                        extra_infos=group_extra_infos,
+                        task_instructions=group_task_instructions,
+                        **reward_kwargs,
+                    )
+                    return indices, judged_outputs, False
+                except Exception:
+                    return indices, None, True
+
+        return await asyncio.gather(
+            *[
+                _judge_single(indices, group_extra_infos, group_task_instructions)
+                for indices, group_extra_infos, group_task_instructions in group_payloads
+            ]
+        )
+
     def compute_rm_score(self, data: DataProto) -> DataProto:
         if self.reward_model_manager is not None:
             self.reward_model_manager.wake_up()
 
-        chunks = data.chunk(len(self.reward_loop_workers))
-        outputs = ray.get(
-            [
-                worker.compute_score_batch.remote(chunk)
-                for worker, chunk in zip(self.reward_loop_workers, chunks, strict=True)
-            ]
-        )
-        outputs_flat = [item for sublist in outputs for item in sublist]
+        outputs_flat = self._run_reward_workers(data)
+        outputs_flat = self._maybe_apply_zerogroup_llm_judge(data, outputs_flat)
 
         # compute rm score
         scores = [item["reward_score"] for item in outputs_flat]
@@ -368,10 +655,24 @@ class RewardLoopManager:
         batch = TensorDict({"rm_scores": rm_scores}, batch_size=len(data))
 
         reward_extra_infos = [output.get("reward_extra_info", {}) for output in outputs_flat]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
-        non_tensor_batch = {}
-        for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+        pack_fn = getattr(self, "reward_extra_info_pack_fn", None) or _load_reward_extra_info_pack_fn(self.config)
+        if pack_fn is not None:
+            non_tensor_batch, reward_extra_keys = pack_fn(
+                reward_extra_infos,
+                template_non_tensor_batch=data.non_tensor_batch,
+            )
+        else:
+            reward_extra_keys = sorted(
+                {key for reward_extra_info in reward_extra_infos if isinstance(reward_extra_info, dict) for key in reward_extra_info}
+            )
+            non_tensor_batch = {}
+            for key in reward_extra_keys:
+                existing_value = data.non_tensor_batch.get(key)
+                target_dtype = existing_value.dtype if isinstance(existing_value, np.ndarray) else object
+                non_tensor_batch[key] = np.array(
+                    [info.get(key) if isinstance(info, dict) else None for info in reward_extra_infos],
+                    dtype=target_dtype,
+                )
 
         if self.reward_model_manager is not None:
             self.reward_model_manager.sleep()

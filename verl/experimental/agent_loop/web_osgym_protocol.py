@@ -5,7 +5,7 @@ from typing import Any
 
 import httpx
 from PIL import Image
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class WebOsGymAction(BaseModel):
@@ -17,6 +17,7 @@ class WebOsGymAction(BaseModel):
     num_clicks: int | None = None
     dx: int | None = None
     dy: int | None = None
+    duration: float | None = Field(default=None, gt=0)
     text: str | None = None
     key: str | None = None
     keys: list[str] | None = None

@@ -475,14 +475,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 yield epoch, batch_dict
 
     async def _init_async_rollout_manager(self):
-        # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
-        # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-        # to stream reward computation with actor rollout
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        # reward_loop_worker_handles becomes None when reward must be computed at batch level
+        # instead of streaming per-sample during rollout.
+        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_worker_handles
 
         # create async rollout manager and request scheduler
         assert self.config.actor_rollout_ref.rollout.mode == "async"
